@@ -3081,11 +3081,17 @@ fn disable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn remove_dns_rules_effect(ctx: &mut Ctx) -> Result<(), String> {
     dns::remove_dns_nrpt_checked()?;
     dns::invalidate_cache();
     ctx.log(Level::Ok, "Правила DNS сняты.");
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn remove_dns_rules_effect(_ctx: &mut Ctx) -> Result<(), String> {
+    Err("Правила DNS NRPT доступны только в Windows.".into())
 }
 
 /// Takes the relay service down for good, with auto-patch kept.
