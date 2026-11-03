@@ -570,9 +570,7 @@ impl App {
                     return;
                 }
                 let on = !self.status.as_ref().is_some_and(|s| s.bypass_on());
-                for cap in ops::bypass_order(on) {
-                    self.worker.send(Cmd::Set(cap, on));
-                }
+                self.worker.send(Cmd::SetBypass(on));
             }
             Row::Install(i) => {
                 let text = self.install_path(i).unwrap_or_default();

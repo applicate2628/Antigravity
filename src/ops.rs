@@ -65,7 +65,28 @@ pub enum Cap {
     // stays in the file so an older build reading it still finds the field.
 }
 
+#[derive(Clone, Copy)]
+enum PlatformFeature { Dns, Watchdog, Wsl, LegacyCa }
+
+fn feature_available(feature: PlatformFeature) -> bool {
+    feature_available_on(feature, cfg!(target_os = "macos"))
+}
+
+fn feature_available_on(feature: PlatformFeature, macos: bool) -> bool {
+    !macos || !matches!(feature,
+        PlatformFeature::Dns | PlatformFeature::Watchdog | PlatformFeature::Wsl | PlatformFeature::LegacyCa)
+}
+
 impl Cap {
+    /// Availability of an operation, independent of the saved user intent.
+    pub fn available(self) -> bool {
+        match self {
+            Cap::Dns => feature_available(PlatformFeature::Dns),
+            Cap::Watchdog => feature_available(PlatformFeature::Watchdog),
+            _ => true,
+        }
+    }
+
     /// Windows gates the DNS layer behind UAC. Without admin these do not fail —
     /// the cmdlets carry `-ErrorAction SilentlyContinue` — they quietly do
     /// nothing, which is exactly the way a switch ends up lying.
@@ -259,7 +280,7 @@ impl Status {
 /// finishes first. OFF: the variable comes off *before* the listener it names
 /// goes away, or a sign-in that lands in between dials a dead port (G31).
 pub fn bypass_order(on: bool) -> Vec<Cap> {
-    if on {
+    let caps = if on {
         // The user's own proxy is theirs to switch on: it needs an address.
         vec![
             Cap::Dns,
@@ -275,7 +296,13 @@ pub fn bypass_order(on: bool) -> Vec<Cap> {
             Cap::GroupProxy,
             Cap::Dns,
         ]
-    }
+    };
+    caps.into_iter().filter(|cap| cap.available()).collect()
+}
+
+fn apply_bypass_sequence<E>(caps: impl IntoIterator<Item = Cap>, mut effect: impl FnMut(Cap) -> Result<(), E>) -> Result<(), E> {
+    for cap in caps { effect(cap)?; }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +367,7 @@ pub enum Cmd {
     #[allow(dead_code)]
     DeepRefresh,
     Set(Cap, bool),
+    SetBypass(bool),
     AddPath(PathBuf),
     ForgetPath(PathBuf),
     /// The «Пропатчить» button of one install row.
@@ -748,6 +776,11 @@ fn run_worker(
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => { shutdown = true; None },
         } };
+        if !feature_available(PlatformFeature::Wsl) && matches!(&command,
+            Some(Cmd::RefreshWsl | Cmd::SetWslEnabled(_) | Cmd::SetWslDistro { .. })) {
+            let _ = owner_events.send(Event::Log(Level::Err, "WSL недоступна на этой платформе.".into()));
+            command = None;
+        }
         if receive_wsl_refresh_command(&mut refresh_requested, &command) { command = None; }
         if native_job.as_ref().is_some_and(|job| job.is_finished()) {
             match native_job.take().unwrap().join() {
@@ -1033,7 +1066,7 @@ fn run_worker(
                 push_status(&mut ctx, Scan::Deep);
                 ctx.busy(None);
             }
-            command @ (Cmd::Set(_, _) | Cmd::EnableAll | Cmd::Repair
+            command @ (Cmd::Set(_, _) | Cmd::SetBypass(_) | Cmd::EnableAll | Cmd::Repair
                 | Cmd::SetOwnProxy(_) | Cmd::SetGroupKey(_) | Cmd::Unlocked
                 | Cmd::AddPath(_) | Cmd::PatchInstall(_)) => {
                 native_cancel.store(false, Ordering::SeqCst);
@@ -1274,7 +1307,10 @@ fn dispatch_owned_command(ctx: &mut Ctx, command: Cmd) -> Result<NativeCompletio
     if ctx.native_cancel.load(Ordering::SeqCst) {
         return Err("Выбранное действие отменено до начала.".into());
     }
-    let saves_intent = matches!(&command, Cmd::Set(_, _) | Cmd::SetOwnProxy(_) | Cmd::SetGroupKey(_) | Cmd::EnableAll | Cmd::Repair);
+    if let Cmd::Set(cap, _) = &command {
+        if !cap.available() { return Err(format!("{} недоступен на этой платформе.", cap.title())); }
+    }
+    let saves_intent = matches!(&command, Cmd::Set(_, _) | Cmd::SetBypass(_) | Cmd::SetOwnProxy(_) | Cmd::SetGroupKey(_) | Cmd::EnableAll | Cmd::Repair);
     let effect = (|| -> Result<(), String> { match command {
             Cmd::Set(cap, on) => {
                 ctx.busy(Some(cap.title()));
@@ -1286,6 +1322,11 @@ fn dispatch_owned_command(ctx: &mut Ctx, command: Cmd) -> Result<NativeCompletio
                 if cap == Cap::Watchdog && on && auto_patch_found(ctx) {
                     push_status(ctx, Scan::Deep);
                 }
+            }
+            Cmd::SetBypass(on) => {
+                if !Cap::Dns.available() { ctx.log(Level::Warn, "Правила DNS недоступны и не изменялись."); }
+                apply_bypass_sequence(bypass_order(on), |cap| apply(ctx, cap, on))?;
+                push_status(ctx, Scan::System);
             }
             Cmd::SetOwnProxy(text) => {
                 ctx.busy(Some("Проверка прокси"));
@@ -1354,7 +1395,7 @@ fn dispatch_owned_command(ctx: &mut Ctx, command: Cmd) -> Result<NativeCompletio
 
 fn genuine_command(command: &Cmd) -> bool {
     matches!(command, Cmd::RequestElevation | Cmd::ApplySettings | Cmd::SetWslEnabled(_) | Cmd::SetWslDistro { .. }
-        | Cmd::Set(_, _) | Cmd::AddPath(_) | Cmd::ForgetPath(_) | Cmd::PatchInstall(_) | Cmd::SetOwnProxy(_)
+        | Cmd::Set(_, _) | Cmd::SetBypass(_) | Cmd::AddPath(_) | Cmd::ForgetPath(_) | Cmd::PatchInstall(_) | Cmd::SetOwnProxy(_)
         | Cmd::SetCustomDns(_) | Cmd::SetGroupKey(_) | Cmd::SetProvider(_, _) | Cmd::ReorderProviders(_)
         | Cmd::EnableAll | Cmd::Repair)
 }
@@ -1468,7 +1509,7 @@ fn settings_only_status(ctx: &Ctx, prev: Status) -> Status {
     let (rules, relay) = ctx.dns_probe;
     Status {
         wsl: wsl_status(ctx),
-        dns: dns_state(
+        dns: platform_dns_state(
             prev.admin,
             rules,
             relay,
@@ -1587,7 +1628,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         admin,
         client_patch,
         watchdog,
-        dns: dns_state(
+        dns: platform_dns_state(
             admin,
             dns_probe.0,
             dns_probe.1,
@@ -1668,11 +1709,13 @@ fn vpn_change_line(now: VpnSeen) -> Option<&'static str> {
 /// path and the patch switch skipped auto-patch for every non-root user, and the
 /// row stayed off for good.
 fn watchdog_allowed(admin: bool) -> bool {
-    admin || !cfg!(target_os = "windows")
+    Cap::Watchdog.available() && (admin || !cfg!(target_os = "windows"))
 }
 
 fn read_watchdog(admin: bool) -> State {
-    if background::is_watchdog_enabled() {
+    if !Cap::Watchdog.available() {
+        State::Blocked("недоступно на этой платформе".into())
+    } else if background::is_watchdog_enabled() {
         State::On
     } else if !admin && cfg!(target_os = "windows") {
         State::Blocked("нужны права администратора".into())
@@ -1706,6 +1749,11 @@ fn probe_dns() -> (bool, bool) {
 /// so there the systemd unit being active is all there is to go on.
 fn relay_reporting() -> bool {
     !cfg!(target_os = "windows") || crate::gate::read().is_some_and(|r| !r.is_stale())
+}
+
+fn platform_dns_state(admin: bool, rules: bool, relay: bool, vpn: Option<VpnSeen>, detect_on: bool, wanted: bool) -> State {
+    if !Cap::Dns.available() { return State::Blocked("недоступно на этой платформе".into()); }
+    dns_state(admin, rules, relay, vpn, detect_on, wanted)
 }
 
 fn dns_state(
@@ -1874,6 +1922,7 @@ fn collect_installs(
 
 fn apply(ctx: &mut Ctx, cap: Cap, on: bool) -> Result<(), String> {
     if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Действие отменено до следующего эффекта.".into()); }
+    if !cap.available() { return Err(format!("{} недоступен на этой платформе.", cap.title())); }
     if cap.needs_admin() && !is_admin() {
         return Err("Нужны права администратора. Нажмите «Перезапустить от имени администратора».".into());
     }
@@ -1939,7 +1988,7 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) -> Result<(), String> {
         (Cap::LocalProxy, on) => {
             ctx.settings.local_proxy = on;
             if on {
-                enable_local_proxy_effect(ctx)?;
+                activate_local_proxy(ctx)?;
             } else {
                 disable_local_proxy_effect(ctx)?;
             }
@@ -2377,7 +2426,8 @@ fn apply_acknowledged(ctx: &mut Ctx, wanted: Settings, cancellation: &AtomicBool
         #[cfg(not(windows))]
         {
         reconcile_native(ctx, &wanted, cancellation)?;
-        if !cancellation.load(Ordering::SeqCst) { ctx.wsl.request_apply(wanted.clone())?; }
+        if feature_available(PlatformFeature::Wsl) && !cancellation.load(Ordering::SeqCst) { ctx.wsl.request_apply(wanted.clone())?; }
+        if !feature_available(PlatformFeature::Wsl) { ctx.log(Level::Warn, "WSL, правила DNS и отдельный автопатч недоступны и не применялись."); }
         Ok(NativeCompletion::Retired)
         }
     })();
@@ -2471,19 +2521,18 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
     let rules = dns::is_nrpt_applied();
     let relay = background::is_running();
     let relay_outdated = background::relay_is_outdated();
-    if wanted.dns && (!rules || !relay || relay_outdated) {
+    if Cap::Dns.available() && wanted.dns && (!rules || !relay || relay_outdated) {
         if cfg!(windows) && !is_admin() { ctx.log(Level::Warn, "Для применения DNS нужны права администратора."); }
         else { enable_dns_effect(ctx)?; }
-    } else if !wanted.dns && rules { disable_dns_effect(ctx)?; }
+    } else if Cap::Dns.available() && !wanted.dns && rules { disable_dns_effect(ctx)?; }
     if cancellation.load(Ordering::SeqCst) { return Ok(()); }
     let local_applied = endpoint::proxy_env_is_ours();
     if wanted.local_proxy && (!local_applied || !background::is_running() || background::relay_is_outdated()) {
-        if background::is_running() && !background::relay_is_outdated() { enable_local_proxy_effect(ctx)?; }
-        else { ensure_route_carrier(ctx)?; }
+        activate_local_proxy(ctx)?;
     } else if !wanted.local_proxy && local_applied { disable_local_proxy_effect(ctx)?; }
     if cancellation.load(Ordering::SeqCst) { return Ok(()); }
     let watchdog = background::is_watchdog_enabled();
-    if wanted.auto_patch != watchdog {
+    if Cap::Watchdog.available() && wanted.auto_patch != watchdog {
         if cfg!(windows) && !is_admin() { ctx.log(Level::Warn, "Для применения автопатча нужны права администратора."); }
         else { set_watchdog_effect(ctx, wanted.auto_patch)?; }
     }
@@ -2512,7 +2561,7 @@ fn enable_all(ctx: &mut Ctx) -> Result<(), String> {
     ctx.settings.group_proxy = true;
     let dns_on =
         dns::is_nrpt_applied() && background::is_running() && !background::relay_is_outdated();
-    if !dns_on {
+    if Cap::Dns.available() && !dns_on {
         if !admin {
             // Said only when it is actually missing: the card offers this button
             // for a patch that is off too, with the bypass already running.
@@ -2530,6 +2579,7 @@ fn enable_all(ctx: &mut Ctx) -> Result<(), String> {
     if watchdog_allowed(admin) && !background::is_watchdog_enabled() {
         apply(ctx, Cap::Watchdog, true)?;
     }
+    if !Cap::Dns.available() { ctx.log(Level::Warn, "Правила DNS и отдельный автопатч недоступны и не включались."); }
     ctx.log(
         Level::Ok,
         "Готово. Откройте Antigravity и напишите что-нибудь в чат — здесь появится подтверждение, что модель ответила.",
@@ -2553,7 +2603,8 @@ fn repair(ctx: &mut Ctx) -> Result<(), String> {
     }
     // DNS is put back only when it was wanted, or when nothing else is: a user
     // running just their own proxy must not get DNS rules from a repair.
-    let with_dns = ctx.settings.dns || !routes_want_relay(&ctx.settings);
+    let with_dns = Cap::Dns.available() && (ctx.settings.dns || !routes_want_relay(&ctx.settings));
+    if !Cap::Dns.available() { ctx.log(Level::Warn, "Правила DNS и отдельный автопатч недоступны и не восстанавливались."); }
     if with_dns {
         ctx.settings.dns = true;
     }
@@ -2584,6 +2635,7 @@ fn repair(ctx: &mut Ctx) -> Result<(), String> {
 /// which is the owner's own machine (G55). Written back at once, so the relay
 /// reads the settled answer and this runs once per machine.
 fn settle_decline(ctx: &mut Ctx) {
+    if !Cap::Watchdog.available() { return; }
     if !ctx.settings.decline_unrecorded {
         return;
     }
@@ -2601,6 +2653,7 @@ fn settle_decline(ctx: &mut Ctx) {
 /// held for a normal application close; this operation owns no process-kill
 /// capability. Its cancellation and first write failure stop later files.
 fn auto_patch_found(ctx: &mut Ctx) -> bool {
+    if !Cap::Watchdog.available() { return false; }
     // Only while the switch is drawn on («при включенной опции»). Its state is
     // the standalone task, which a user without admin rights cannot have and
     // which `disable_dns` takes down with the relay («вернётся вместе с
@@ -2808,7 +2861,7 @@ fn enable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&All
 
     // I39: the legacy CA comes out last, and `remove_legacy_ca` itself refuses
     // while the relay is still an older build.
-    crate::remove_legacy_ca_quiet();
+    if feature_available(PlatformFeature::LegacyCa) { crate::remove_legacy_ca_quiet(); }
 
     ctx.log(Level::Ok, format!("Пропатчено установок: {}", ok));
     Ok(true)
@@ -2840,10 +2893,10 @@ fn disable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&Al
     }
     #[cfg(not(windows))]
     {
-        background::disable_watchdog();
+        if Cap::Watchdog.available() { background::disable_watchdog(); }
         background::disable()?;
         let primary = revert_client_primary(ctx);
-        let restoration = if ctx.settings.dns || routes_want_relay(&ctx.settings) { background::ensure_running() } else { Ok(()) };
+        let restoration = if (Cap::Dns.available() && ctx.settings.dns) || routes_want_relay(&ctx.settings) { background::ensure_running() } else { Ok(()) };
         receive_client_undo(Some(primary), restoration)
     }
 }
@@ -2979,6 +3032,7 @@ fn background_roles_effect(ctx: &mut Ctx, relay: bool, watchdog: bool) -> Result
 }
 
 fn set_watchdog_effect(ctx: &mut Ctx, on: bool) -> Result<(), String> {
+    if !Cap::Watchdog.available() { return Err("Автопатч недоступен на этой платформе.".into()); }
     #[cfg(windows)]
     return background_roles_effect(ctx, ctx.settings.dns || routes_want_relay(&ctx.settings), ctx.settings.auto_patch_wanted());
     #[cfg(not(windows))]
@@ -3001,6 +3055,7 @@ fn set_watchdog_effect(ctx: &mut Ctx, on: bool) -> Result<(), String> {
 // --- DNS -------------------------------------------------------------------
 
 fn enable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
+    if !Cap::Dns.available() { return Err("Правила DNS недоступны на этой платформе.".into()); }
     ctx.log(Level::Step, "Обход через DNS");
 
     // I5: the rules name the relay as their first nameserver, so it has to be
@@ -3046,6 +3101,7 @@ fn enable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
 }
 
 fn disable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
+    if !Cap::Dns.available() { return Err("Правила DNS недоступны на этой платформе.".into()); }
     ctx.log(Level::Step, "Отключение обхода через DNS");
 
     // The relay is also the carrier of every route (local proxy, own proxy,
@@ -3105,7 +3161,7 @@ fn stop_relay_effect(ctx: &mut Ctx) -> Result<(), String> {
     return background_roles_effect(ctx, false, ctx.settings.auto_patch_wanted());
     #[cfg(not(windows))]
     {
-    let watchdog_enabled = background::is_watchdog_enabled();
+    let watchdog_enabled = Cap::Watchdog.available() && background::is_watchdog_enabled();
     let restore_watchdog = ctx.settings.auto_patch && watchdog_enabled;
     if restore_watchdog {
         background::disable_watchdog();
@@ -3135,6 +3191,16 @@ fn routes_want_relay(s: &Settings) -> bool {
 /// other ways off. Starts the service and points the client at it; the DNS
 /// rules are not touched.
 fn ensure_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
+    prepare_then_activate_carrier(ctx, prepare_route_carrier, activate_prepared_carrier)
+}
+
+fn prepare_then_activate_carrier<T, E>(ctx: &mut T, prepare: impl FnOnce(&mut T) -> Result<(), E>,
+    activate: impl FnOnce(&mut T) -> Result<(), E>) -> Result<(), E> {
+    prepare(ctx)?;
+    activate(ctx)
+}
+
+fn prepare_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
     if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Подготовка службы отменена.".into()); }
     if cfg!(target_os = "windows") && !is_admin() {
         return Err("Служба обхода не запущена: нужны права администратора. Нажмите «Перезапустить от имени администратора».".into());
@@ -3146,6 +3212,10 @@ fn ensure_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
     let reconciled = background::ensure_running();
     reconciled.map_err(|error| format!("Служба обхода не запустилась: {error}"))?;
     if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Служба получена; настройка прокси отменена.".into()); }
+    Ok(())
+}
+
+fn activate_prepared_carrier(ctx: &mut Ctx) -> Result<(), String> {
     // Wanted, whatever `enable_local_proxy` manages below: the relay writes the
     // variable itself once its listener answers, and the door opens only while
     // this is set (`loopback::is_up`).
@@ -3163,7 +3233,7 @@ fn ensure_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
 /// The counterpart: a route went off, and if nothing else wants the service it
 /// goes too. Not while DNS is on - then it is the DNS layer's.
 fn release_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
-    if ctx.settings.dns || routes_want_relay_without_proxy_var(&ctx.settings) {
+    if (Cap::Dns.available() && ctx.settings.dns) || routes_want_relay_without_proxy_var(&ctx.settings) {
         return Ok(());
     }
     if cfg!(target_os = "windows") && !is_admin() {
@@ -3207,6 +3277,7 @@ fn reapply_dns_rules(ctx: &mut Ctx) -> bool {
 
 fn reapply_dns_rules_checked(ctx: &mut Ctx) -> Result<bool, String> {
     if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Изменение правил DNS отменено.".into()); }
+    if !Cap::Dns.available() { return Ok(false); }
     if !dns::is_nrpt_applied() {
         return Ok(false);
     }
@@ -3222,6 +3293,20 @@ fn reapply_dns_rules_checked(ctx: &mut Ctx) -> Result<bool, String> {
 }
 
 // --- local proxy -----------------------------------------------------------
+
+fn activate_local_proxy(ctx: &mut Ctx) -> Result<(), String> {
+    activate_local_proxy_with(ctx, |_| background::is_running() && !background::relay_is_outdated(),
+        enable_local_proxy_effect, ensure_route_carrier)
+}
+
+fn activate_local_proxy_with<T, E>(ctx: &mut T, ready: impl FnOnce(&mut T) -> bool,
+    activate: impl FnOnce(&mut T) -> Result<(), E>, prepare: impl FnOnce(&mut T) -> Result<(), E>) -> Result<(), E> {
+    if ready(ctx) {
+        activate(ctx)
+    } else {
+        prepare(ctx)
+    }
+}
 
 fn enable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
     ctx.log(Level::Step, "Локальный прокси");
@@ -3262,7 +3347,7 @@ fn enable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
     //    move the proxy while this waits (P26), and a URL for the port it left
     //    would be a dead one no watchdog takes back off.
     let Some(port) = proxy::wait_for_our_listener(Duration::from_secs(3))? else {
-        return Err("Локальный прокси не отвечает — сначала включите «Обход через DNS».".into());
+        return Err("Локальный прокси не отвечает после подготовки службы.".into());
     };
     let url = proxy::url_at(port);
 
@@ -3401,6 +3486,77 @@ pub fn resolve_manual_path(raw: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cold_carrier_precedes_proxy_and_routes_and_failures_stop_dependents() {
+        use super::{activate_local_proxy_with, apply_bypass_sequence, prepare_then_activate_carrier, Cap};
+        #[derive(Default)]
+        struct Fixture { intent: bool, running: bool, proxy: bool, events: Vec<&'static str> }
+        for failure in [None, Some("prepare"), Some("listener")] {
+            let mut fixture = Fixture::default();
+            let result = apply_bypass_sequence([Cap::LocalProxy, Cap::BuiltinExits, Cap::GroupProxy], |cap| {
+                if cap == Cap::LocalProxy {
+                    fixture.intent = true;
+                    activate_local_proxy_with(&mut fixture, |f| f.running, |_f| {
+                        panic!("a stopped carrier cannot use the prepared path")
+                    }, |f| prepare_then_activate_carrier(f, |f| {
+                        f.events.push("prepare");
+                        if failure == Some("prepare") { return Err("prepare failed"); }
+                        f.running = true;
+                        Ok(())
+                    }, |f| {
+                        f.events.push("listener");
+                        assert!(f.running);
+                        if failure == Some("listener") { return Err("listener failed"); }
+                        f.proxy = true;
+                        f.events.push("proxy");
+                        Ok(())
+                    }))
+                } else {
+                    fixture.events.push(if cap == Cap::BuiltinExits { "builtin" } else { "group" });
+                    Ok(())
+                }
+            });
+            assert!(fixture.intent);
+            match failure {
+                None => { assert_eq!(result, Ok(())); assert!(fixture.proxy); assert_eq!(fixture.events, ["prepare", "listener", "proxy", "builtin", "group"]); }
+                Some("prepare") => { assert_eq!(result, Err("prepare failed")); assert!(!fixture.running && !fixture.proxy); assert_eq!(fixture.events, ["prepare"]); }
+                Some("listener") => { assert_eq!(result, Err("listener failed")); assert!(fixture.running && !fixture.proxy); assert_eq!(fixture.events, ["prepare", "listener"]); }
+                _ => unreachable!(),
+            }
+        }
+    }
+    #[test]
+    fn bypass_sequence_runs_once_in_order_and_stops_on_first_error() {
+        use super::{apply_bypass_sequence, bypass_order, Cap};
+        for on in [true, false] {
+            let expected = bypass_order(on);
+            let mut seen = Vec::new();
+            let result: Result<(), &str> = apply_bypass_sequence(expected.clone(), |cap| {
+                seen.push(cap);
+                Ok(())
+            });
+            assert_eq!(result, Ok(()));
+            assert_eq!(seen, expected);
+
+            let mut attempted = Vec::new();
+            let failed = expected[1];
+            let result = apply_bypass_sequence(expected.clone(), |cap| {
+                attempted.push(cap);
+                if cap == failed { Err("first failure") } else { Ok(()) }
+            });
+            assert_eq!(result, Err("first failure"));
+            assert_eq!(attempted, expected[..2]);
+            assert!(!on || !expected.contains(&Cap::OwnProxy));
+        }
+    }
+    #[test]
+    fn mac_platform_features_are_unavailable_without_changing_other_platforms() {
+        use super::{feature_available_on, PlatformFeature};
+        for feature in [PlatformFeature::Dns, PlatformFeature::Watchdog, PlatformFeature::Wsl, PlatformFeature::LegacyCa] {
+            assert!(!feature_available_on(feature, true));
+            assert!(feature_available_on(feature, false));
+        }
+    }
     #[test]
     #[cfg(windows)]
     fn later_plan_failure_or_cancel_preserves_recovery_results_including_error_after_publish() {
@@ -3758,7 +3914,8 @@ mod tests {
     #[test]
     fn master_off_takes_every_way_down_and_on_never_picks_the_users_proxy() {
         let off = bypass_order(false);
-        assert_eq!(off.last(), Some(&Cap::Dns));
+        if Cap::Dns.available() { assert_eq!(off.last(), Some(&Cap::Dns)); }
+        else { assert!(!off.contains(&Cap::Dns)); }
         assert!(off.contains(&Cap::OwnProxy) && off.contains(&Cap::GroupProxy));
         assert!(!bypass_order(true).contains(&Cap::OwnProxy));
     }

@@ -601,9 +601,7 @@ fn bypass_master(app: &mut App, ui: &mut egui::Ui) {
         widgets::hint(ui, hint);
     });
     if flipped {
-        for cap in crate::ops::bypass_order(master) {
-            app.worker.send(Cmd::Set(cap, master));
-        }
+        app.worker.send(Cmd::SetBypass(master));
     }
 }
 
