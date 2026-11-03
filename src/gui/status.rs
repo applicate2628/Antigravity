@@ -79,7 +79,8 @@ pub struct Answered {
 
 /// Everything the verdict is made of. Plain values, so a test can build any
 /// state the window can be in.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "macos"), derive(Default))]
 pub struct Facts {
     /// Windows and elevated (or not Windows, where nothing needs it).
     pub admin: bool,
@@ -91,8 +92,14 @@ pub struct Facts {
     /// local proxy lives in the same service, and the loopback door only opens
     /// once the relay answers the gate hosts.
     pub bypass_on: bool,
+    #[cfg(not(target_os = "macos"))]
     pub relay_running: bool,
+    #[cfg(not(target_os = "macos"))]
     pub relay_outdated: bool,
+    #[cfg(target_os = "macos")]
+    pub relay_observation: Result<crate::ops::RelayObservation, String>,
+    #[cfg(target_os = "macos")]
+    pub relay_record_error: Option<String>,
     /// Our DNS rules are in. Without them nothing on the machine asks the
     /// service anything, however healthy it is.
     pub rules: bool,
@@ -132,6 +139,17 @@ pub struct Facts {
     pub overloaded: Option<(Duration, String)>,
     /// The newest 401 in the last ten minutes: how long ago, and how many.
     pub unauthorized: Option<(Duration, usize)>,
+}
+
+#[cfg(target_os = "macos")]
+impl Default for Facts {
+    fn default() -> Self {
+        Self { admin: false, installs_found: false, patch_on: false, bypass_on: false,
+            relay_observation: Err("состояние службы ещё не получено".into()), relay_record_error: None, rules: false,
+            relay_reporting: false, refusal: None, answer: None, answered: None, route: None,
+            proxy_blocked: None, door_blocked: None, dns_blocked: None, cut_off: false,
+            net_ok: None, relay_exe: String::new(), verify: None, overloaded: None, unauthorized: None }
+    }
 }
 
 /// One 401 can be a token refreshed a moment late; a credential Google stopped
@@ -181,7 +199,10 @@ impl Facts {
         // The relay's record is only worth anything while the relay runs: a record
         // outlives its writer by up to `STALE_AFTER`, and "обход перехватил" about a
         // dead service is the worst sentence this card could say (I58).
+        #[cfg(not(target_os = "macos"))]
         let relay = gate.relay.as_ref().filter(|_| s.relay_running);
+        #[cfg(target_os = "macos")]
+        let relay = gate.relay.as_ref().filter(|_| s.relay_observation.as_ref().is_ok_and(|observation| observation.running));
         let answered = refusal.and_then(|(ago, _)| {
             if ago > crate::gate::RECENT {
                 return None;
@@ -214,8 +235,14 @@ impl Facts {
             installs_found: s.installs.iter().any(|r| r.path.is_some()),
             patch_on: s.client_patch.is_on(),
             bypass_on: s.bypass_on(),
+            #[cfg(not(target_os = "macos"))]
             relay_running: s.relay_running,
+            #[cfg(not(target_os = "macos"))]
             relay_outdated: s.relay_outdated,
+            #[cfg(target_os = "macos")]
+            relay_observation: s.relay_observation.clone(),
+            #[cfg(target_os = "macos")]
+            relay_record_error: gate.relay_error.clone(),
             // Rules are only owed while the DNS switch is on: a route running alone
             // (own proxy, group, exits) has none by design.
             rules: s.rules || !s.dns.is_on() || !cfg!(target_os = "windows"),
@@ -420,6 +447,18 @@ pub fn blocker_line(b: &crate::gate::Blocker) -> String {
 }
 
 pub fn headline(f: &Facts) -> Headline {
+    #[cfg(target_os = "macos")]
+    let (relay_running, relay_outdated) = match &f.relay_observation {
+        Ok(observation) => (observation.running, observation.outdated),
+        Err(error) => return Headline { tone: Tone::Action, title: "Состояние службы недоступно".into(),
+            detail: error.clone(), action: None },
+    };
+    #[cfg(target_os = "macos")]
+    if let Some(error) = &f.relay_record_error {
+        return Headline { tone: Tone::Action, title: "Запись службы недоступна".into(), detail: error.clone(), action: None };
+    }
+    #[cfg(not(target_os = "macos"))]
+    let (relay_running, relay_outdated) = (f.relay_running, f.relay_outdated);
     // Nothing to work on. Said first: every other card assumes Antigravity is
     // installed, and a button that patches nothing is not an action.
     if !f.installs_found && !f.patch_on && !f.bypass_on {
@@ -502,7 +541,7 @@ pub fn headline(f: &Facts) -> Headline {
 
     // The bypass needs an administrator to install and to repair. Asked for
     // only when there is something it would install or repair.
-    let service_broken = f.bypass_on && (!f.relay_running || f.relay_outdated || !f.rules);
+    let service_broken = f.bypass_on && (!relay_running || relay_outdated || !f.rules);
     if !f.admin && (!f.bypass_on || service_broken) {
         return Headline {
             tone: Tone::Action,
@@ -536,9 +575,9 @@ pub fn headline(f: &Facts) -> Headline {
     if service_broken {
         return Headline {
             tone: Tone::Action,
-            title: if !f.relay_running {
+            title: if !relay_running {
                 "Служба обхода не работает".into()
-            } else if f.relay_outdated {
+            } else if relay_outdated {
                 "Служба обхода устарела".into()
             } else {
                 "Служба обхода работает не полностью".into()
@@ -740,14 +779,29 @@ pub fn plural(n: u64, one: &'static str, few: &'static str, many: &'static str) 
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unavailable_relay_is_reported_without_a_fabricated_running_state() {
+        let mut facts = working();
+        facts.relay_observation = Err("synthetic backend failure".into());
+        let headline = headline(&facts);
+        assert_eq!(headline.title, "Состояние службы недоступно");
+        assert!(headline.detail.contains("synthetic backend failure"));
+        assert_eq!(headline.action, None);
+    }
+
     fn working() -> Facts {
         Facts {
             admin: true,
             installs_found: true,
             patch_on: true,
             bypass_on: true,
+            #[cfg(not(target_os = "macos"))]
             relay_running: true,
+            #[cfg(not(target_os = "macos"))]
             relay_outdated: false,
+            #[cfg(target_os = "macos")]
+            relay_observation: Ok(crate::ops::RelayObservation { running: true, outdated: false }),
             rules: true,
             relay_reporting: true,
             ..Facts::default()
@@ -906,13 +960,19 @@ mod tests {
     #[test]
     fn a_dead_or_old_service_is_repaired_by_one_button() {
         let f = Facts {
+            #[cfg(not(target_os = "macos"))]
             relay_running: false,
+            #[cfg(target_os = "macos")]
+            relay_observation: Ok(crate::ops::RelayObservation { running: false, outdated: false }),
             ..working()
         };
         let h = headline(&f);
         assert_eq!((h.tone, h.action), (Tone::Action, Some(Action::Repair)));
         let f = Facts {
+            #[cfg(not(target_os = "macos"))]
             relay_outdated: true,
+            #[cfg(target_os = "macos")]
+            relay_observation: Ok(crate::ops::RelayObservation { running: true, outdated: true }),
             ..working()
         };
         assert_eq!(headline(&f).title, "Служба обхода устарела");

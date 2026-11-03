@@ -227,12 +227,16 @@ pub struct Status {
     pub vpn: Option<VpnSeen>,
     pub own_proxy_text: String,
     pub custom_dns_text: String,
+    #[cfg(not(target_os = "macos"))]
     pub relay_outdated: bool,
     /// Whether the relay task is registered *and* running. The raw fact, kept
     /// beside the `dns` row that already folds it into a verdict: the gate strip
     /// has to say "there is nobody to catch the next 400" without re-deriving it
     /// from a string meant for a switch.
+    #[cfg(not(target_os = "macos"))]
     pub relay_running: bool,
+    #[cfg(target_os = "macos")]
+    pub relay_observation: Result<RelayObservation, String>,
     /// Whether our NRPT rules are in. The raw fact, beside `relay_running`, for
     /// the same reason: a running service with no rules is a bypass nobody's
     /// queries ever reach, and the status card has to be able to say so.
@@ -247,6 +251,10 @@ pub struct Status {
     /// client's (D13, P34).
     pub relay_egress: Option<crate::egress::ClientEgress>,
 }
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayObservation { pub running: bool, pub outdated: bool }
 
 impl Status {
     pub fn get(&self, cap: Cap) -> &State {
@@ -359,7 +367,10 @@ pub enum Cmd {
     /// process spawns and neither belongs on the worker's queue.
     Probed {
         vpn: VpnSeen,
+        #[cfg(not(target_os = "macos"))]
         relay: bool,
+        #[cfg(target_os = "macos")]
+        relay: Result<RelayObservation, String>,
         relay_egress: Option<crate::egress::ClientEgress>,
     },
     /// Re-read the system *including* whether each install is patched, which
@@ -638,7 +649,10 @@ struct Ctx {
     last: Option<Status>,
     /// The raw pair `read_dns` needs, kept from the last system scan so the DNS
     /// row can be recomputed for a new `vpn_detect` without going near PowerShell.
+    #[cfg(not(target_os = "macos"))]
     dns_probe: (bool, bool),
+    #[cfg(target_os = "macos")]
+    relay_observation: Result<RelayObservation, String>,
     /// `ensure_route_carrier` switched the local-proxy wish on, rather than the
     /// user: only then does letting go of the last route switch it off again.
     carrier_set_proxy: bool,
@@ -734,7 +748,10 @@ fn run_worker(
         vpn: None,
         relay_egress: None,
         last: None,
+        #[cfg(not(target_os = "macos"))]
         dns_probe: (false, false),
+        #[cfg(target_os = "macos")]
+        relay_observation: Err("состояние службы ещё не получено".into()),
         carrier_set_proxy: false,
     };
 
@@ -1024,7 +1041,10 @@ fn run_worker(
                         .name("vpn-probe".to_string())
                         .spawn(move || {
                             let (vpn, relay_egress) = measure_vpn();
+                            #[cfg(not(target_os = "macos"))]
                             let relay = background::is_enabled() && background::is_running();
+                            #[cfg(target_os = "macos")]
+                            let relay = observe_relay();
                             MEASURING_VPN.store(false, Ordering::SeqCst);
                             let _ = back.send(Cmd::Probed {
                                 vpn,
@@ -1058,7 +1078,10 @@ fn run_worker(
                 // The raw half of `dns_probe`, refreshed without re-asking
                 // Windows about rules: the relay is the one of the two that
                 // stops on its own.
-                ctx.dns_probe.1 = relay;
+                #[cfg(not(target_os = "macos"))]
+                { ctx.dns_probe.1 = relay; }
+                #[cfg(target_os = "macos")]
+                { ctx.relay_observation = relay; }
                 push_status(&mut ctx, Scan::Settings);
             }
             Cmd::DeepRefresh => {
@@ -1506,9 +1529,11 @@ fn retire_replacement(ready: &mut crate::instances::GuiReplacementReady,
 /// pair the last system scan kept, so a settings-only flip updates the row
 /// it governs without going near a scheduled task.
 fn settings_only_status(ctx: &Ctx, prev: Status) -> Status {
+    #[cfg(not(target_os = "macos"))]
     let (rules, relay) = ctx.dns_probe;
     Status {
         wsl: wsl_status(ctx),
+        #[cfg(not(target_os = "macos"))]
         dns: platform_dns_state(
             prev.admin,
             rules,
@@ -1517,14 +1542,24 @@ fn settings_only_status(ctx: &Ctx, prev: Status) -> Status {
             ctx.settings.vpn_detect,
             ctx.settings.dns,
         ),
+        #[cfg(target_os = "macos")]
+        dns: State::Blocked("недоступно на этой платформе".into()),
         // Not `..prev`: `Cmd::Probed` refreshes this behind the window's back,
         // and a row carried forward from the last system scan would say a relay
         // that died an hour ago is still running.
+        #[cfg(not(target_os = "macos"))]
         relay_running: relay,
+        #[cfg(not(target_os = "macos"))]
         rules,
-        own_proxy_text: upstream::configured()
-            .map(|u| u.display())
-            .unwrap_or_else(|| ctx.settings.own_proxy.clone()),
+        #[cfg(target_os = "macos")]
+        relay_observation: ctx.relay_observation.clone(),
+        #[cfg(target_os = "macos")]
+        local_proxy: {
+            let current = read_local_proxy(&ctx.settings);
+            if matches!(&current, State::Blocked(_)) { current }
+            else { match &ctx.relay_observation { Err(error) => State::Blocked(error.clone()), Ok(_) => current } }
+        },
+        own_proxy_text: own_proxy_display(&ctx.settings),
         vpn: ctx.vpn,
         relay_egress: ctx.relay_egress,
         ..prev
@@ -1588,23 +1623,47 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
             let dns_probe = scope.spawn(probe_dns);
             let local_proxy = scope.spawn(move || read_local_proxy(settings));
             let own_proxy = scope.spawn(read_own_proxy);
-            let own_proxy_text = scope.spawn(move || {
-                upstream::configured()
-                    .map(|u| u.display())
-                    .unwrap_or_else(|| settings.own_proxy.clone())
-            });
+            let own_proxy_text = scope.spawn(move || own_proxy_display(settings));
+            #[cfg(not(target_os = "macos"))]
             let relay_outdated = scope.spawn(background::relay_is_outdated);
+            #[cfg(not(target_os = "macos"))]
+            let dns_result = dns_probe.join().unwrap_or((false, false));
+            #[cfg(target_os = "macos")]
+            let dns_result = dns_probe.join().unwrap_or_else(|_| Err("наблюдение службы прервано".into()));
+            #[cfg(not(target_os = "macos"))]
+            let outdated_result = relay_outdated.join().unwrap_or(false);
+            #[cfg(target_os = "macos")]
+            let outdated_result = ();
+            #[cfg(not(target_os = "macos"))]
+            let watchdog_result = watchdog.join().unwrap_or(State::Off);
+            #[cfg(target_os = "macos")]
+            let watchdog_result = watchdog.join().unwrap_or_else(|_| State::Blocked("наблюдение автопатча прервано".into()));
+            #[cfg(not(target_os = "macos"))]
+            let local_result = local_proxy.join().unwrap_or(State::Off);
+            #[cfg(target_os = "macos")]
+            let local_result = local_proxy.join().unwrap_or_else(|_| State::Blocked("наблюдение локального прокси прервано".into()));
+            #[cfg(not(target_os = "macos"))]
+            let own_result = own_proxy.join().unwrap_or(State::Off);
+            #[cfg(target_os = "macos")]
+            let own_result = own_proxy.join().unwrap_or_else(|_| State::Blocked("наблюдение своего прокси прервано".into()));
+            #[cfg(not(target_os = "macos"))]
+            let own_text_result = own_proxy_text.join().unwrap_or_default();
+            #[cfg(target_os = "macos")]
+            let own_text_result = own_proxy_text.join().unwrap_or_else(|_| "состояние своего прокси недоступно".into());
             (
                 installs.join().unwrap_or_default(),
-                watchdog.join().unwrap_or(State::Off),
-                dns_probe.join().unwrap_or((false, false)),
-                local_proxy.join().unwrap_or(State::Off),
-                own_proxy.join().unwrap_or(State::Off),
-                own_proxy_text.join().unwrap_or_default(),
-                relay_outdated.join().unwrap_or(false),
+                watchdog_result,
+                dns_result,
+                local_result,
+                own_result,
+                own_text_result,
+                outdated_result,
             )
         });
-    ctx.dns_probe = dns_probe;
+    #[cfg(not(target_os = "macos"))]
+    { ctx.dns_probe = dns_probe; }
+    #[cfg(target_os = "macos")]
+    { ctx.relay_observation = dns_probe.clone(); let _ = relay_outdated; }
 
     let patched: Vec<bool> = installs.iter().filter_map(|i| i.patched).collect();
     let client_patch = if patched.is_empty() {
@@ -1628,6 +1687,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         admin,
         client_patch,
         watchdog,
+        #[cfg(not(target_os = "macos"))]
         dns: platform_dns_state(
             admin,
             dns_probe.0,
@@ -1636,7 +1696,13 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
             ctx.settings.vpn_detect,
             ctx.settings.dns,
         ),
+        #[cfg(target_os = "macos")]
+        dns: State::Blocked("недоступно на этой платформе".into()),
+        #[cfg(not(target_os = "macos"))]
         local_proxy,
+        #[cfg(target_os = "macos")]
+        local_proxy: if matches!(&local_proxy, State::Blocked(_)) { local_proxy }
+            else { match &dns_probe { Ok(_) => local_proxy, Err(error) => State::Blocked(error.clone()) } },
         own_proxy,
         own_proxy_text,
         custom_dns_text: ctx.settings.custom_dns.clone(),
@@ -1644,9 +1710,16 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         group_proxy: State::Off,
         vpn: ctx.vpn,
         dns_rotation: State::Off,
+        #[cfg(not(target_os = "macos"))]
         relay_outdated,
+        #[cfg(not(target_os = "macos"))]
         relay_running: dns_probe.1,
+        #[cfg(not(target_os = "macos"))]
         rules: dns_probe.0,
+        #[cfg(target_os = "macos")]
+        relay_observation: dns_probe,
+        #[cfg(target_os = "macos")]
+        rules: false,
         relay_egress: ctx.relay_egress,
         providers: Vec::new(),
         installs,
@@ -1660,6 +1733,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
 /// decision can never disagree: anything else would be a second opinion, and a
 /// second opinion is how a user ends up told one thing while the layer does
 /// another.
+#[cfg(not(target_os = "macos"))]
 fn measure_vpn() -> (VpnSeen, Option<crate::egress::ClientEgress>) {
     use crate::egress::ClientEgress;
     let egress = crate::egress::detect();
@@ -1682,6 +1756,24 @@ fn measure_vpn() -> (VpnSeen, Option<crate::egress::ClientEgress>) {
         ClientEgress::Unknown => VpnSeen::Unmeasured,
     };
     (client, Some(reading.relay))
+}
+
+#[cfg(target_os = "macos")]
+fn measure_vpn() -> (VpnSeen, Option<crate::egress::ClientEgress>) {
+    use crate::egress::ClientEgress;
+    match crate::egress::read() {
+        Ok(reading) => {
+            let client = match reading.client {
+                ClientEgress::Physical => VpnSeen::NotCarryingClient,
+                ClientEgress::Tunnel => VpnSeen::CarryingClient,
+                ClientEgress::Mixed => VpnSeen::PartlyCarryingClient,
+                ClientEgress::ViaLocalProxy => VpnSeen::ViaLocalProxy,
+                ClientEgress::Unknown => VpnSeen::Unmeasured,
+            };
+            (client, Some(reading.relay))
+        },
+        Err(error) => { eprintln!("egress observation unavailable: {error}"); (VpnSeen::Unmeasured, None) }
+    }
 }
 
 /// The one line the journal gets when the answer changes. An `Unmeasured` is
@@ -1712,6 +1804,7 @@ fn watchdog_allowed(admin: bool) -> bool {
     Cap::Watchdog.available() && (admin || !cfg!(target_os = "windows"))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn read_watchdog(admin: bool) -> State {
     if !Cap::Watchdog.available() {
         State::Blocked("недоступно на этой платформе".into())
@@ -1724,16 +1817,31 @@ fn read_watchdog(admin: bool) -> State {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn read_watchdog(_admin: bool) -> State { State::Blocked("недоступно на этой платформе".into()) }
+
 /// The two facts about the DNS layer that only the machine can answer: are our
 /// NRPT rules in, and is the relay task both registered and running.
 ///
 /// Split from the verdict below so a settings-only refresh can rebuild the row
 /// from the last measurement instead of asking Windows again (`Scan::Settings`).
+#[cfg(not(target_os = "macos"))]
 fn probe_dns() -> (bool, bool) {
     let rules = dns::is_nrpt_applied();
     let relay = background::is_enabled() && background::is_running() && relay_reporting();
     (rules, relay)
 }
+
+#[cfg(target_os = "macos")]
+fn observe_relay() -> Result<RelayObservation, String> {
+    let enabled = background::is_enabled()?;
+    let running = background::is_running()?;
+    let outdated = background::relay_is_outdated()?;
+    Ok(RelayObservation { running: enabled && running, outdated })
+}
+
+#[cfg(target_os = "macos")]
+fn probe_dns() -> Result<RelayObservation, String> { observe_relay() }
 
 /// Whether the relay itself is alive, and not only a process of its name.
 ///
@@ -1799,6 +1907,7 @@ fn dns_state(
 /// failed removal made the window say «вкл» in the same minute the service
 /// logged «выключена в настройках», with nothing on screen to explain it or
 /// any way for the user to act on it (G74, two field reports on `2.15.1`).
+#[cfg(not(target_os = "macos"))]
 fn read_local_proxy(settings: &Settings) -> State {
     let url = proxy::proxy_url();
     if let Some(foreign) = endpoint::foreign_proxy(&url) {
@@ -1809,6 +1918,13 @@ fn read_local_proxy(settings: &Settings) -> State {
         return State::Blocked("в системе задан свой прокси".into());
     }
     local_proxy_state(settings.local_proxy, endpoint::proxy_env_is_ours())
+}
+
+#[cfg(target_os = "macos")]
+fn read_local_proxy(settings: &Settings) -> State {
+    let url = match proxy::proxy_url() { Ok(url) => url, Err(error) => return State::Blocked(error.to_string()) };
+    if endpoint::foreign_proxy(&url).is_some() { return State::Blocked("в системе задан свой прокси".into()); }
+    local_proxy_state(settings.local_proxy, endpoint::proxy_env_is_ours(&url))
 }
 
 /// The switch itself, away from the machine it reads.
@@ -1833,11 +1949,32 @@ fn local_proxy_state(wanted: bool, ours: bool) -> State {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+fn own_proxy_display(settings: &Settings) -> String {
+    upstream::configured().map(|up| up.display()).unwrap_or_else(|| settings.own_proxy.clone())
+}
+
+#[cfg(target_os = "macos")]
+fn own_proxy_display(settings: &Settings) -> String {
+    match upstream::configured() {
+        Ok(Some(up)) => up.display(), Ok(None) => settings.own_proxy.clone(),
+        Err(error) => format!("недоступно: {error}"),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn read_own_proxy() -> State {
     if upstream::configured().is_some() {
         State::On
     } else {
         State::Off
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_own_proxy() -> State {
+    match upstream::configured() {
+        Ok(Some(_)) => State::On, Ok(None) => State::Off, Err(error) => State::Blocked(error),
     }
 }
 
@@ -1946,6 +2083,7 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) -> Result<(), String> {
             // gone, so without the task back the switch would read off while
             // patching went on. `set_watchdog` no longer starts the relay, so
             // this does not depend on the bypass being wanted.
+            #[cfg(not(target_os = "macos"))]
             if watchdog_allowed(is_admin())
                 && ctx.settings.auto_patch_wanted()
                 && !background::is_watchdog_enabled()
@@ -2491,7 +2629,10 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
     }
     }
     if cancellation.load(Ordering::SeqCst) { return Ok(()); }
+    #[cfg(not(target_os = "macos"))]
     let configured = upstream::configured();
+    #[cfg(target_os = "macos")]
+    let configured = upstream::configured()?;
     if wanted.own_proxy_enabled {
         match upstream::parse(&wanted.own_proxy) {
             Ok(upstream) if configured.as_ref() != Some(&upstream) => {
@@ -2516,7 +2657,7 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
         if cancellation.load(Ordering::SeqCst) { return Ok(()); }
         return Ok(());
     }
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
     let rules = dns::is_nrpt_applied();
     let relay = background::is_running();
@@ -2537,6 +2678,18 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
         else { set_watchdog_effect(ctx, wanted.auto_patch)?; }
     }
     Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (url, local_applied) = selected_proxy()?;
+        if wanted.local_proxy {
+            activate_local_proxy_with_url(ctx, &url)?;
+        } else if local_applied {
+            disable_local_proxy_effect_with(ctx, &url)?;
+        }
+        if cancellation.load(Ordering::SeqCst) { return Ok(()); }
+        if routes_want_relay(wanted) { ensure_route_carrier(ctx)?; }
+        Ok(())
     }
 }
 
@@ -2559,8 +2712,10 @@ fn enable_all(ctx: &mut Ctx) -> Result<(), String> {
     // The service they ride on is brought up below, with DNS.
     ctx.settings.builtin_exits = true;
     ctx.settings.group_proxy = true;
+    #[cfg(not(target_os = "macos"))]
     let dns_on =
         dns::is_nrpt_applied() && background::is_running() && !background::relay_is_outdated();
+    #[cfg(not(target_os = "macos"))]
     if Cap::Dns.available() && !dns_on {
         if !admin {
             // Said only when it is actually missing: the card offers this button
@@ -2571,11 +2726,22 @@ fn enable_all(ctx: &mut Ctx) -> Result<(), String> {
     }
     // A proxy the user set up themselves stays theirs (G33): `enable_local_proxy`
     // says so and leaves ours off, which also keeps the loopback door shut.
-    if !endpoint::proxy_env_is_ours() {
+    #[cfg(not(target_os = "macos"))]
+    let proxy_is_ours = endpoint::proxy_env_is_ours();
+    #[cfg(target_os = "macos")]
+    let (url, proxy_is_ours) = selected_proxy()?;
+    if !proxy_is_ours {
+        #[cfg(not(target_os = "macos"))]
         apply(ctx, Cap::LocalProxy, true)?;
+        #[cfg(target_os = "macos")]
+        {
+            ctx.settings.local_proxy = true;
+            activate_local_proxy_with_url(ctx, &url)?;
+        }
     }
     // Whether or not the patch found anything to patch: auto-patch is what
     // patches the Antigravity installed after this click (D27).
+    #[cfg(not(target_os = "macos"))]
     if watchdog_allowed(admin) && !background::is_watchdog_enabled() {
         apply(ctx, Cap::Watchdog, true)?;
     }
@@ -2598,6 +2764,16 @@ fn patch_is_on(ctx: &Ctx) -> bool {
 /// that ate the copy in `%ProgramData%` - and every one of those is fixed by
 /// installing it again and putting its rules and variable back.
 fn repair(ctx: &mut Ctx) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let (url, _) = selected_proxy()?;
+        ctx.log(Level::Warn, "Правила DNS и отдельный автопатч недоступны и не восстанавливались.");
+        background::enable().map_err(|error| format!("Служба обхода не подготовлена: {error}"))?;
+        ensure_route_carrier_with(ctx, &url)?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     if cfg!(target_os = "windows") && !is_admin() {
         return Err("Нужны права администратора. Нажмите «Перезапустить от имени администратора».".into());
     }
@@ -2621,6 +2797,7 @@ fn repair(ctx: &mut Ctx) -> Result<(), String> {
         ensure_route_carrier(ctx)?;
     }
     Ok(())
+    }
 }
 
 // --- client patch ----------------------------------------------------------
@@ -2634,6 +2811,7 @@ fn repair(ctx: &mut Ctx) -> Result<(), String> {
 /// with it still registered the user saw auto-patch *on*, and it may act -
 /// which is the owner's own machine (G55). Written back at once, so the relay
 /// reads the settled answer and this runs once per machine.
+#[cfg(not(target_os = "macos"))]
 fn settle_decline(ctx: &mut Ctx) {
     if !Cap::Watchdog.available() { return; }
     if !ctx.settings.decline_unrecorded {
@@ -2643,6 +2821,9 @@ fn settle_decline(ctx: &mut Ctx) {
     ctx.settings.decline_unrecorded = false;
     ctx.settings.save();
 }
+
+#[cfg(target_os = "macos")]
+fn settle_decline(_ctx: &mut Ctx) {}
 
 /// Auto-patch from the window (D27): every install the last deep scan found
 /// unpatched is patched now, without a click, while auto-patch is on and the
@@ -2861,6 +3042,7 @@ fn enable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&All
 
     // I39: the legacy CA comes out last, and `remove_legacy_ca` itself refuses
     // while the relay is still an older build.
+    #[cfg(not(target_os = "macos"))]
     if feature_available(PlatformFeature::LegacyCa) { crate::remove_legacy_ca_quiet(); }
 
     ctx.log(Level::Ok, format!("Пропатчено установок: {}", ok));
@@ -2893,6 +3075,7 @@ fn disable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&Al
     }
     #[cfg(not(windows))]
     {
+        #[cfg(not(target_os = "macos"))]
         if Cap::Watchdog.available() { background::disable_watchdog(); }
         background::disable()?;
         let primary = revert_client_primary(ctx);
@@ -3031,6 +3214,7 @@ fn background_roles_effect(ctx: &mut Ctx, relay: bool, watchdog: bool) -> Result
     result
 }
 
+#[cfg(not(target_os = "macos"))]
 fn set_watchdog_effect(ctx: &mut Ctx, on: bool) -> Result<(), String> {
     if !Cap::Watchdog.available() { return Err("Автопатч недоступен на этой платформе.".into()); }
     #[cfg(windows)]
@@ -3052,8 +3236,14 @@ fn set_watchdog_effect(ctx: &mut Ctx, on: bool) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn set_watchdog_effect(_ctx: &mut Ctx, on: bool) -> Result<(), String> {
+    if on { background::enable_watchdog() } else { background::disable_watchdog() }
+}
+
 // --- DNS -------------------------------------------------------------------
 
+#[cfg(not(target_os = "macos"))]
 fn enable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
     if !Cap::Dns.available() { return Err("Правила DNS недоступны на этой платформе.".into()); }
     ctx.log(Level::Step, "Обход через DNS");
@@ -3100,6 +3290,10 @@ fn enable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn enable_dns_effect(_ctx: &mut Ctx) -> Result<(), String> { Err("Правила DNS недоступны на этой платформе.".into()) }
+
+#[cfg(not(target_os = "macos"))]
 fn disable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
     if !Cap::Dns.available() { return Err("Правила DNS недоступны на этой платформе.".into()); }
     ctx.log(Level::Step, "Отключение обхода через DNS");
@@ -3137,6 +3331,9 @@ fn disable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn disable_dns_effect(_ctx: &mut Ctx) -> Result<(), String> { Err("Правила DNS недоступны на этой платформе.".into()) }
+
 #[cfg(windows)]
 fn remove_dns_rules_effect(ctx: &mut Ctx) -> Result<(), String> {
     dns::remove_dns_nrpt_checked()?;
@@ -3156,6 +3353,7 @@ fn remove_dns_rules_effect(_ctx: &mut Ctx) -> Result<(), String> {
 /// `background::disable` is about to delete. It is taken down first and put
 /// back after, on a copy of its own: auto-patch is not part of the bypass,
 /// and switching the bypass off must not switch it off too.
+#[cfg(not(target_os = "macos"))]
 fn stop_relay_effect(ctx: &mut Ctx) -> Result<(), String> {
     #[cfg(windows)]
     return background_roles_effect(ctx, false, ctx.settings.auto_patch_wanted());
@@ -3176,6 +3374,9 @@ fn stop_relay_effect(ctx: &mut Ctx) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn stop_relay_effect(_ctx: &mut Ctx) -> Result<(), String> { background::disable() }
+
 /// Whether something other than the DNS rules needs the relay running: the
 /// proxy listener and every route it serves live inside it.
 fn routes_want_relay(s: &Settings) -> bool {
@@ -3190,8 +3391,20 @@ fn routes_want_relay(s: &Settings) -> bool {
 /// carried nothing - which is exactly how «свой прокси» "did not work" with the
 /// other ways off. Starts the service and points the client at it; the DNS
 /// rules are not touched.
+#[cfg(not(target_os = "macos"))]
 fn ensure_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
     prepare_then_activate_carrier(ctx, prepare_route_carrier, activate_prepared_carrier)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
+    let (url, _) = selected_proxy()?;
+    ensure_route_carrier_with(ctx, &url)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_route_carrier_with(ctx: &mut Ctx, url: &str) -> Result<(), String> {
+    prepare_then_activate_carrier(ctx, prepare_route_carrier, |ctx| activate_prepared_carrier_with(ctx, url))
 }
 
 fn prepare_then_activate_carrier<T, E>(ctx: &mut T, prepare: impl FnOnce(&mut T) -> Result<(), E>,
@@ -3215,6 +3428,7 @@ fn prepare_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn activate_prepared_carrier(ctx: &mut Ctx) -> Result<(), String> {
     // Wanted, whatever `enable_local_proxy` manages below: the relay writes the
     // variable itself once its listener answers, and the door opens only while
@@ -3230,21 +3444,37 @@ fn activate_prepared_carrier(ctx: &mut Ctx) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn activate_prepared_carrier_with(ctx: &mut Ctx, url: &str) -> Result<(), String> {
+    if !ctx.settings.local_proxy {
+        ctx.carrier_set_proxy = true;
+        ctx.settings.local_proxy = true;
+        if !ctx.settings.save() { return Err("Выбор локального прокси не сохранён.".into()); }
+    }
+    if !endpoint::proxy_env_is_ours(url) { enable_local_proxy_effect_with(ctx, url)?; }
+    Ok(())
+}
+
 /// The counterpart: a route went off, and if nothing else wants the service it
 /// goes too. Not while DNS is on - then it is the DNS layer's.
 fn release_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
     if (Cap::Dns.available() && ctx.settings.dns) || routes_want_relay_without_proxy_var(&ctx.settings) {
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    let (url, proxy_is_ours) = selected_proxy()?;
     if cfg!(target_os = "windows") && !is_admin() {
         return Err("Отключение службы требует прав администратора.".into());
     }
     if ctx.carrier_set_proxy {
         ctx.carrier_set_proxy = false;
         ctx.settings.local_proxy = false;
+        #[cfg(not(target_os = "macos"))]
         if endpoint::proxy_env_is_ours() {
             disable_local_proxy_effect(ctx)?;
         }
+        #[cfg(target_os = "macos")]
+        if proxy_is_ours { disable_local_proxy_effect_with(ctx, &url)?; }
     }
     // The local proxy switched on by the user keeps the service.
     if ctx.settings.local_proxy {
@@ -3294,14 +3524,34 @@ fn reapply_dns_rules_checked(ctx: &mut Ctx) -> Result<bool, String> {
 
 // --- local proxy -----------------------------------------------------------
 
+#[cfg(not(target_os = "macos"))]
 fn activate_local_proxy(ctx: &mut Ctx) -> Result<(), String> {
-    activate_local_proxy_with(ctx, |_| background::is_running() && !background::relay_is_outdated(),
+    activate_local_proxy_with(ctx, |_| Ok(background::is_running() && !background::relay_is_outdated()),
         enable_local_proxy_effect, ensure_route_carrier)
 }
 
-fn activate_local_proxy_with<T, E>(ctx: &mut T, ready: impl FnOnce(&mut T) -> bool,
+#[cfg(target_os = "macos")]
+fn selected_proxy() -> Result<(String, bool), String> {
+    let url = proxy::proxy_url().map_err(|error| error.to_string())?;
+    let ours = endpoint::proxy_env_is_ours(&url);
+    Ok((url, ours))
+}
+
+#[cfg(target_os = "macos")]
+fn activate_local_proxy(ctx: &mut Ctx) -> Result<(), String> {
+    let (url, _) = selected_proxy()?;
+    activate_local_proxy_with_url(ctx, &url)
+}
+
+#[cfg(target_os = "macos")]
+fn activate_local_proxy_with_url(ctx: &mut Ctx, url: &str) -> Result<(), String> {
+    activate_local_proxy_with(ctx, |_| Ok(background::is_running()? && !background::relay_is_outdated()?),
+        |ctx| enable_local_proxy_effect_with(ctx, url), |ctx| ensure_route_carrier_with(ctx, url))
+}
+
+fn activate_local_proxy_with<T, E>(ctx: &mut T, ready: impl FnOnce(&mut T) -> Result<bool, E>,
     activate: impl FnOnce(&mut T) -> Result<(), E>, prepare: impl FnOnce(&mut T) -> Result<(), E>) -> Result<(), E> {
-    if ready(ctx) {
+    if ready(ctx)? {
         activate(ctx)
     } else {
         prepare(ctx)
@@ -3309,12 +3559,19 @@ fn activate_local_proxy_with<T, E>(ctx: &mut T, ready: impl FnOnce(&mut T) -> bo
 }
 
 fn enable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
-    ctx.log(Level::Step, "Локальный прокси");
+    #[cfg(not(target_os = "macos"))]
     let url = proxy::proxy_url();
+    #[cfg(target_os = "macos")]
+    let url = proxy::proxy_url().map_err(|error| error.to_string())?;
+    enable_local_proxy_effect_with(ctx, &url)
+}
+
+fn enable_local_proxy_effect_with(ctx: &mut Ctx, url: &str) -> Result<(), String> {
+    ctx.log(Level::Step, "Локальный прокси");
 
     // 1. The user-wide pair that builds up to 2.11.0_4 wrote. It goes first:
     //    leaving it puts the whole machine through loopback (D19).
-    match endpoint::remove_legacy_proxy_env(&url) {
+    match endpoint::remove_legacy_proxy_env(url) {
         Ok(true) => ctx.log(Level::Ok, "Прежняя общесистемная HTTPS_PROXY снята."),
         Ok(false) => {}
         Err(e) => {
@@ -3325,8 +3582,8 @@ fn enable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
     // 2. Measured (G33): ours outranks theirs inside the patched server. A user
     //    who configured their own proxy must keep it, so ours comes off — this
     //    is not a "skip".
-    if endpoint::foreign_proxy(&url).is_some() {
-        endpoint::remove_proxy(&url, "").map_err(|error| format!("Своя переменная прокси не снята при чужом прокси: {error}"))?;
+    if endpoint::foreign_proxy(url).is_some() {
+        endpoint::remove_proxy(url, "").map_err(|error| format!("Своя переменная прокси не снята при чужом прокси: {error}"))?;
         return Err("В системе задан свой прокси — наш не включён, чтобы не перехватывать чужой. Выбор сохранён.".into());
     }
 
@@ -3357,10 +3614,17 @@ fn enable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
 }
 
 fn disable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
     let url = proxy::proxy_url();
+    #[cfg(target_os = "macos")]
+    let url = proxy::proxy_url().map_err(|error| error.to_string())?;
+    disable_local_proxy_effect_with(ctx, &url)
+}
+
+fn disable_local_proxy_effect_with(ctx: &mut Ctx, url: &str) -> Result<(), String> {
     // I45 again: `remove_proxy` collects its own failures and joins them, so a
     // half-failed removal still takes off everything it can.
-    endpoint::remove_proxy(&url, "").map_err(|error| format!("Снято не полностью: {error}"))?;
+    endpoint::remove_proxy(url, "").map_err(|error| format!("Снято не полностью: {error}"))?;
     ctx.log(Level::Ok, "Локальный прокси отключён.");
     Ok(())
 }
@@ -3496,7 +3760,7 @@ mod tests {
             let result = apply_bypass_sequence([Cap::LocalProxy, Cap::BuiltinExits, Cap::GroupProxy], |cap| {
                 if cap == Cap::LocalProxy {
                     fixture.intent = true;
-                    activate_local_proxy_with(&mut fixture, |f| f.running, |_f| {
+                    activate_local_proxy_with(&mut fixture, |f| Ok(f.running), |_f| {
                         panic!("a stopped carrier cannot use the prepared path")
                     }, |f| prepare_then_activate_carrier(f, |f| {
                         f.events.push("prepare");
@@ -3969,7 +4233,10 @@ mod tests {
             vpn: Some(VpnSeen::None),
             relay_egress: None,
             last: None,
+            #[cfg(not(target_os = "macos"))]
             dns_probe: (false, false),
+            #[cfg(target_os = "macos")]
+            relay_observation: Err("не проверено".into()),
             carrier_set_proxy: false,
         };
 
@@ -4008,8 +4275,12 @@ mod tests {
             vpn: None,
             own_proxy_text: String::new(),
             custom_dns_text: String::new(),
+            #[cfg(not(target_os = "macos"))]
             relay_outdated: false,
+            #[cfg(not(target_os = "macos"))]
             relay_running: false,
+            #[cfg(target_os = "macos")]
+            relay_observation: Err("не проверено".into()),
             rules: false,
             providers: Vec::new(),
             relay_egress: None,

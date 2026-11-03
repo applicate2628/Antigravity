@@ -226,7 +226,7 @@ pub fn log_dir() -> PathBuf {
 /// On Linux the per-user state dir follows the XDG base-dir spec
 /// (`~/.local/share/agunlocker`), which is also where the own-proxy config and
 /// any relay log will live once that layer is ported.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn log_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .ok()
@@ -238,24 +238,48 @@ pub fn log_dir() -> PathBuf {
     PathBuf::from(base).join("agunlocker")
 }
 
+#[cfg(target_os = "macos")]
+pub fn log_dir() -> Result<PathBuf, crate::user_state_location::MacStateError> {
+    Ok(crate::user_state_location::macos_state_paths()?.state_dir().to_path_buf())
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn log_path() -> PathBuf {
     log_dir().join("forwarder.log")
 }
 
+#[cfg(target_os = "macos")]
+pub fn log_path() -> Result<PathBuf, crate::user_state_location::MacStateError> {
+    Ok(log_dir()?.join("forwarder.log"))
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn version_path() -> PathBuf {
     log_dir().join(VERSION_FILE)
+}
+
+#[cfg(target_os = "macos")]
+pub fn version_path() -> Result<PathBuf, crate::user_state_location::MacStateError> {
+    Ok(log_dir()?.join(VERSION_FILE))
 }
 
 /// Records which relay generation is in place. Called both by the installer and
 /// by the relay itself at startup: the installer's write is what makes the
 /// answer correct the moment an upgrade finishes, and the relay's write is what
 /// keeps it honest if the exe ever gets there some other way.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn record_version() {
     if let Some(dir) = version_path().parent() {
         fs::create_dir_all(dir).ok();
     }
     fs::write(version_path(), RELAY_VERSION.to_string()).ok();
+}
+
+#[cfg(target_os = "macos")]
+pub fn record_version() -> Result<(), String> {
+    let state = crate::user_state_location::macos_state_paths().map_err(|error| error.to_string())?;
+    state.replace_file(VERSION_FILE, RELAY_VERSION.to_string().as_bytes(), crate::user_state_location::MacStateFile::Public)
+        .map_err(|error| format!("relay version write: {error}"))
 }
 
 /// One received Windows nonsecret generation file. The native plan retains
@@ -318,9 +342,13 @@ pub fn record_version() {
 
 /// The relay generation currently installed. `0` for a relay old enough not to
 /// have written one - which is exactly the case worth reporting.
+#[cfg(not(target_os = "macos"))]
 pub fn installed_version() -> u32 {
     parse_version(fs::read_to_string(version_path()).ok().as_deref())
 }
+
+#[cfg(target_os = "macos")]
+pub fn installed_version() -> Result<u32, String> { checked_installed_version() }
 
 /// Anything unreadable counts as the oldest possible relay: the file is written
 /// by us and never edited, so a value that will not parse means something else
@@ -334,12 +362,23 @@ fn parse_version_checked(raw: &str) -> Result<u32, String> {
 }
 
 /// Fresh version evidence: only an absent version file means a pre-versioned relay.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub(crate) fn checked_installed_version() -> Result<u32, String> {
     match fs::read_to_string(version_path()) {
         Ok(raw) => parse_version_checked(&raw),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
         Err(e) => Err(format!("read relay version: {e}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn checked_installed_version() -> Result<u32, String> {
+    let state = crate::user_state_location::macos_state_paths().map_err(|error| error.to_string())?;
+    match state.read_file(VERSION_FILE, crate::user_state_location::MacStateFile::Public) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|error| format!("invalid relay version: {error}"))
+            .and_then(|text| parse_version_checked(&text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(format!("read relay version: {error}")),
     }
 }
 
@@ -381,6 +420,21 @@ fn log(line: &str) {
     if note.is_none() && !write_line {
         return;
     }
+    let at = stamp();
+    let mut entry = String::new();
+    if let Some(note) = note { entry.push_str(&format!("{} {}\n", at, note)); }
+    if write_line { entry.push_str(&format!("{} {}\n", at, line)); }
+    #[cfg(target_os = "macos")]
+    {
+        match crate::user_state_location::macos_state_paths() {
+            Ok(state) => if let Err(error) = state.append_log("forwarder.log", entry.as_bytes(), LOG_LIMIT_BYTES) {
+                eprintln!("forwarder log unavailable: {error}");
+            },
+            Err(error) => eprintln!("forwarder log unavailable: {error}"),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     let path = log_path();
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).ok();
@@ -394,15 +448,8 @@ fn log(line: &str) {
         // processes) logging at once interleaved into lines like
         // «16:48:2616:48:26 PASSTHROUGH … PASSTHROUGH …» - seen in reports from
         // both platforms.
-        let at = stamp();
-        let mut entry = String::new();
-        if let Some(note) = note {
-            entry.push_str(&format!("{} {}\n", at, note));
-        }
-        if write_line {
-            entry.push_str(&format!("{} {}\n", at, line));
-        }
         f.write_all(entry.as_bytes()).ok();
+    }
     }
 }
 
@@ -629,6 +676,16 @@ fn warm_forever() {
         // watching the window. The leader is the one the last pass settled on,
         // which is the one in force right now.
         let exit_country = vpn_exit_country();
+        #[cfg(target_os = "macos")]
+        let profile = match proxy::checked_route_profile(ROUTE_PROBE_HOST) {
+            Ok(profile) => Some(profile),
+            Err(error) => { log_proxy(&format!("route configuration unavailable: {error}")); None }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let route_rows = Some(routes::rows(|k| proxy::route_usable(k, ROUTE_PROBE_HOST)));
+        #[cfg(target_os = "macos")]
+        let route_rows = profile.as_ref().map(|profile| routes::rows(|k| profile.usable(k, ROUTE_PROBE_HOST)));
+        if let Some(route_rows) = route_rows {
         gate::publish(gate::Now {
             route: routes::leader().map(|k| k.label()),
             forced_for: resolvers::substitution_forced_for(),
@@ -636,8 +693,9 @@ fn warm_forever() {
             loopback: loopback::active(),
             tunnel: net::tunnel_up(),
             vpn_exit: &exit_country,
-            routes: routes::rows(|k| proxy::route_usable(k, ROUTE_PROBE_HOST)),
+            routes: route_rows,
         });
+        }
         // One syscall, every pass: where the default route goes now. A change
         // is a VPN coming up or going down, or a different network - worth the
         // full scan right away rather than on the four-minute clock.
@@ -656,6 +714,7 @@ fn warm_forever() {
         // relay changes what it *answers* instead, which needs no privilege and
         // reaches the same place. Menu 1 removes the rules outright on the next
         // elevated run (`dns::refresh_pinned_hosts`).
+        #[cfg(not(target_os = "macos"))]
         if since_vpn >= VPN_CHECK_EVERY {
             // A tunnel holding the default route no longer takes the bypass down
             // (D25): the client's gate connections come to us on loopback, so the
@@ -709,6 +768,11 @@ fn warm_forever() {
             }
             since_vpn = Duration::ZERO;
         }
+        #[cfg(target_os = "macos")]
+        if since_vpn >= VPN_CHECK_EVERY {
+            log_proxy("macOS egress observation is unavailable");
+            since_vpn = Duration::ZERO;
+        }
         if net::tunnel_up() && since_exit_check >= VPN_EXIT_EVERY {
             measure_vpn_exit();
             since_exit_check = Duration::ZERO;
@@ -718,7 +782,11 @@ fn warm_forever() {
         // half a minute after a failed detection, and taking that for a new
         // network wiped every bench - and put back first the route the gate had
         // just refused - twice per hiccup.
-        if egress != 0 && routes::set_context(network_fingerprint(egress, best, net::tunnel_up())) {
+        #[cfg(not(target_os = "macos"))]
+        let route_inputs_available = true;
+        #[cfg(target_os = "macos")]
+        let route_inputs_available = profile.is_some();
+        if route_inputs_available && egress != 0 && routes::set_context(network_fingerprint(egress, best, net::tunnel_up())) {
             log_proxy("сеть изменилась — что работает, выясняется заново");
         }
         // The client logs are watched on a thread of their own every two
@@ -735,6 +803,7 @@ fn warm_forever() {
         // treats it as a last resort (an unmeasured route sorts after every
         // measured one); it is touched unbidden only to lift a bench a real
         // failure set, so a transient fault is not made permanent.
+        if route_inputs_available {
         if proxy::relay_is_benched() {
             proxy::probe_relay();
         }
@@ -743,7 +812,10 @@ fn warm_forever() {
         // the moment it works again - which is what they asked for when they
         // gave us one.
         if upstream::OWN.health.is_benched() || since_upstream >= PROBE_HEALTHY_EVERY {
+            #[cfg(not(target_os = "macos"))]
             upstream::probe_health();
+            #[cfg(target_os = "macos")]
+            if let Err(error) = upstream::probe_health() { log_proxy(&format!("upstream configuration unavailable: {error}")); }
             since_upstream = Duration::ZERO;
         }
         // The built-in exits are checked on the same clock in *both* states, and
@@ -756,7 +828,12 @@ fn warm_forever() {
         // route working at all.
         if since_exits >= PROBE_HEALTHY_EVERY {
             proxy::probe_exits();
+            #[cfg(not(target_os = "macos"))]
             crate::group::probe_health();
+            #[cfg(target_os = "macos")]
+            if let Some(profile) = &profile {
+                if let Err(error) = profile.probe_captured_group() { log_proxy(&format!("group state unavailable: {error}")); }
+            }
             since_exits = Duration::ZERO;
         }
         // The direct route is timed on the same clock as the others, so the
@@ -767,7 +844,11 @@ fn warm_forever() {
             proxy::probe_vpn();
             since_direct = Duration::ZERO;
         }
+        #[cfg(not(target_os = "macos"))]
         routes::refresh_leader(|k| proxy::route_usable(k, ROUTE_PROBE_HOST));
+        #[cfg(target_os = "macos")]
+        if let Some(profile) = &profile { routes::refresh_leader(|k| profile.usable(k, ROUTE_PROBE_HOST)); }
+        }
         thread::sleep(WARM_EVERY);
         since_upstream += WARM_EVERY;
         since_exits += WARM_EVERY;
@@ -789,7 +870,14 @@ fn watch_client_logs() {
         thread::sleep(LOG_WATCH_EVERY);
         // The user switched their own proxy off: its open tunnels go too. A pooled
         // client connection would otherwise keep using it for as long as it lives.
-        if upstream::configured().is_none() {
+        #[cfg(not(target_os = "macos"))]
+        let own_missing = Some(upstream::configured().is_none());
+        #[cfg(target_os = "macos")]
+        let own_missing = match upstream::configured() {
+            Ok(value) => Some(value.is_none()),
+            Err(error) => { log_proxy(&format!("upstream configuration unavailable: {error}")); None }
+        };
+        if own_missing == Some(true) {
             routes::cut_kind(routes::Kind::Own);
         }
         let hits = ls_log::poll();
@@ -1211,7 +1299,10 @@ pub fn run() -> Result<(), String> {
     // direct resolvers - and then caches that unsubstituted answer for its full
     // TTL, so one slow startup is felt for minutes.
     log(&format!("egress: if{}", isp_interface()));
+    #[cfg(not(target_os = "macos"))]
     record_version();
+    #[cfg(target_os = "macos")]
+    record_version()?;
     // Before any listener is tried: from here on the window can tell this
     // process from its own watchdog by the age of what it writes (P54).
     gate::note_started();
@@ -1260,7 +1351,10 @@ pub fn run() -> Result<(), String> {
 /// proxy environment variable, then serves the local proxy on 127.0.0.1:53129.
 pub fn run_proxy_service() -> Result<(), String> {
     log_proxy("служба обхода (локальный прокси) запущена");
+    #[cfg(not(target_os = "macos"))]
     record_version();
+    #[cfg(target_os = "macos")]
+    record_version()?;
     gate::note_started();
     thread::spawn(warm_forever);
     thread::spawn(watch_client_logs);
@@ -1277,7 +1371,13 @@ fn spawn_proxy_env_maintainer() {
         // need it most - the ones where 53129 is taken or reserved, where the old
         // value names a port that no longer answers and takes the whole machine's
         // proxy-aware traffic with it (G20, G31).
-        match crate::endpoint::remove_legacy_proxy_env(&proxy::proxy_url()) {
+        #[cfg(not(target_os = "macos"))]
+        let initial_url = proxy::proxy_url();
+        #[cfg(target_os = "macos")]
+        let initial_url = match proxy::proxy_url() {
+            Ok(url) => url, Err(error) => { log_proxy(&format!("proxy state unavailable: {error}")); return; }
+        };
+        match crate::endpoint::remove_legacy_proxy_env(&initial_url) {
             Ok(true) => log_proxy("снята прежняя общесистемная HTTPS_PROXY"),
             Ok(false) => {}
             Err(e) => log_proxy(&format!("прежняя HTTPS_PROXY не снята: {}", e)),
@@ -1321,7 +1421,12 @@ fn spawn_proxy_env_maintainer() {
                     Ok(crate::endpoint::Outcome::AlreadySet) => {}
                     Err(e) => log_proxy(&format!("{} не восстановлена: {}", var, e)),
                 }
-            } else if crate::endpoint::proxy_env_is_ours() {
+            } else if {
+                #[cfg(not(target_os = "macos"))]
+                { crate::endpoint::proxy_env_is_ours() }
+                #[cfg(target_os = "macos")]
+                { crate::endpoint::proxy_env_is_ours(&url) }
+            } {
                 // Off in the settings and still set. `remove_proxy` judges each
                 // variable on its own: `PROXY_ENV_VAR` is a name only this tool
                 // writes, and the legacy pair is removed by value, so a proxy of

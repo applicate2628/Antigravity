@@ -53,17 +53,65 @@ const FALLBACK_PORTS: [u16; 6] = [43129, 44129, 45129, 46129, 47129, 48129];
 
 /// The port this process bound, 0 until it has (the relay's own answer).
 static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+const PORT_FILE: &str = "proxy_port";
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub enum MacProxyPortError {
+    State(crate::user_state_location::MacStateError),
+    RecordIo(std::io::Error),
+    InvalidRecord,
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for MacProxyPortError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::State(error) => write!(f, "state unavailable: {error}"),
+            Self::RecordIo(error) => write!(f, "proxy port record: {error}"),
+            Self::InvalidRecord => f.write_str("invalid proxy port record"),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_port_from_record(bound: u16, record: impl FnOnce() -> std::io::Result<String>) -> Result<u16, MacProxyPortError> {
+    if bound != 0 { return Ok(bound); }
+    match record() {
+        Ok(text) => text.trim().parse::<u16>().ok().filter(|port| *port != 0).ok_or(MacProxyPortError::InvalidRecord),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(DEFAULT_PORT),
+        Err(error) if error.kind() == ErrorKind::InvalidData => Err(MacProxyPortError::InvalidRecord),
+        Err(error) => Err(MacProxyPortError::RecordIo(error)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn checked_mac_port() -> Result<u16, MacProxyPortError> {
+    mac_port_with_state(crate::user_state_location::macos_state_paths(),
+        || PORT.load(std::sync::atomic::Ordering::Relaxed),
+        |state| state.read_file(PORT_FILE, crate::user_state_location::MacStateFile::Public)
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_port_with_state<T>(state: Result<T, crate::user_state_location::MacStateError>,
+    bound: impl FnOnce() -> u16, record: impl FnOnce(T) -> std::io::Result<String>) -> Result<u16, MacProxyPortError> {
+    let state = state.map_err(MacProxyPortError::State)?;
+    mac_port_from_record(bound(), || record(state))
+}
 
 /// The file the relay records a moved port in, beside `settings.json` - the one
 /// place the window (another process, as the same user) and the relay agree on.
 /// Absent while the proxy is on `DEFAULT_PORT`.
+#[cfg(not(target_os = "macos"))]
 fn port_file() -> PathBuf {
-    crate::dns_forwarder::log_dir().join("proxy_port")
+    crate::dns_forwarder::log_dir().join(PORT_FILE)
 }
 
 /// The port the local proxy listens on: the one this process bound, else the
 /// one the relay recorded, else the default. Everything that names the proxy -
 /// the variable, the door's hop, the egress probe - asks this.
+#[cfg(not(target_os = "macos"))]
 pub fn port() -> u16 {
     match PORT.load(std::sync::atomic::Ordering::Relaxed) {
         0 => fs::read_to_string(port_file())
@@ -75,7 +123,11 @@ pub fn port() -> u16 {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub fn port() -> Result<u16, MacProxyPortError> { checked_mac_port() }
+
 /// Takes `port` as this machine's, in this process and on disk.
+#[cfg(not(target_os = "macos"))]
 fn adopt(port: u16) {
     PORT.store(port, std::sync::atomic::Ordering::Relaxed);
     // Never from a test: the file is the real user's, and the relay reads it.
@@ -91,6 +143,17 @@ fn adopt(port: u16) {
         }
         fs::write(path, port.to_string()).ok();
     }
+}
+
+#[cfg(target_os = "macos")]
+fn adopt(port: u16) -> Result<(), MacProxyPortError> {
+    let state = crate::user_state_location::macos_state_paths().map_err(MacProxyPortError::State)?;
+    PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+    if cfg!(test) { return Ok(()); }
+    let result = if port == DEFAULT_PORT { state.remove_file(PORT_FILE, crate::user_state_location::MacStateFile::Public) }
+        else { state.replace_file(PORT_FILE, port.to_string().as_bytes(), crate::user_state_location::MacStateFile::Public) };
+    if let Err(error) = result { eprintln!("proxy port record write failed: {error}"); }
+    Ok(())
 }
 
 /// The URL the variable held before any move - still ours, never a foreign
@@ -207,9 +270,13 @@ fn ca_key_path() -> PathBuf {
 }
 
 /// The proxy URL that goes into the environment of the processes being routed.
+#[cfg(not(target_os = "macos"))]
 pub fn proxy_url() -> String {
     url_at(port())
 }
+
+#[cfg(target_os = "macos")]
+pub fn proxy_url() -> Result<String, MacProxyPortError> { port().map(url_at) }
 
 /// The URL naming the proxy on `port`.
 pub fn url_at(port: u16) -> String {
@@ -230,7 +297,10 @@ pub fn url_at(port: u16) -> String {
 pub fn wait_for_our_listener(budget: Duration) -> Result<Option<u16>, String> {
     let deadline = Instant::now() + budget;
     loop {
+        #[cfg(not(target_os = "macos"))]
         let p = port();
+        #[cfg(target_os = "macos")]
+        let p = port().map_err(|error| error.to_string())?;
         if ours_answers(p)? {
             return Ok(Some(p));
         }
@@ -273,9 +343,13 @@ fn ours_answers(port: u16) -> Result<bool, String> {
 
 /// The address the listener holds, as a `SocketAddr`. The IP is a literal in
 /// this file, so it cannot fail.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn listen_addr() -> std::net::SocketAddr {
     addr_at(port())
 }
+
+#[cfg(target_os = "macos")]
+pub(crate) fn listen_addr() -> Result<std::net::SocketAddr, MacProxyPortError> { port().map(addr_at) }
 
 fn addr_at(port: u16) -> std::net::SocketAddr {
     std::net::SocketAddr::from((LISTEN_IP.parse::<Ipv4Addr>().unwrap(), port))
@@ -288,9 +362,13 @@ fn addr_at(port: u16) -> std::net::SocketAddr {
 /// leave Antigravity unrouted - it takes every proxy-aware program on the machine
 /// with it, the language server's own OAuth call included (G31). Nothing may set
 /// that variable without asking this first.
+#[cfg(not(target_os = "macos"))]
 pub fn listener_answers() -> bool {
     answers_at(listen_addr())
 }
+
+#[cfg(target_os = "macos")]
+pub fn listener_answers() -> Result<bool, MacProxyPortError> { listen_addr().map(answers_at) }
 
 /// The check above, with the address given: the product asks about its own port,
 /// and a test needs one nothing else on the machine can be holding. Waiting for
@@ -430,20 +508,29 @@ impl<'a> GateTarget443<'a> {
 
 /// The settings and separately owned credentials captured for one gate request.
 /// Health remains live; configuration is not reread during this request.
-struct DesiredRouteProfile {
+pub(crate) struct DesiredRouteProfile {
     settings: crate::settings::Settings,
     own: Option<upstream::Upstream>,
     group: Option<crate::group_key::GroupKey>,
 }
 
 impl DesiredRouteProfile {
+    #[cfg(not(target_os = "macos"))]
     fn capture(_target: &GateTarget443<'_>) -> Self {
         let (settings, group) = crate::group::capture_route_profile();
         let own = upstream::configured();
         Self { settings, own, group }
     }
 
-    fn usable(&self, kind: routes::Kind, host: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    fn capture(_target: &GateTarget443<'_>) -> Result<Self, String> {
+        let (settings, group, own) = crate::group::capture_route_profile(|settings| {
+            if settings.own_proxy_enabled { upstream::configured() } else { Ok(None) }
+        })?;
+        Ok(Self { settings, own, group })
+    }
+
+    pub(crate) fn usable(&self, kind: routes::Kind, host: &str) -> bool {
         match kind {
             routes::Kind::Own => self.settings.own_proxy_enabled
                 && self.own.is_some() && upstream::OWN.usable(),
@@ -454,6 +541,14 @@ impl DesiredRouteProfile {
             routes::Kind::Direct => direct_usable(host),
             routes::Kind::Vpn => vpn_usable(),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn probe_captured_group(&self) -> Result<(), String> {
+        if self.settings.group_proxy {
+            if let Some(key) = &self.group { crate::group::probe_health_captured(key)?; }
+        }
+        Ok(())
     }
 
     fn order(&self, host: &str) -> Vec<routes::Kind> {
@@ -475,14 +570,19 @@ impl DesiredRouteProfile {
 /// cutting them at the handshake, which is exactly how the relay failed - is left
 /// to the probe, because "bytes moved" is not the same question as "it worked"
 /// and reading it that way once already let an outage run.
-fn try_own_proxy(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
+#[cfg(not(target_os = "macos"))]
+fn try_own_proxy(client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
     if port != 443 || !is_gate_host(host) || !upstream::available() {
         return Err(client);
     }
     let Some(up) = upstream::configured() else {
         return Err(client);
     };
-    let upstream_sock = match upstream::open(&up, host, port, upstream::LIVE_OPEN_BUDGET) {
+    try_own_proxy_received(client, host, port, &up)
+}
+
+fn try_own_proxy_received(mut client: TcpStream, host: &str, port: u16, up: &upstream::Upstream) -> Result<(), TcpStream> {
+    let upstream_sock = match upstream::open(up, host, port, upstream::LIVE_OPEN_BUDGET) {
         Ok(sock) => sock,
         Err(why) => {
             // The route's name, never its address: this log goes into the report
@@ -716,6 +816,7 @@ fn vpn_usable() -> bool {
 /// What is asked about here is whether the route exists at all on this machine
 /// right now: a proxy the user has not given us, a tunnel that is not up, a
 /// pool with nothing in it, a name the DNS layer is not substituting.
+#[cfg(not(target_os = "macos"))]
 pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
     match kind {
         routes::Kind::Own => upstream::available(),
@@ -729,6 +830,16 @@ pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
         routes::Kind::Direct => direct_usable(host),
         routes::Kind::Vpn => vpn_usable(),
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn checked_route_profile(host: &str) -> Result<DesiredRouteProfile, String> {
+    DesiredRouteProfile::capture(&GateTarget443 { host })
+}
+
+#[cfg(target_os = "macos")]
+pub fn route_usable(kind: routes::Kind, host: &str) -> Result<bool, String> {
+    Ok(checked_route_profile(host)?.usable(kind, host))
 }
 
 /// The direct tunnel reaches something useful when the relay last answered the
@@ -1105,6 +1216,7 @@ fn try_relay_route(client: TcpStream, _host: &str, _port: u16) -> Result<(), Tcp
     Err(client)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn try_group(client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
     if port == 443 && is_gate_host(host) && crate::group::available() {
         crate::group::tunnel(client, host, port)
@@ -1188,13 +1300,46 @@ fn serve_gate(client: TcpStream, host: &str, port: u16) {
     let started = Instant::now();
     let mut client = client;
     let mut tried_direct = false;
-    for kind in routes::order(|k| route_usable(k, host)) {
+    #[cfg(target_os = "macos")]
+    let profile = match checked_route_profile(host) {
+        Ok(profile) => profile,
+        Err(error) => { crate::dns_forwarder::log_proxy(&format!("route configuration unavailable: {error}")); let _ = client.write_all(RESP_BAD_GATEWAY); return; }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let order = routes::order(|k| route_usable(k, host));
+    #[cfg(target_os = "macos")]
+    let order = profile.order(host);
+    for kind in order {
         if started.elapsed() >= GATE_OPEN_BUDGET {
             break;
         }
+        #[cfg(target_os = "macos")]
+        if kind == routes::Kind::Group {
+            let current = match profile.group.as_ref() {
+                Some(key) => crate::group::captured_key_is_current(key),
+                None => Ok(false),
+            };
+            match current {
+                Ok(true) => {},
+                Ok(false) => { crate::dns_forwarder::log_proxy("group configuration changed after route capture"); let _ = client.write_all(RESP_BAD_GATEWAY); return; },
+                Err(error) => { crate::dns_forwarder::log_proxy(&format!("group state unavailable: {error}")); let _ = client.write_all(RESP_BAD_GATEWAY); return; },
+            }
+        }
         let attempt = match kind {
+            #[cfg(not(target_os = "macos"))]
             routes::Kind::Own => try_own_proxy(client, host, port),
+            #[cfg(target_os = "macos")]
+            routes::Kind::Own => match profile.own.as_ref() {
+                Some(up) => try_own_proxy_received(client, host, port, up),
+                None => Err(client),
+            },
+            #[cfg(not(target_os = "macos"))]
             routes::Kind::Group => try_group(client, host, port),
+            #[cfg(target_os = "macos")]
+            routes::Kind::Group => match profile.group.as_ref() {
+                Some(key) => crate::group::tunnel_captured(client, host, port, key),
+                None => Err(client),
+            },
             routes::Kind::Exits => try_builtin_exit(client, host, port),
             routes::Kind::Relay => try_relay_route(client, host, port),
             routes::Kind::Direct => {
@@ -1207,9 +1352,27 @@ fn serve_gate(client: TcpStream, host: &str, port: u16) {
             Ok(()) => return,
             // Failed before any `200`: not the gate, just a route that would not
             // open. Out of the way of the next few connections.
-            Err(returned) => {
+            Err(mut returned) => {
+                #[cfg(target_os = "macos")]
+                if kind == routes::Kind::Group {
+                    let received = match profile.group.as_ref() {
+                        Some(key) => crate::group::stumble_if_current(key), None => Ok(false),
+                    };
+                    match received {
+                        Ok(true) => {},
+                        Ok(false) => { crate::dns_forwarder::log_proxy("group configuration changed during route attempt"); let _ = returned.write_all(RESP_BAD_GATEWAY); return; },
+                        Err(error) => { crate::dns_forwarder::log_proxy(&format!("group state unavailable: {error}")); let _ = returned.write_all(RESP_BAD_GATEWAY); return; },
+                    }
+                    returned
+                } else {
+                    routes::stumble(kind);
+                    returned
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
                 routes::stumble(kind);
                 returned
+                }
             }
         };
     }
@@ -1243,6 +1406,12 @@ fn serve_gate(mut client: TcpStream, host: &str, port: u16) {
     let cancelled = AtomicBool::new(false);
     let opened = match route_session::open_selected_route(&target, deadline, &cancelled, None) {
         Ok(opened) => opened,
+        #[cfg(target_os = "macos")]
+        Err(route_session::OpenFailure::Configuration(error)) => {
+            crate::dns_forwarder::log_proxy(&format!("route configuration unavailable: {error}"));
+            let _ = client.write_all(RESP_BAD_GATEWAY);
+            return;
+        }
         Err(_) => {
             let _ = client.write_all(RESP_BAD_GATEWAY);
             return;
@@ -1284,11 +1453,28 @@ const BIND_RETRY_WAIT: Duration = Duration::from_secs(3);
 /// unless the refusal is security software's (which follows this program to any
 /// port), the proxy moves to one outside the dynamic range and records it
 /// (`adopt`), so the variable written after it names the port that answers.
-fn bind_listener() -> Result<TcpListener, crate::gate::Blocker> {
+#[cfg(not(target_os = "macos"))]
+type BindError = crate::gate::Blocker;
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum BindError { Input(MacProxyPortError), Bind(crate::gate::Blocker) }
+
+#[cfg(not(target_os = "macos"))]
+fn bind_error(blocker: crate::gate::Blocker) -> BindError { blocker }
+#[cfg(target_os = "macos")]
+fn bind_error(blocker: crate::gate::Blocker) -> BindError { BindError::Bind(blocker) }
+
+#[cfg(not(target_os = "macos"))]
+fn bind_listener() -> Result<TcpListener, BindError> {
     bind_from(port(), &FALLBACK_PORTS)
 }
 
-fn bind_from(first: u16, fallbacks: &[u16]) -> Result<TcpListener, crate::gate::Blocker> {
+#[cfg(target_os = "macos")]
+fn bind_listener() -> Result<TcpListener, BindError> {
+    bind_from(port().map_err(BindError::Input)?, &FALLBACK_PORTS)
+}
+
+fn bind_from(first: u16, fallbacks: &[u16]) -> Result<TcpListener, BindError> {
     let mut failed: Option<(std::io::Error, crate::portcheck::Cause)> = None;
     for attempt in 0..BIND_TRIES {
         match TcpListener::bind(addr_at(first)) {
@@ -1300,7 +1486,10 @@ fn bind_from(first: u16, fallbacks: &[u16]) -> Result<TcpListener, crate::gate::
                         attempt + 1
                     ));
                 }
+                #[cfg(not(target_os = "macos"))]
                 adopt(first);
+                #[cfg(target_os = "macos")]
+                adopt(first).map_err(BindError::Input)?;
                 return Ok(listener);
             }
             Err(e) => {
@@ -1336,12 +1525,15 @@ fn bind_from(first: u16, fallbacks: &[u16]) -> Result<TcpListener, crate::gate::
                     "порт {} недоступен ({}) — локальный прокси перенесён на {}",
                     first, err, other
                 ));
+                #[cfg(not(target_os = "macos"))]
                 adopt(other);
+                #[cfg(target_os = "macos")]
+                adopt(other).map_err(BindError::Input)?;
                 return Ok(listener);
             }
         }
     }
-    Err(cause.blocker("proxy", addr_at(first), &err))
+    Err(bind_error(cause.blocker("proxy", addr_at(first), &err)))
 }
 
 /// How often a listener that could not be bound is tried again. A user who adds
@@ -1354,12 +1546,24 @@ pub const REBIND_EVERY: Duration = Duration::from_secs(60);
 pub fn run(if_index: u32) -> Result<(), String> {
     let mut said: Option<crate::gate::Blocker> = None;
     let listener = loop {
-        match bind_listener() {
+        #[cfg(not(target_os = "macos"))]
+        let received = bind_listener();
+        #[cfg(target_os = "macos")]
+        let received = match bind_listener() {
+            Ok(listener) => Ok(listener),
+            Err(BindError::Bind(blocker)) => Err(blocker),
+            Err(BindError::Input(error)) => return Err(format!("proxy state unavailable: {error}")),
+        };
+        match received {
             Ok(listener) => {
                 if said.is_some() {
+                    #[cfg(not(target_os = "macos"))]
+                    let current_port = port();
+                    #[cfg(target_os = "macos")]
+                    let current_port = listener.local_addr().map_err(|error| format!("listener address: {error}"))?.port();
                     crate::dns_forwarder::log_proxy(&format!(
                         "локальный прокси поднялся на порту {}",
-                        port()
+                        current_port
                     ));
                     crate::gate::set_blocker("proxy", None);
                 }
@@ -1406,6 +1610,24 @@ pub fn run(if_index: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_port_record_distinguishes_missing_invalid_and_io_failure() {
+        use super::{mac_port_from_record, mac_port_with_state, MacProxyPortError, DEFAULT_PORT};
+        use std::io::{Error, ErrorKind};
+        let invalid = mac_port_with_state::<()>(Err(crate::user_state_location::MacStateError::Uninitialized),
+            || panic!("uninitialized state cannot consult cached port"),
+            |_| panic!("uninitialized state cannot consult record"));
+        assert!(matches!(invalid, Err(MacProxyPortError::State(_))));
+        assert_eq!(mac_port_from_record(0, || Err(Error::from(ErrorKind::NotFound))).unwrap(), DEFAULT_PORT);
+        assert_eq!(mac_port_from_record(0, || Ok("45129\n".into())).unwrap(), 45129);
+        assert_eq!(mac_port_from_record(45129, || panic!("bound port must not read record")).unwrap(), 45129);
+        for record in ["", "0", "65536", "bad"] {
+            assert!(matches!(mac_port_from_record(0, || Ok(record.into())), Err(MacProxyPortError::InvalidRecord)));
+        }
+        assert!(matches!(mac_port_from_record(0, || Err(Error::from(ErrorKind::InvalidData))), Err(MacProxyPortError::InvalidRecord)));
+        assert!(matches!(mac_port_from_record(0, || Err(Error::from(ErrorKind::PermissionDenied))), Err(MacProxyPortError::RecordIo(_))));
+    }
     #[test]
     fn non_gate_tunnel_keeps_response_and_raw_bidirectional_bytes() {
         use super::*;
@@ -1736,7 +1958,10 @@ mod tests {
 
     #[test]
     fn the_proxy_url_is_loopback() {
+        #[cfg(not(target_os = "macos"))]
         assert!(proxy_url().starts_with("http://127.0.0.1:"));
+        #[cfg(target_os = "macos")]
+        assert!(url_at(DEFAULT_PORT).starts_with("http://127.0.0.1:"));
     }
 
     /// P26: a port another program listens on is left at once - no fifteen
@@ -1767,6 +1992,8 @@ mod tests {
         let holder = TcpListener::bind("127.0.0.1:0").unwrap();
         let held = holder.local_addr().unwrap().port();
         let b = bind_from(held, &[]).err().expect("nothing to move to");
+        #[cfg(target_os = "macos")]
+        let b = match b { BindError::Bind(blocker) => blocker, BindError::Input(error) => panic!("unexpected input error: {error}") };
         assert_eq!(b.what, "proxy");
         if cfg!(windows) {
             assert_eq!(b.cause, "held");

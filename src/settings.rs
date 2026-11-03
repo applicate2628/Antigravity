@@ -200,15 +200,23 @@ impl Settings {
     /// Best-effort write. A failure here must never block an action the user
     /// asked for, so it is reported as a bool and normally ignored.
     pub fn save(&self) -> bool {
-        let Some(path) = path() else { return false };
+        #[cfg(not(target_os = "macos"))]
+        let Ok(Some(path)) = checked_path() else { return false };
+        #[cfg(not(target_os = "macos"))]
         if let Some(dir) = path.parent() {
             if std::fs::create_dir_all(dir).is_err() {
                 return false;
             }
         }
+        #[cfg(not(target_os = "macos"))]
         let written = match serde_json::to_string_pretty(self) {
             Ok(json) => write_replacing(&path, &json).is_ok(),
             Err(_) => false,
+        };
+        #[cfg(target_os = "macos")]
+        let written = match (crate::user_state_location::macos_state_paths(), serde_json::to_string_pretty(self)) {
+            (Ok(state), Ok(json)) => state.replace_file(FILE_NAME, json.as_bytes(), crate::user_state_location::MacStateFile::Secret).is_ok(),
+            _ => false,
         };
         if written {
             // The writer must see its own write immediately. Without this the
@@ -257,13 +265,29 @@ enum Read {
 }
 
 fn read() -> Read {
-    let Some(path) = path() else {
-        return Read::Missing;
-    };
-    match std::fs::read_to_string(path) {
-        Ok(text) => parse(&text).map_or(Read::Broken, Read::Parsed),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Read::Missing,
+    match read_settings() {
+        Ok(Some(text)) => parse(&text).map_or(Read::Broken, Read::Parsed),
+        Ok(None) => Read::Missing,
         Err(_) => Read::Broken,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_settings() -> Result<Option<String>, String> {
+    let Some(path) = checked_path()? else { return Ok(None); };
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)), Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("settings read failed: {error}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_settings() -> Result<Option<String>, String> {
+    let state = crate::user_state_location::macos_state_paths().map_err(|error| error.to_string())?;
+    match state.read_file(FILE_NAME, crate::user_state_location::MacStateFile::Secret) {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|error| format!("settings encoding: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("settings read failed: {error}")),
     }
 }
 
@@ -318,19 +342,31 @@ fn write_replacing(path: &Path, text: &str) -> std::io::Result<()> {
     result
 }
 
-fn path() -> Option<PathBuf> {
+#[cfg(not(target_os = "macos"))]
+fn checked_path() -> Result<Option<PathBuf>, String> {
     let dir = crate::dns_forwarder::log_dir();
     if dir.as_os_str().is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(dir.join(FILE_NAME))
+    Ok(Some(dir.join(FILE_NAME)))
 }
 
 /// Bind handoff to the bytes actually persisted by this settings owner.
 pub(crate) fn saved_intent_sha256(expected: &Settings) -> Result<[u8; 32], String> {
-    let path = path().ok_or_else(|| "settings path unavailable".to_owned())?;
-    let bytes = std::fs::read(path).map_err(|e| format!("settings read failed: {e}"))?;
-    saved_intent_hash(&bytes, expected)
+    saved_intent_hash(&read_intent_bytes()?, expected)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_intent_bytes() -> Result<Vec<u8>, String> {
+    let path = checked_path()?.ok_or_else(|| "settings path unavailable".to_owned())?;
+    std::fs::read(path).map_err(|error| format!("settings read failed: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn read_intent_bytes() -> Result<Vec<u8>, String> {
+    let state = crate::user_state_location::macos_state_paths().map_err(|error| error.to_string())?;
+    state.read_file(FILE_NAME, crate::user_state_location::MacStateFile::Secret)
+        .map_err(|error| format!("settings read failed: {error}"))
 }
 
 fn saved_intent_hash(bytes: &[u8], expected: &Settings) -> Result<[u8; 32], String> {
@@ -344,9 +380,7 @@ fn saved_intent_hash(bytes: &[u8], expected: &Settings) -> Result<[u8; 32], Stri
 
 /// Receive exactly the saved settings bound by the handoff, without fallback.
 pub(crate) fn receive_saved_intent(expected_sha256: &[u8; 32]) -> Result<Settings, String> {
-    let path = path().ok_or_else(|| "settings path unavailable".to_owned())?;
-    let bytes = std::fs::read(path).map_err(|e| format!("settings read failed: {e}"))?;
-    receive_intent_bytes(&bytes, expected_sha256)
+    receive_intent_bytes(&read_intent_bytes()?, expected_sha256)
 }
 
 fn receive_intent_bytes(bytes: &[u8], expected_sha256: &[u8; 32]) -> Result<Settings, String> {
@@ -390,6 +424,14 @@ fn cached() -> Settings {
 /// One serving-settings snapshot for a connection's route selection.
 pub(crate) fn routing_snapshot() -> Settings {
     cached()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn routing_snapshot_checked() -> Result<Settings, String> {
+    match read_settings()? {
+        Some(text) => parse(&text).ok_or_else(|| "settings data is invalid".to_owned()),
+        None => Ok(Settings::default()),
+    }
 }
 
 #[cfg(not(test))]

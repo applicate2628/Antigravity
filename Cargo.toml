@@ -94,3 +94,6 @@ strip = true
 # Private Linux launcher: directory-anchored I/O, liveness polling and fd execution.
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "=1.1.4", features = ["fs", "process", "event", "stdio", "runtime"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "=0.2.186"

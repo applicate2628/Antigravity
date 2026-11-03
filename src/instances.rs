@@ -29,7 +29,7 @@ fn is_service_args(args: &[String]) -> bool {
 
 /// Closes every other copy of the window. Best effort and silent: a copy that
 /// refuses to die (another user's, a higher integrity level) is left running.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn close_others() {
     let Ok(me) = std::env::current_exe() else {
         return;
@@ -44,6 +44,17 @@ pub fn close_others() {
 #[cfg(target_os = "windows")]
 #[path = "gui_instance.rs"]
 mod gui_instance;
+#[cfg(target_os = "macos")]
+#[path = "instances/macos_writer.rs"]
+mod macos_writer;
+#[cfg(target_os = "macos")]
+pub(crate) use macos_writer::MacSettingsWriterLease;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn acquire_gui_writer(state: &crate::user_state_location::MacStateDirectory)
+    -> Result<MacSettingsWriterLease<'_>, String> {
+    macos_writer::acquire_from_admitted_directory(state.directory()).map_err(|error| error.to_string())
+}
 #[cfg(target_os = "windows")]
 pub(crate) use gui_instance::{
     receive_replacement, request_elevation, ElevationProgress, GuiApplyContinuation,
@@ -59,7 +70,7 @@ pub fn acquire_gui_writer(
     Ok(lease)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 mod platform {
     use super::{is_service_args, is_window_name};
 

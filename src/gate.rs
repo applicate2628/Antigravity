@@ -210,12 +210,13 @@ pub fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn path() -> Option<PathBuf> {
+#[cfg(not(target_os = "macos"))]
+fn checked_path() -> Result<Option<PathBuf>, String> {
     let dir = crate::dns_forwarder::log_dir();
     if dir.as_os_str().is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(dir.join(FILE_NAME))
+    Ok(Some(dir.join(FILE_NAME)))
 }
 
 pub fn read() -> Option<Report> {
@@ -224,8 +225,20 @@ pub fn read() -> Option<Report> {
 
 /// Fresh report evidence: only a missing file means that no report exists.
 pub(crate) fn read_checked() -> Result<Option<Report>, String> {
-    let path = path().ok_or("relay report path unavailable")?;
+    #[cfg(not(target_os = "macos"))]
+    {
+    let path = checked_path()?.ok_or("relay report path unavailable")?;
     checked_report(std::fs::read_to_string(path))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let state = crate::user_state_location::macos_state_paths().map_err(|error| error.to_string())?;
+        match state.read_file(FILE_NAME, crate::user_state_location::MacStateFile::Public) {
+            Ok(bytes) => String::from_utf8(bytes).map_err(|error| format!("invalid relay report encoding: {error}"))
+                .and_then(|text| checked_report(Ok(text))),
+            Err(error) => checked_report(Err(error)),
+        }
+    }
 }
 
 fn checked_report(raw: std::io::Result<String>) -> Result<Option<Report>, String> {
@@ -246,6 +259,7 @@ fn checked_report(raw: std::io::Result<String>) -> Result<Option<Report>, String
 /// keep the fields it is not changing.
 static CURRENT: Mutex<Option<Report>> = Mutex::new(None);
 
+#[cfg(not(target_os = "macos"))]
 fn update(change: impl FnOnce(&mut Report)) {
     let snapshot = {
         let Ok(mut guard) = CURRENT.lock() else {
@@ -264,7 +278,11 @@ fn update(change: impl FnOnce(&mut Report)) {
     // Outside the lock. Nothing here calls back into this module, but a file
     // write held under a lock the warm pass wants is the shape I50 is about,
     // and keeping it out costs nothing.
-    let Some(path) = path() else { return };
+    let path = match checked_path() {
+        Ok(Some(path)) => path,
+        Ok(None) => return,
+        Err(error) => { eprintln!("relay report path unavailable: {error}"); return; }
+    };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
     }
@@ -287,6 +305,24 @@ fn update(change: impl FnOnce(&mut Report)) {
     let tmp = PathBuf::from(tmp);
     if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_err() {
         std::fs::remove_file(&tmp).ok();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn update(change: impl FnOnce(&mut Report)) {
+    let state = match crate::user_state_location::macos_state_paths() {
+        Ok(state) => state, Err(error) => { eprintln!("relay report unavailable: {error}"); return; }
+    };
+    let Ok(mut guard) = CURRENT.lock() else { eprintln!("relay report lock unavailable"); return; };
+    let report = guard.get_or_insert_with(Report::default);
+    change(report);
+    report.at = now_unix();
+    if report.started_at == 0 { report.started_at = report.at; }
+    let json = match serde_json::to_vec(report) {
+        Ok(json) => json, Err(error) => { eprintln!("relay report serialization: {error}"); return; }
+    };
+    if let Err(error) = state.replace_file(FILE_NAME, &json, crate::user_state_location::MacStateFile::Public) {
+        eprintln!("relay report write: {error}");
     }
 }
 
@@ -415,6 +451,8 @@ pub struct View {
     pub server_errors: Option<crate::ls_log::Sighting>,
     /// The relay's record, or `None` when there is none or it has gone stale.
     pub relay: Option<Report>,
+    #[cfg(target_os = "macos")]
+    pub relay_error: Option<String>,
     /// Whether this window reaches the internet, asked only while the relay is
     /// cut off: the difference between "no internet" and "something on this
     /// machine blocks the relay alone" (P53). `None` = not asked.
@@ -549,6 +587,13 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
             server_errors = h.server_errors.map(|s| (s, at)).or(server_errors);
         }
 
+        #[cfg(not(target_os = "macos"))]
+        let relay = read().filter(|report| !report.is_stale());
+        #[cfg(target_os = "macos")]
+        let (relay, relay_error) = match read_checked() {
+            Ok(report) => (report.filter(|report| !report.is_stale()), None),
+            Err(error) => (None, Some(error)),
+        };
         let view = View {
             // Carried forward rather than re-read. `count` is as of the last
             // scan, which is exact whenever anything is happening — a client
@@ -585,7 +630,9 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
                 let ago = s.ago + at.elapsed();
                 (ago <= ANSWER_RECENT).then_some(crate::ls_log::Sighting { ago, ..s })
             }),
-            relay: read().filter(|r| !r.is_stale()),
+            relay,
+            #[cfg(target_os = "macos")]
+            relay_error,
             net_ok: None,
         };
         let mut view = view;
@@ -639,6 +686,8 @@ fn watch(tx: Sender<Signal>, wake: Box<dyn Fn() + Send>) {
 /// on screen, or a different number of them — the window ages its own copy in
 /// between.
 fn worth_sending(fresh: &View, shown: &View) -> bool {
+    #[cfg(target_os = "macos")]
+    if fresh.relay_error != shown.relay_error { return true; }
     let relay_changed = match (&fresh.relay, &shown.relay) {
         (Some(a), Some(b)) => !a.same_state_as(b),
         (None, None) => false,
@@ -670,6 +719,14 @@ fn worth_sending(fresh: &View, shown: &View) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn report_error_change_reaches_the_view() {
+        let shown = View::default();
+        let fresh = View { relay_error: Some("synthetic read failure".into()), ..shown.clone() };
+        assert!(worth_sending(&fresh, &shown));
+    }
     use crate::ls_log::Sighting;
 
     #[test]
@@ -702,6 +759,8 @@ mod tests {
             server_errors: None,
             unauthorized: None,
             relay: None,
+            #[cfg(target_os = "macos")]
+            relay_error: None,
             net_ok: None,
         };
         let older = View {
@@ -798,6 +857,8 @@ mod tests {
             server_errors: None,
             unauthorized: None,
             relay: Some(base),
+            #[cfg(target_os = "macos")]
+            relay_error: None,
             net_ok: None,
         };
         assert!(!worth_sending(

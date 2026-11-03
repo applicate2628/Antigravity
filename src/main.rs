@@ -730,6 +730,7 @@ fn binary_failure_message(summary: &patch_binary::BinarySummary) -> String {
 /// is the common case, and pulling the root from under a relay that is still an
 /// older build makes every gate request die as `BadCertificate`. Returns whether
 /// anything was actually taken out.
+#[cfg(not(target_os = "macos"))]
 pub fn remove_legacy_ca_quiet() -> bool {
     let cert = proxy::ca_cert_path();
     if !cert.exists() {
@@ -760,7 +761,38 @@ pub fn install_label(install: &Path) -> &'static str {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn unsupported_macos_role(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter().any(|arg| [elevate::PATCH_ROOT_FLAG, elevate::UNPATCH_ROOT_FLAG,
+        background::FORWARDER_FLAG, background::WATCHDOG_FLAG].iter().any(|flag| arg == std::ffi::OsStr::new(flag)))
+}
+
 fn main() {
+    #[cfg(target_os = "macos")]
+    if unsupported_macos_role(env::args_os().skip(1)) {
+        eprintln!("Этот служебный режим недоступен на macOS.");
+        std::process::exit(1);
+    }
+    // The informational CLI has no state; preserve the existing proxy-role
+    // precedence when mixed with an informational flag.
+    #[cfg(target_os = "macos")]
+    if !env::args_os().any(|arg| arg == std::ffi::OsStr::new(background::PROXY_FLAG)) {
+        canary::handle_cli_flags();
+    }
+    #[cfg(target_os = "macos")]
+    let _mac_state = {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("Запуск macOS от имени root не поддерживается.");
+            std::process::exit(1);
+        }
+        let input = user_state_location::MacStateInput {
+            xdg_data_home: env::var_os("XDG_DATA_HOME"), home: env::var_os("HOME"),
+        };
+        match user_state_location::initialize_macos_state(input) {
+            Ok(state) => state,
+            Err(error) => { eprintln!("Не удалось подготовить каталог данных: {error}"); std::process::exit(1); }
+        }
+    };
     #[allow(unused_mut)]
     let mut gui_replacement = false;
     #[cfg(windows)]
@@ -849,7 +881,12 @@ fn main() {
             return;
         }
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let _settings_writer = match instances::acquire_gui_writer(&_mac_state) {
+        Ok(lease) => lease,
+        Err(error) => { eprintln!("Не удалось получить доступ к настройкам: {error}"); return; }
+    };
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     instances::close_others();
 
     if !gui_replacement && tui::requested() {
@@ -936,6 +973,16 @@ fn settle_gui_lifetime(lifetime: &std::sync::Arc<ops::GuiLifetime>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unsupported_helper_is_rejected_even_when_proxy_is_also_requested() {
+        for flag in [elevate::PATCH_ROOT_FLAG, elevate::UNPATCH_ROOT_FLAG,
+            background::FORWARDER_FLAG, background::WATCHDOG_FLAG] {
+            assert!(unsupported_macos_role([background::PROXY_FLAG.into(), flag.into()]));
+        }
+        assert!(!unsupported_macos_role([background::PROXY_FLAG.into()]));
+    }
 
     #[test]
     fn resource_projection_is_platform_and_final_component_specific() {

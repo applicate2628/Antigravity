@@ -743,9 +743,22 @@ impl App {
         let saved = crate::utils::desktop_dir()
             .and_then(|dir| crate::utils::save_text_file(&dir, crate::utils::REPORT_FILE, &text))
             .or_else(|| {
+                #[cfg(not(target_os = "macos"))]
+                {
                 let dir = crate::dns_forwarder::log_dir();
                 std::fs::create_dir_all(&dir).ok();
                 crate::utils::save_text_file(&dir, crate::utils::REPORT_FILE, &text)
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let state = match crate::user_state_location::macos_state_paths() {
+                        Ok(state) => state, Err(error) => { eprintln!("report state unavailable: {error}"); return None; }
+                    };
+                    match state.replace_file(crate::utils::REPORT_FILE, text.as_bytes(), crate::user_state_location::MacStateFile::Public) {
+                        Ok(()) => Some(state.state_dir().join(crate::utils::REPORT_FILE)),
+                        Err(error) => { eprintln!("report save failed: {error}"); None }
+                    }
+                }
             });
         let copied = copy_out(&text);
         let msg = match (saved, copied) {

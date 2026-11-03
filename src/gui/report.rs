@@ -111,18 +111,38 @@ pub fn build(status: Option<&Status>, view: &View) -> String {
     // Fresh from the file, not the window's copy: the route table's ages move
     // every pass and the watcher does not wake the window for them.
     let _ = writeln!(out, "\n— Служба обхода (её запись)");
+    #[cfg(not(target_os = "macos"))]
     match crate::gate::read() {
         Some(r) => relay_part(&mut out, &r),
-        None => {
+        None => { let _ = writeln!(out, "Записи нет — служба не запущена или старая."); }
+    }
+    #[cfg(target_os = "macos")]
+    match crate::gate::read_checked() {
+        Ok(Some(r)) => relay_part(&mut out, &r),
+        Ok(None) => {
             let _ = writeln!(out, "Записи нет — служба не запущена или старая.");
         }
+        Err(error) => { let _ = writeln!(out, "Запись недоступна: {error}"); }
     }
 
     let _ = writeln!(out, "\n— Журнал службы (последние строки)");
+    #[cfg(not(target_os = "macos"))]
     let log = std::fs::read_to_string(crate::dns_forwarder::log_path()).unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    let log = match crate::user_state_location::macos_state_paths().map_err(|error| error.to_string())
+        .and_then(|state| state.read_file("forwarder.log", crate::user_state_location::MacStateFile::Public).map_err(|error| error.to_string())) {
+        Ok(bytes) => match String::from_utf8(bytes) { Ok(text) => text, Err(error) => { let _ = writeln!(out, "Журнал недоступен: {error}"); String::new() } },
+        Err(error) => { let _ = writeln!(out, "Журнал недоступен: {error}"); String::new() },
+    };
     let lines: Vec<&str> = log.lines().collect();
     let from = lines.len().saturating_sub(LOG_LINES);
+    #[cfg(not(target_os = "macos"))]
     let own = crate::upstream::configured().map(|u| u.display());
+    #[cfg(target_os = "macos")]
+    let own = match crate::upstream::checked_mac_configured() {
+        Ok(value) => value.map(|u| u.display()),
+        Err(error) => { let _ = writeln!(out, "Журнал скрыт: данные для маскирования недоступны ({error})."); return out; }
+    };
     for line in &lines[from..] {
         let _ = writeln!(out, "{}", mask_addresses(line, own.as_deref()));
     }
@@ -177,6 +197,7 @@ fn status_part(out: &mut String, s: &Status) {
         crate::hwid::pc_code()
     );
     let _ = writeln!(out, "Свой прокси: {}", onoff(&s.own_proxy));
+    #[cfg(not(target_os = "macos"))]
     let _ = writeln!(
         out,
         "Служба: {}{}; правила DNS: {}",
@@ -192,6 +213,13 @@ fn status_part(out: &mut String, s: &Status) {
         },
         if s.rules { "есть" } else { "НЕТ" }
     );
+    #[cfg(target_os = "macos")]
+    match &s.relay_observation {
+        Ok(observation) => { let _ = writeln!(out, "Служба: {}{}; правила DNS недоступны",
+            if observation.running { "запущена" } else { "НЕ запущена" },
+            if observation.outdated { ", устарела" } else { "" }); },
+        Err(error) => { let _ = writeln!(out, "Состояние службы недоступно: {error}; правила DNS недоступны"); },
+    }
     if let Some(vpn) = s.vpn {
         let _ = writeln!(out, "VPN (по сокетам Antigravity): {:?}", vpn);
     }
@@ -216,6 +244,7 @@ fn relay_part(out: &mut String, r: &Report) {
     for b in &r.blockers {
         let _ = writeln!(out, "Мешает обходу: {}", super::status::blocker_line(b));
     }
+    #[cfg(not(target_os = "macos"))]
     if crate::proxy::port() != crate::proxy::DEFAULT_PORT {
         let _ = writeln!(
             out,
@@ -223,6 +252,14 @@ fn relay_part(out: &mut String, r: &Report) {
             crate::proxy::port(),
             crate::proxy::DEFAULT_PORT
         );
+    }
+    #[cfg(target_os = "macos")]
+    match crate::proxy::checked_mac_port() {
+        Ok(port) if port != crate::proxy::DEFAULT_PORT => {
+            let _ = writeln!(out, "Порт локального прокси: {port} (перенесён со стандартного {})", crate::proxy::DEFAULT_PORT);
+        },
+        Ok(_) => {},
+        Err(error) => { let _ = writeln!(out, "Порт локального прокси недоступен: {error}"); },
     }
     if r.started_at != 0 {
         let _ = writeln!(

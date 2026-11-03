@@ -874,9 +874,15 @@ pub fn proxy_env_value() -> Option<String> {
 /// True when the variable is set AND names our own local listener rather than
 /// something the user configured themselves.
 #[allow(dead_code)]
+#[cfg(not(target_os = "macos"))]
 pub fn proxy_env_is_ours() -> bool {
     let ours = crate::proxy::proxy_url();
     proxy_env_value().is_some_and(|v| is_our_proxy_value(&v, &ours))
+}
+
+#[cfg(target_os = "macos")]
+pub fn proxy_env_is_ours(ours: &str) -> bool {
+    proxy_env_value().is_some_and(|value| is_our_proxy_value(&value, ours))
 }
 
 #[cfg(test)]
@@ -1132,6 +1138,9 @@ mod tests {
     #[test]
     fn proxy_env_queries_run_without_panic() {
         let _ = proxy_env_value();
+        #[cfg(not(target_os = "macos"))]
         let _ = proxy_env_is_ours();
+        #[cfg(target_os = "macos")]
+        let _ = proxy_env_is_ours("http://127.0.0.1:53129");
     }
 }

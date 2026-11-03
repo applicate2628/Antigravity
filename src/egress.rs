@@ -171,6 +171,7 @@ const CLIENT_PROBE_LIMIT: Duration = Duration::from_secs(15);
 /// gate hosts' own door (`loopback`), and without this line its source address
 /// (127.x, the loopback adapter, which is not physical) read as a *tunnel*: the
 /// client would have been reported inside a VPN for talking to us.
+#[cfg(not(target_os = "macos"))]
 pub fn read() -> Reading {
     let script = format!(
         "$ids=@(Get-Process -Name '{glob}' -ErrorAction SilentlyContinue | \
@@ -223,8 +224,15 @@ pub fn read() -> Reading {
         )
 }
 
+#[cfg(target_os = "macos")]
+pub fn read() -> Result<Reading, String> {
+    let _ = crate::proxy::port().map_err(|error| error.to_string())?;
+    Err("macOS egress observation is unavailable".into())
+}
+
 /// `Get-Process` wants the image name without its extension. Taken from the
 /// installed path rather than spelled out again, so the two cannot drift.
+#[cfg(not(target_os = "macos"))]
 fn relay_process_name() -> String {
     #[cfg(windows)]
     return crate::background::relay_process_name();
@@ -286,6 +294,7 @@ fn classify_client(phys: u32, tunnel: u32, ours: u32) -> ClientEgress {
 /// Kept for the one caller that only asks about the client: the stand-down
 /// decision, which is about the client and must not start answering a different
 /// question because a second one became measurable (D13, P34).
+#[cfg(not(target_os = "macos"))]
 pub fn client_egress() -> ClientEgress {
     read().client
 }
@@ -317,6 +326,7 @@ pub fn client_egress() -> ClientEgress {
 /// it - the RU-only providers refuse the tunnel's foreign exit (N25). The rules
 /// are always installed now (`dns::setup_dns_nrpt`): the relay decides what they
 /// answer, at runtime.
+#[cfg(not(target_os = "macos"))]
 pub fn vpn_verdict(egress: Option<&Egress>) -> (bool, ClientEgress) {
     if !egress.is_some_and(|e| e.vpn_active) {
         return (false, ClientEgress::Unknown);
@@ -423,6 +433,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn standing_down_needs_the_client_to_be_in_the_tunnel() {
         let no_vpn = Egress {
@@ -486,6 +497,7 @@ mod tests {
     ///
     ///     cargo test reads_where_the_client_actually_leaves -- --ignored --nocapture
     #[test]
+    #[cfg(not(target_os = "macos"))]
     #[ignore = "reads live processes and sockets; run with --ignored"]
     fn reads_where_the_client_actually_leaves() {
         let eg = detect();

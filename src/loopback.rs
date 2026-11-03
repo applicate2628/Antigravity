@@ -179,15 +179,27 @@ fn hop(client: TcpStream, host: &'static str) {
     }
     let up = open_hop(host);
     OPENING.fetch_sub(1, Ordering::SeqCst);
+    #[cfg(target_os = "macos")]
+    let up = match up {
+        Ok(up) => up,
+        Err(error) => { crate::dns_forwarder::log_proxy(&format!("loopback state unavailable: {error}")); return; }
+    };
     if let Some(up) = up {
         crate::proxy::splice(client, up);
     }
 }
 
 /// Asks the local proxy for a tunnel to `host`; `None` when it refused.
-fn open_hop(host: &'static str) -> Option<TcpStream> {
-    let mut up =
-        TcpStream::connect_timeout(&crate::proxy::listen_addr(), Duration::from_secs(3)).ok()?;
+#[cfg(not(target_os = "macos"))]
+fn open_hop(host: &'static str) -> Option<TcpStream> { open_hop_at(host, crate::proxy::listen_addr()) }
+
+#[cfg(target_os = "macos")]
+fn open_hop(host: &'static str) -> Result<Option<TcpStream>, crate::proxy::MacProxyPortError> {
+    Ok(open_hop_at(host, crate::proxy::listen_addr()?))
+}
+
+fn open_hop_at(host: &'static str, addr: std::net::SocketAddr) -> Option<TcpStream> {
+    let mut up = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
     up.set_read_timeout(Some(ROUTE_BUDGET)).ok();
     up.write_all(
         format!("CONNECT {host}:{PORT} HTTP/1.1\r\nHost: {host}:{PORT}\r\n\r\n").as_bytes(),

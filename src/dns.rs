@@ -728,6 +728,7 @@ pub fn outcome_note(o: &DnsOutcome) -> Option<String> {
     }
 
     if o.via_relay {
+        #[cfg(not(target_os = "macos"))]
         lines.push(
             if background::is_running() {
                 "  Резолвинг идёт через фоновый релей — адреса берутся с канала\n  \
@@ -738,6 +739,12 @@ pub fn outcome_note(o: &DnsOutcome) -> Option<String> {
             }
             .to_string(),
         );
+        #[cfg(target_os = "macos")]
+        lines.push(match background::is_running() {
+            Ok(true) => "Резолвинг идёт через фоновый релей.".to_owned(),
+            Ok(false) => "Фоновый релей не запущен.".to_owned(),
+            Err(error) => format!("Состояние фонового релея недоступно: {error}"),
+        });
         return Some(lines.join("\n"));
     }
 

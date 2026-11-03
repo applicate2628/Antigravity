@@ -292,19 +292,43 @@ pub fn parse(input: &str) -> Result<Upstream, String> {
 /// connections - runs under an S4U principal for that same user and reads it.
 /// A registry value or an environment variable would need a relay restart to
 /// take effect; a file is picked up on the next connection.
+const CONFIG_FILE: &str = "upstream.txt";
+
+#[cfg(not(target_os = "macos"))]
 pub fn config_path() -> PathBuf {
-    crate::dns_forwarder::log_dir().join("upstream.txt")
+    crate::dns_forwarder::log_dir().join(CONFIG_FILE)
+}
+
+#[cfg(target_os = "macos")]
+pub fn config_path() -> Result<PathBuf, crate::user_state_location::MacStateError> {
+    Ok(crate::user_state_location::macos_state_paths()?.state_dir().join(CONFIG_FILE))
 }
 
 pub fn save(up: &Upstream) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let state = crate::user_state_location::macos_state_paths().map_err(|error| error.to_string())?;
+        return state.replace_file(CONFIG_FILE, up.as_line().as_bytes(), crate::user_state_location::MacStateFile::Secret)
+            .map_err(|error| format!("save upstream configuration: {error}"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     let path = config_path();
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     fs::write(&path, up.as_line()).map_err(|e| e.to_string())
+    }
 }
 
 pub fn clear() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let state = crate::user_state_location::macos_state_paths().map_err(|error| error.to_string())?;
+        return state.remove_file(CONFIG_FILE, crate::user_state_location::MacStateFile::Secret)
+            .map_err(|error| format!("clear upstream configuration: {error}"));
+    }
+    #[cfg(not(target_os = "macos"))]
     clear_path(&config_path())
 }
 
@@ -323,9 +347,33 @@ fn clear_path(path: &std::path::Path) -> Result<(), String> {
 /// a background service for it to matter. One small read per connection is
 /// nothing beside the handshake that follows it - the same reasoning the old CA
 /// lookup used.
+#[cfg(not(target_os = "macos"))]
 pub fn configured() -> Option<Upstream> {
     let raw = fs::read_to_string(config_path()).ok()?;
     parse(&raw).ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn configured() -> Result<Option<Upstream>, String> { checked_mac_configured() }
+
+/// A missing file is an omitted proxy; unavailable state and invalid or
+/// unreadable existing files are distinct failures on macOS.
+#[cfg(target_os = "macos")]
+pub(crate) fn checked_mac_configured() -> Result<Option<Upstream>, String> {
+    mac_configured_with_state(crate::user_state_location::macos_state_paths(),
+        |state| state.read_file(CONFIG_FILE, crate::user_state_location::MacStateFile::Secret)
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_configured_with_state<T>(state: Result<T, crate::user_state_location::MacStateError>,
+    read: impl FnOnce(T) -> std::io::Result<String>) -> Result<Option<Upstream>, String> {
+    let state = state.map_err(|error| error.to_string())?;
+    match read(state) {
+        Ok(raw) => parse(&raw).map(Some).map_err(|_| "invalid upstream configuration".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("read upstream configuration: {error}")),
+    }
 }
 
 /// Whether the route should be tried for this connection.
@@ -333,9 +381,13 @@ pub fn configured() -> Option<Upstream> {
 /// Three things have to hold: the user gave us one, it is answering, and it
 /// comes out somewhere Google will accept. The last is checked against a pinned
 /// address rather than a clock - see `Route`.
+#[cfg(not(target_os = "macos"))]
 pub fn available() -> bool {
     configured().is_some() && OWN.usable()
 }
+
+#[cfg(target_os = "macos")]
+pub fn available() -> Result<bool, String> { Ok(configured()?.is_some() && OWN.usable()) }
 
 fn basic(auth: &str) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -538,11 +590,18 @@ pub fn probe(up: &Upstream) -> Result<(), String> {
 /// where the trace only guesses from Cloudflare's geolocation, and a benched
 /// Own gives way like any route (G81). Owner's decision: no trace traffic to
 /// third-party hosts through their proxy every two minutes.
+#[cfg(not(target_os = "macos"))]
 pub fn probe_health() {
     let Some(up) = configured() else {
         return;
     };
     OWN.probe(&up, false);
+}
+
+#[cfg(target_os = "macos")]
+pub fn probe_health() -> Result<(), String> {
+    if let Some(up) = configured()? { OWN.probe(&up, false); }
+    Ok(())
 }
 
 /// The address the proxy comes out on, and the country Cloudflare puts it in.
@@ -680,6 +739,18 @@ pub fn region_is_blocked(loc: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_configured_distinguishes_unavailable_missing_and_invalid() {
+        use super::mac_configured_with_state;
+        use std::io::{Error, ErrorKind};
+        assert!(mac_configured_with_state::<()>(Err(crate::user_state_location::MacStateError::Uninitialized),
+            |_| panic!("state failure must not read configuration")).is_err());
+        assert!(mac_configured_with_state(Ok(()), |_| Err(Error::from(ErrorKind::NotFound))).unwrap().is_none());
+        assert!(mac_configured_with_state(Ok(()), |_| Err(Error::from(ErrorKind::PermissionDenied))).is_err());
+        assert!(mac_configured_with_state(Ok(()), |_| Ok("invalid".into())).is_err());
+        assert_eq!(mac_configured_with_state(Ok(()), |_| Ok("example.test:8080".into())).unwrap().unwrap().port, 8080);
+    }
     use super::*;
 
     #[cfg(windows)]

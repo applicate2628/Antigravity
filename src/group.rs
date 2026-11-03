@@ -335,6 +335,7 @@ fn scrub(msg: &str) -> String {
     out
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn get_active_key() -> Option<GroupKey> {
     let mut state = group_state().lock().unwrap();
     let settings_key = settings::group_key();
@@ -343,6 +344,7 @@ pub fn get_active_key() -> Option<GroupKey> {
 
 /// Serialize profile capture with pool admission, so an older request cannot
 /// later replace the pool selected by a newer settings snapshot.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn capture_route_profile() -> (settings::Settings, Option<GroupKey>) {
     let mut state = group_state().lock().unwrap();
     let settings = settings::routing_snapshot();
@@ -352,6 +354,16 @@ pub(crate) fn capture_route_profile() -> (settings::Settings, Option<GroupKey>) 
         None
     };
     (settings, key)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn capture_route_profile<T>(receive: impl FnOnce(&settings::Settings) -> Result<T, String>)
+    -> Result<(settings::Settings, Option<GroupKey>, T), String> {
+    let mut state = group_state().lock().map_err(|_| "group state lock unavailable".to_owned())?;
+    let settings = settings::routing_snapshot_checked()?;
+    let received = receive(&settings)?;
+    let key = if settings.group_proxy { receive_key_locked(&mut state, &settings.group_key) } else { None };
+    Ok((settings, key, received))
 }
 
 fn receive_key_locked(state: &mut GroupState, settings_key: &str) -> Option<GroupKey> {
@@ -389,6 +401,7 @@ pub(crate) fn bound_key_usable(key: Option<&GroupKey>) -> bool {
     key.is_some() && state.parsed.as_ref() == key && group_route().usable()
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn available() -> bool {
     get_active_key().is_some() && group_route().usable()
 }
@@ -1077,42 +1090,91 @@ pub(crate) fn open_group(target: &crate::proxy::GateTarget443<'_>, key: &GroupKe
     None
 }
 
-pub fn tunnel(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
+#[cfg(not(target_os = "macos"))]
+pub fn tunnel(client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
     let Some(target) = crate::proxy::GateTarget443::new(host, port) else {
         return Err(client);
     };
     let Some(key) = get_active_key() else {
         return Err(client);
     };
+    tunnel_with_key(client, &target, &key)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn tunnel_captured(client: TcpStream, host: &str, port: u16, key: &GroupKey) -> Result<(), TcpStream> {
+    let Some(target) = crate::proxy::GateTarget443::new(host, port) else { return Err(client); };
+    tunnel_with_key(client, &target, key)
+}
+
+fn tunnel_with_key(mut client: TcpStream, target: &crate::proxy::GateTarget443<'_>, key: &GroupKey) -> Result<(), TcpStream> {
     let cancelled = std::sync::atomic::AtomicBool::new(false);
-    let Some(opened) = open_group(&target, &key, Instant::now() + 2 * upstream::LIVE_OPEN_BUDGET, &cancelled) else {
+    let Some(opened) = open_group(target, key, Instant::now() + 2 * upstream::LIVE_OPEN_BUDGET, &cancelled) else {
         return Err(client);
     };
     if client.write_all(crate::proxy::RESP_ESTABLISHED).is_err() {
         return Ok(());
     }
-    opened.note_committed(host);
+    opened.note_committed(target.host());
     opened.transfer(client);
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn probe_health() {
     let key = match get_active_key() {
         Some(k) => k,
         None => return,
     };
 
-    poll_pool(&key);
+    probe_health_for(&key);
+}
+
+fn probe_health_for(key: &GroupKey) {
+    poll_pool(key);
     let started = Instant::now();
-    let result = probe_once(&key, true);
+    let result = probe_once(key, true);
     let state = group_state().lock().unwrap();
-    record_if_current(&state, &key, || {
+    record_if_current(&state, key, || {
         group_route().record_probe(result, started.elapsed());
     });
 }
 
-fn record_if_current(state: &GroupState, key: &GroupKey, record: impl FnOnce()) {
-    if state.parsed.as_ref() == Some(key) { record(); }
+#[cfg(target_os = "macos")]
+pub(crate) fn captured_key_is_current(key: &GroupKey) -> Result<bool, String> {
+    group_state().lock().map(|state| state.parsed.as_ref() == Some(key)).map_err(|_| "group state lock unavailable".into())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn stumble_if_current(key: &GroupKey) -> Result<bool, String> {
+    match group_state().lock() {
+        Ok(state) => Ok(record_if_current(&state, key, || crate::routes::stumble(crate::routes::Kind::Group))),
+        Err(_) => Err("group state lock unavailable".into()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn probe_health_captured(key: &GroupKey) -> Result<(), String> {
+    run_captured_probe(key, captured_key_is_current, poll_pool, |key| probe_once(key, true), |key, result, elapsed| {
+        let state = group_state().lock().map_err(|_| "group state lock unavailable".to_owned())?;
+        record_if_current(&state, key, || group_route().record_probe(result, elapsed));
+        Ok(())
+    })
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn run_captured_probe<K, R>(key: &K, mut current: impl FnMut(&K) -> Result<bool, String>,
+    poll: impl FnOnce(&K), probe: impl FnOnce(&K) -> R, record: impl FnOnce(&K, R, Duration) -> Result<(), String>) -> Result<(), String> {
+    if !current(key)? { return Ok(()); }
+    poll(key);
+    if !current(key)? { return Ok(()); }
+    let started = Instant::now();
+    let result = probe(key);
+    record(key, result, started.elapsed())
+}
+
+fn record_if_current(state: &GroupState, key: &GroupKey, record: impl FnOnce()) -> bool {
+    if state.parsed.as_ref() == Some(key) { record(); true } else { false }
 }
 
 /// What a server says about itself, signed with this user's key.
@@ -1415,6 +1477,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn captured_probe_stops_if_key_changes_and_never_recaptures_settings() {
+        use std::cell::{Cell, RefCell};
+        let current = Cell::new(true);
+        let events = RefCell::new(Vec::new());
+        run_captured_probe(&7u8, |_| Ok(current.get()), |_| {
+            events.borrow_mut().push("poll");
+            current.set(false);
+        }, |_| { events.borrow_mut().push("probe"); Ok::<(), ()>(()) },
+        |_, _, _| { events.borrow_mut().push("record"); Ok(()) }).unwrap();
+        assert_eq!(*events.borrow(), ["poll"]);
+        events.borrow_mut().clear();
+        current.set(true);
+        run_captured_probe(&7u8, |_| Ok(current.get()), |_| events.borrow_mut().push("poll"),
+            |_| { events.borrow_mut().push("probe"); Ok::<(), ()>(()) },
+            |_, _, _| { events.borrow_mut().push("record"); Ok(()) }).unwrap();
+        assert_eq!(*events.borrow(), ["poll", "probe", "record"]);
+        events.borrow_mut().clear();
+        let error = run_captured_probe(&7u8, |_| Err("group state unavailable".into()),
+            |_| events.borrow_mut().push("poll"), |_| events.borrow_mut().push("probe"),
+            |_, _, _| { events.borrow_mut().push("record"); Ok(()) }).unwrap_err();
+        assert_eq!(error, "group state unavailable");
+        assert!(events.borrow().is_empty());
+    }
+
+    #[test]
     fn group_cancellation_between_attempts_prevents_second_open() {
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         let attempts = std::cell::Cell::new(0);
@@ -1455,9 +1542,9 @@ mod tests {
         assert_eq!(state.servers.len(), 1);
         assert!(state.servers[0].cpu.is_none());
         let recorded = std::cell::Cell::new(0);
-        record_if_current(&state, &old, || recorded.set(recorded.get() + 1));
+        assert!(!record_if_current(&state, &old, || recorded.set(recorded.get() + 1)));
         assert_eq!(recorded.get(), 0);
-        record_if_current(&state, &current, || recorded.set(recorded.get() + 1));
+        assert!(record_if_current(&state, &current, || recorded.set(recorded.get() + 1)));
         assert_eq!(recorded.get(), 1);
         assert!(apply_status_results(&mut state, &current, &names, vec![Ok(status())]).is_some());
         assert_eq!(state.servers.len(), 2);

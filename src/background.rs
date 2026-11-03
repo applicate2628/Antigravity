@@ -19,8 +19,28 @@ pub const PROXY_FLAG: &str = "--proxy";
 #[cfg(target_os = "windows")]
 pub use windows_impl::*;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub use unix_impl::*;
+#[cfg(target_os = "macos")]
+pub use macos_impl::*;
+
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use std::path::PathBuf;
+    fn unavailable<T>() -> Result<T, String> { Err("Фоновая служба macOS ещё недоступна".into()) }
+    pub fn install_dir() -> Result<PathBuf, String> { unavailable() }
+    pub fn installed_exe() -> Result<PathBuf, String> { unavailable() }
+    pub fn is_enabled() -> Result<bool, String> { unavailable() }
+    pub fn is_watchdog_enabled() -> Result<bool, String> { unavailable() }
+    pub fn is_running() -> Result<bool, String> { unavailable() }
+    pub fn relay_is_outdated() -> Result<bool, String> { unavailable() }
+    pub fn ensure_running() -> Result<(), String> { unavailable() }
+    pub fn enable() -> Result<(), String> { unavailable() }
+    pub fn ensure_installed() -> Result<(), String> { unavailable() }
+    pub fn enable_watchdog() -> Result<(), String> { unavailable() }
+    pub fn disable_watchdog() -> Result<(), String> { unavailable() }
+    pub fn disable() -> Result<(), String> { unavailable() }
+}
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
@@ -1788,7 +1808,7 @@ mod windows_impl {
 // root, no `:53` listener, so systemd-resolved is never touched. The DNS relay
 // (phase 5) would be a separate, privileged story; this is deliberately the
 // unprivileged half that already lifts the region gate through a permitted exit.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 mod unix_impl {
     use std::fs;
     use std::path::PathBuf;

@@ -26,6 +26,8 @@ pub(crate) enum OpenFailure {
     Unavailable(Option<String>),
     DeniedTarget,
     UnsupportedPrivateRoutes,
+    #[cfg(target_os = "macos")]
+    Configuration(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -205,14 +207,14 @@ fn walk_routes<T>(
     deadline: Instant,
     cancelled: &AtomicBool,
     mut attempt: impl FnMut(routes::Kind, Duration) -> Option<T>,
-    mut failed: impl FnMut(routes::Kind),
+    mut failed: impl FnMut(routes::Kind) -> Result<(), OpenFailure>,
 ) -> Result<Option<T>, OpenFailure> {
     for kind in order {
         let budget = remaining(deadline, cancelled)?;
         let opened = attempt(kind, budget);
         remaining(deadline, cancelled)?;
         if opened.is_some() { return Ok(opened); }
-        failed(kind);
+        failed(kind)?;
     }
     Ok(None)
 }
@@ -262,7 +264,10 @@ pub(crate) fn open_selected_route<'a>(
         return Err(OpenFailure::UnsupportedPrivateRoutes);
     }
     remaining(deadline, cancelled)?;
+    #[cfg(not(target_os = "macos"))]
     let profile = DesiredRouteProfile::capture(target);
+    #[cfg(target_os = "macos")]
+    let profile = DesiredRouteProfile::capture(target).map_err(OpenFailure::Configuration)?;
     let mut tried_direct = false;
     let mut denied_direct = false;
     let mut last_error = None;
@@ -306,7 +311,21 @@ pub(crate) fn open_selected_route<'a>(
             // The snapshot does not contain the feature-gated private openers.
             routes::Kind::Relay | routes::Kind::Exits => None,
         }
-    }, routes::stumble)?;
+    }, |kind| {
+        #[cfg(target_os = "macos")]
+        if kind == routes::Kind::Group {
+            let received = match profile.group.as_ref() {
+                Some(key) => crate::group::stumble_if_current(key), None => Ok(false),
+            };
+            return match received {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(OpenFailure::Configuration("group configuration changed during route attempt".into())),
+                Err(error) => Err(OpenFailure::Configuration(error)),
+            };
+        }
+        routes::stumble(kind);
+        Ok(())
+    })?;
     if let Some(opened) = opened { return Ok(opened); }
     if !tried_direct {
         remaining(deadline, cancelled)?;
@@ -333,6 +352,21 @@ pub(crate) fn tcp_direct<'a>(socket: TcpStream, kind: Option<routes::Kind>, chec
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn configuration_failure_stops_route_walk_before_fallback_or_penalty() {
+        use super::*;
+        use std::cell::RefCell;
+        let cancelled = AtomicBool::new(false);
+        let attempted = RefCell::new(Vec::new());
+        let result: Result<Option<()>, OpenFailure> = walk_routes(
+            [routes::Kind::Group, routes::Kind::Direct], Instant::now() + Duration::from_secs(2), &cancelled,
+            |kind, _| { attempted.borrow_mut().push(kind); None },
+            |_| Err(OpenFailure::Configuration("captured group changed".into())),
+        );
+        assert!(matches!(result, Err(OpenFailure::Configuration(_))));
+        assert_eq!(*attempted.borrow(), [routes::Kind::Group]);
+    }
     use super::*;
     use std::net::{Shutdown, TcpListener};
 
@@ -360,7 +394,7 @@ mod tests {
                         credentials.set(credentials.get() + 1);
                     }
                     (kind == routes::Kind::Direct).then_some(eof)
-                }, |_| {});
+                }, |_| Ok(()));
             assert!(!attempts.borrow().contains(&routes::Kind::Own), "disabled Own was attempted");
             assert_eq!(credentials.get(), 0, "disabled Own credentials were used");
             assert!(matches!(selected, Ok(Some(selected)) if selected == eof), "selected Direct fallback was lost");
@@ -389,7 +423,7 @@ mod tests {
         let result = walk_routes([routes::Kind::Own, routes::Kind::Group, routes::Kind::Direct],
             Instant::now() + Duration::from_secs(2), &cancelled,
             |kind, _| { attempted.borrow_mut().push(kind); (kind == routes::Kind::Group).then_some(7) },
-            |kind| failed.borrow_mut().push(kind));
+            |kind| { failed.borrow_mut().push(kind); Ok(()) });
         assert!(matches!(result, Ok(Some(7))));
         assert_eq!(*attempted.borrow(), [routes::Kind::Own, routes::Kind::Group]);
         assert_eq!(*failed.borrow(), [routes::Kind::Own]);

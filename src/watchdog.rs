@@ -235,6 +235,10 @@ struct ListenerGuard {
 }
 
 impl ListenerGuard {
+    #[cfg(target_os = "macos")]
+    fn check(&mut self) { eprintln!("watchdog is unavailable on macOS"); }
+
+    #[cfg(not(target_os = "macos"))]
     fn check(&mut self) {
         if crate::proxy::listener_answers() {
             self.misses = 0;
@@ -487,6 +491,18 @@ fn log(line: &str) {
     if cfg!(test) {
         return;
     }
+    #[cfg(target_os = "macos")]
+    {
+        let stamp = crate::utils::local_clock().map_or_else(String::new, |c| c.hms());
+        match crate::user_state_location::macos_state_paths() {
+            Ok(state) => if let Err(error) = state.append_log("watchdog.log", format!("{stamp} {line}\n").as_bytes(), LOG_LIMIT_BYTES) {
+                eprintln!("watchdog log unavailable: {error}");
+            },
+            Err(error) => eprintln!("watchdog log unavailable: {error}"),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     let dir = dns_forwarder::log_dir();
     let path = dir.join("watchdog.log");
     fs::create_dir_all(&dir).ok();
@@ -496,6 +512,7 @@ fn log(line: &str) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let stamp = crate::utils::local_clock().map_or_else(String::new, |c| c.hms());
         writeln!(f, "{} {}", stamp, line).ok();
+    }
     }
 }
 
