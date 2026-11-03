@@ -101,6 +101,21 @@ pub fn clean_input_path(input: &str) -> String {
     s.to_string()
 }
 
+/// Project a selected root to candidate resource paths; this grants no write authority.
+pub(crate) fn installation_resources(root: &Path) -> PathBuf {
+    installation_resources_for(root, cfg!(target_os = "macos"))
+}
+
+fn installation_resources_for(root: &Path, is_macos: bool) -> PathBuf {
+    if is_macos && root.extension().and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+    {
+        root.join("Contents").join("Resources")
+    } else {
+        root.join("resources")
+    }
+}
+
 fn is_install_root(path: &Path) -> bool {
     is_install_root_checked(path).unwrap_or(false)
 }
@@ -125,7 +140,7 @@ fn is_install_root_checked(path: &Path) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let resources = path.join("resources");
+    let resources = installation_resources(path);
     if discovery_metadata(&resources)?.is_some_and(|value| value.is_dir()) {
         for child in ["app.asar", "app", "bin"] {
             if discovery_metadata(&resources.join(child))?.is_some() { return Ok(true); }
@@ -511,7 +526,7 @@ pub(crate) struct InstallationLayout {
 /// The effect branch owns classification; presentation labels cannot mint it.
 #[cfg(windows)]
 pub(crate) fn receive_installation_layout(root: &Path) -> Result<InstallationLayout, String> {
-    let archive = root.join("resources").join("app.asar");
+    let archive = installation_resources(root).join("app.asar");
     let scripts = patch_ide::js_targets(root);
     let archive_present = discovery_metadata(&archive)?.is_some();
     let (out, dist, new_desktop) = if archive_present {
@@ -563,7 +578,7 @@ pub(crate) fn process_install_received(install: &Path, expected: Option<Installa
     if expected.is_some_and(|expected| expected != layout.kind) { return Err("installation effect kind changed before execution".into()); }
     #[cfg(not(windows))]
     let _ = expected;
-    let resources = install.join("resources");
+    let resources = installation_resources(install);
     let app_dir = resources.join("app");
     let app_asar = resources.join("app.asar");
     #[cfg(windows)]
@@ -738,7 +753,7 @@ pub fn install_label(install: &Path) -> &'static str {
     if install.join("agy.exe").is_file() || install.join("agy").is_file() {
         "Antigravity CLI"
     } else if install.join("Antigravity IDE.exe").exists()
-        || install.join("resources").join("app").join("out").exists()
+        || installation_resources(install).join("app").join("out").exists()
     {
         "Antigravity IDE"
     } else {
@@ -922,6 +937,32 @@ fn settle_gui_lifetime(lifetime: &std::sync::Arc<ops::GuiLifetime>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_projection_is_platform_and_final_component_specific() {
+        let bundle = Path::new("/test-fixtures/Antigravity.APP");
+        assert_eq!(installation_resources_for(bundle, true), bundle.join("Contents/Resources"));
+        assert_eq!(installation_resources_for(bundle, false), bundle.join("resources"));
+        for root in [Path::new("/test-fixtures/cli"), Path::new("/test-fixtures/Example.app.other"),
+            Path::new(""), Path::new("relative")]
+        {
+            assert_eq!(installation_resources_for(root, true), root.join("resources"));
+            assert_eq!(installation_resources_for(root, false), root.join("resources"));
+        }
+        // An unrelated or absent bundle name is candidate data, not authorization.
+        let unknown = Path::new("/test-fixtures/unrelated.app");
+        assert_eq!(installation_resources_for(unknown, true), unknown.join("Contents/Resources"));
+    }
+
+    #[test]
+    fn js_targets_use_the_selected_resource_projection() {
+        let root = Path::new("/test-fixtures/Antigravity.app");
+        let resources = installation_resources(root);
+        let targets = patch_ide::js_targets(root);
+        assert_eq!(targets.ide_main, resources.join("app/out/main.js"));
+        assert_eq!(targets.desktop_main, resources.join("app/dist/main.js"));
+        assert_eq!(targets.extension, resources.join("app/extensions/antigravity/dist/extension.js"));
+    }
 
     /// Regression: `%LOCALAPPDATA%` holds an `agy` *directory* (the CLI's folder).
     /// An `exists()` check matched that directory, so the parent-walk in

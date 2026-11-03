@@ -348,9 +348,9 @@ pub fn repatch_if_needed(bin_path: &Path) -> RepatchOutcome {
 /// `language_server*` file - whatever the exact suffix, the signature scan then
 /// decides whether it is really a target.
 pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
-    let resources_bin = inst.join("resources").join("bin");
-    let ext_bin = inst
-        .join("resources")
+    let resources = crate::installation_resources(inst);
+    let resources_bin = resources.join("bin");
+    let ext_bin = resources
         .join("app")
         .join("extensions")
         .join("antigravity")
@@ -391,8 +391,7 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
     // IDE 2.6.0 carries no language server of its own: its `agy` extension
     // downloads the backend into the user's `~/.gemini/bin`. That file is the
     // IDE's, so the IDE's row reads and patches it (G85).
-    if inst
-        .join("resources")
+    if resources
         .join("app")
         .join("extensions")
         .join("agy")

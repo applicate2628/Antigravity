@@ -113,7 +113,7 @@ fn revert_files_run(inst: &Path, stop_on_failure: bool) -> Reverted {
         }
     }
     }
-    if let Err(e) = crate::restore_pristine_asar(&inst.join("resources")) {
+    if let Err(e) = crate::restore_pristine_asar(&crate::installation_resources(inst)) {
         if stop_on_failure { out.errors.push(format!("app.asar не восстановлен: {e}")); }
         else { out.warnings.push(format!("app.asar не восстановлен: {e}")); }
     }
@@ -153,7 +153,7 @@ fn written_dirs(inst: &Path) -> Vec<PathBuf> {
         .filter(|t| t.is_file())
         .filter_map(|t| t.parent().map(Path::to_path_buf))
         .collect();
-    let app = inst.join("resources").join("app");
+    let app = crate::installation_resources(inst).join("app");
     for js in [
         app.join("out").join("main.js"),
         app.join("dist").join("main.js"),
