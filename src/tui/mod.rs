@@ -315,6 +315,15 @@ impl App {
                 }
                 Event::Status(s) => self.status = Some(*s),
                 Event::Busy(what) => self.busy = what,
+                #[cfg(target_os = "macos")]
+                Event::RegistrationCode(result) => match result {
+                    Ok(code) if self.lifetime.accepts_user_action() => {
+                        if crate::utils::set_clipboard_text(&format!("/ag+{code}")) { self.toast("Команда скопирована — отправьте её в группе"); }
+                        else { self.toast("Не удалось скопировать команду"); }
+                    },
+                    Ok(_) => {},
+                    Err(error) => self.toast(format!("Код устройства недоступен: {error}")),
+                },
                 Event::ShutdownReady => self.shutdown_ready = true,
             }
             any = true;
@@ -591,9 +600,17 @@ impl App {
                 self.toast("Открыто в браузере: https://t.me/nova_txt/69864");
             }
             Row::GroupProxyCopy => {
+                #[cfg(not(target_os = "macos"))]
+                {
                 let cmd = format!("/ag+{}", crate::hwid::pc_code());
                 crate::utils::set_clipboard_text(&cmd);
                 self.toast(format!("Скопировано: {} — отправьте это сообщение в комнате", cmd));
+                }
+                #[cfg(target_os = "macos")]
+                match crate::hwid::cached_availability() {
+                    Some(Err(error)) => self.toast(format!("Код устройства недоступен: {error}")),
+                    _ => self.worker.send(Cmd::CopyGroupRegistration),
+                }
             }
             Row::GroupProxyPaste => {
                 if let Some(text) = crate::utils::clipboard_text() {
@@ -969,19 +986,35 @@ impl App {
                 switch_line("      ", &name, &state, busy, width)
             }
             Row::GroupProxyText => {
+                #[cfg(not(target_os = "macos"))]
                 let pc = crate::hwid::pc_code();
                 let key_text = if crate::settings::group_key().is_empty() {
                     "ключа нет"
-                } else {
-                    "ключ принят"
+                } else if cfg!(target_os = "macos") { "ключ сохранён" } else { "ключ принят" };
+                #[cfg(not(target_os = "macos"))]
+                let availability = format!("{} - {}", pc, key_text);
+                #[cfg(target_os = "macos")]
+                let availability = match crate::hwid::cached_availability() {
+                    None => format!("не проверен — {key_text}"),
+                    Some(Ok(())) => format!("доступен — {key_text}"),
+                    Some(Err(error)) => format!("недоступен: {error} — {key_text}"),
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw("      Код ПК: "),
-                    Span::styled(format!("{} - {}", pc, key_text), Style::new().fg(Color::Gray)),
+                    Span::styled(availability, Style::new().fg(Color::Gray)),
                 ]))
             }
             Row::GroupProxyOpenRoom => ListItem::new(Line::from(vec![Span::styled("      > Открыть комнату группы", Style::new().fg(Color::Cyan))])),
-            Row::GroupProxyCopy => ListItem::new(Line::from(vec![Span::styled("      > Скопировать команду", Style::new().fg(Color::Cyan))])),
+            Row::GroupProxyCopy => {
+                #[cfg(target_os = "macos")]
+                let unavailable = matches!(crate::hwid::cached_availability(), Some(Err(_)));
+                #[cfg(not(target_os = "macos"))]
+                let unavailable = false;
+                ListItem::new(Line::from(vec![Span::styled(
+                    if unavailable { "      > Скопировать команду — недоступно" } else { "      > Скопировать команду" },
+                    Style::new().fg(if unavailable { Color::DarkGray } else { Color::Cyan }),
+                )]))
+            },
             Row::GroupProxyPaste => ListItem::new(Line::from(vec![Span::styled("      > Вставить ключ из буфера", Style::new().fg(Color::Cyan))])),
             Row::CustomDnsText => {
                 let text = self.custom_dns_text();

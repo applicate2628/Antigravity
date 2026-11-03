@@ -918,6 +918,7 @@ fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
     );
     ui.add_space(4.0);
     ui.horizontal(|ui| {
+        #[cfg(not(target_os = "macos"))]
         if ui.button("Скопировать команду").clicked() {
             let cmd = format!("/ag+{}", crate::hwid::pc_code());
             crate::utils::set_clipboard_text(&cmd);
@@ -926,10 +927,21 @@ fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
                 "Команда скопирована — отправьте её в группе.".to_string(),
             ));
         }
+        #[cfg(target_os = "macos")]
+        {
+            let unavailable = matches!(crate::hwid::cached_availability(), Some(Err(_)));
+            if ui.add_enabled(!busy && !unavailable, egui::Button::new("Скопировать команду")).clicked() {
+                app.worker.send(Cmd::CopyGroupRegistration);
+            }
+        }
         if ui.button("Открыть группу").clicked() {
             crate::utils::open_url(GROUP_ROOM_URL);
         }
     });
+    #[cfg(target_os = "macos")]
+    if let Some(Err(error)) = crate::hwid::cached_availability() {
+        ui.label(format!("Код устройства недоступен: {error}"));
+    }
     ui.add_space(4.0);
     let field = egui::TextEdit::singleline(&mut app.group_key_input)
         .hint_text("код из группы")

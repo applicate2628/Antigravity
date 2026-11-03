@@ -12,12 +12,17 @@ pub struct GroupKey {
 
 impl fmt::Debug for GroupKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(target_os = "macos")]
+        return write!(f, "GroupKey {{ issued: {} }}", self.issued);
+        #[cfg(not(target_os = "macos"))]
+        {
         // never user_key, host or port — invariant I46
         write!(
             f,
             "GroupKey {{ tg: {}, code: {}, issued: {} }}",
             self.tg, self.code, self.issued
         )
+        }
     }
 }
 
@@ -26,6 +31,10 @@ pub enum KeyError {
     NotAKey,
     Damaged,
     OtherPc,
+    #[cfg(target_os = "macos")]
+    IdentityUnavailable(crate::hwid::HwidError),
+    #[cfg(target_os = "macos")]
+    Cancelled,
 }
 
 impl fmt::Display for KeyError {
@@ -33,11 +42,18 @@ impl fmt::Display for KeyError {
         match self {
             KeyError::NotAKey => write!(f, "Это не ключ доступа — скопируйте ответ бота целиком"),
             KeyError::Damaged => write!(f, "Ключ повреждён"),
+            #[cfg(not(target_os = "macos"))]
             KeyError::OtherPc => write!(
                 f,
                 "Этот ключ выдан для другого ПК (код {})",
                 crate::hwid::pc_code()
             ),
+            #[cfg(target_os = "macos")]
+            KeyError::OtherPc => write!(f, "Этот ключ выдан для другого ПК"),
+            #[cfg(target_os = "macos")]
+            KeyError::IdentityUnavailable(error) => write!(f, "Код устройства недоступен: {error}"),
+            #[cfg(target_os = "macos")]
+            KeyError::Cancelled => write!(f, "Проверка ключа отменена"),
         }
     }
 }
@@ -155,6 +171,13 @@ fn unwrap(t: &[u8], token: &str) -> Result<Vec<u8>, KeyError> {
 include!(concat!(env!("OUT_DIR"), "/group_gen.rs"));
 
 pub fn parse_key(text: &str) -> Result<GroupKey, KeyError> {
+    #[cfg(target_os = "macos")]
+    { return parse_key_with_allowed(text, &|| true); }
+    #[cfg(not(target_os = "macos"))]
+    { parse_with(&baked_wrap_key()?, text, crate::hwid::pc_code()) }
+}
+
+fn baked_wrap_key() -> Result<[u8; 32], KeyError> {
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce as AesNonce};
     let plain_group = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&GROUP_KEY))
@@ -166,12 +189,37 @@ pub fn parse_key(text: &str) -> Result<GroupKey, KeyError> {
     if t_hex.len() != 64 || hex::decode_to_slice(&t_hex, &mut t).is_err() {
         return Err(KeyError::Damaged); // internal error: baked T is invalid
     }
-    parse_with(&t, text, crate::hwid::pc_code())
+    Ok(t)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn parse_key_with_allowed(text: &str, allowed: &dyn Fn() -> bool) -> Result<GroupKey, KeyError> {
+    if !allowed() { return Err(KeyError::Cancelled); }
+    if text.trim().is_empty() { return Err(KeyError::NotAKey); }
+    parse_with_identity(&baked_wrap_key()?, text, allowed, crate::hwid::pc_code)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_with_identity<'a>(t: &[u8; 32], text: &str, allowed: &dyn Fn() -> bool,
+    identity: impl FnOnce() -> Result<&'a str, crate::hwid::HwidError>) -> Result<GroupKey, KeyError> {
+    if !allowed() { return Err(KeyError::Cancelled); }
+    if text.trim().is_empty() { return Err(KeyError::NotAKey); }
+    let key = decode_key(t, text)?;
+    if !allowed() { return Err(KeyError::Cancelled); }
+    let received = identity();
+    let still_allowed = allowed();
+    let code = received.map_err(KeyError::IdentityUnavailable)?;
+    if !still_allowed { return Err(KeyError::Cancelled); }
+    match_device(key, code)
 }
 
 /// The parse itself, with the wrap key and this PC's code passed in, so the
 /// reference vectors (server/agu2.py) can be checked without the baked secret.
 fn parse_with(t: &[u8; 32], text: &str, own_code: &str) -> Result<GroupKey, KeyError> {
+    match_device(decode_key(t, text)?, own_code)
+}
+
+fn decode_key(t: &[u8; 32], text: &str) -> Result<GroupKey, KeyError> {
     let plain = unwrap(t, text)?;
     let s = String::from_utf8(plain).map_err(|_| KeyError::Damaged)?;
     let f: Vec<&str> = s.split('\n').collect();
@@ -192,10 +240,6 @@ fn parse_with(t: &[u8; 32], text: &str, own_code: &str) -> Result<GroupKey, KeyE
         return Err(KeyError::Damaged);
     }
 
-    if code != own_code {
-        return Err(KeyError::OtherPc);
-    }
-
     Ok(GroupKey {
         host,
         port,
@@ -204,6 +248,11 @@ fn parse_with(t: &[u8; 32], text: &str, own_code: &str) -> Result<GroupKey, KeyE
         issued,
         user_key,
     })
+}
+
+fn match_device(key: GroupKey, own_code: &str) -> Result<GroupKey, KeyError> {
+    if key.code != own_code { return Err(KeyError::OtherPc); }
+    Ok(key)
 }
 
 /// The `Proxy-Authorization` value for one CONNECT (agu2.py `auth_header`).
@@ -227,6 +276,21 @@ pub fn auth_header(key: &GroupKey, own_code: &str, ts: u64, nonce_hex: &str, hos
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn empty_or_cancelled_key_does_not_request_identity() {
+        let calls = std::cell::Cell::new(0);
+        let identity = || { calls.set(calls.get() + 1); Ok("synthetic") };
+        assert!(matches!(parse_with_identity(&vec_t(), "", &|| true, identity), Err(KeyError::NotAKey)));
+        assert!(matches!(parse_with_identity(&vec_t(), VEC_TOKEN, &|| false, || { calls.set(calls.get() + 1); Ok("synthetic") }), Err(KeyError::Cancelled)));
+        assert!(matches!(parse_with_identity(&vec_t(), "not_a_key", &|| true, || { calls.set(calls.get() + 1); Ok("synthetic") }), Err(KeyError::NotAKey)));
+        assert_eq!(calls.get(), 0);
+        assert!(matches!(parse_with_identity(&vec_t(), VEC_TOKEN, &|| true, || { calls.set(calls.get() + 1); Err(crate::hwid::HwidError::RegistryExit) }), Err(KeyError::IdentityUnavailable(_))));
+        assert_eq!(calls.get(), 1);
+        assert!(parse_with_identity(&vec_t(), VEC_TOKEN, &|| true, || Ok("t146sdha")).is_ok());
+        assert!(matches!(parse_with_identity(&vec_t(), VEC_TOKEN, &|| true, || Ok("aaaaaaaa")), Err(KeyError::OtherPc)));
+    }
 
     // Inputs and outputs of `python server/agu2.py` (vectors()): M = 0..32, T = 32..64.
     const VEC_TOKEN: &str = "agk1.AAAAAAAAAAAAAAAAAAAAAEy6F3L5D8Dc9LvH6rGHrLK_G4rFhrMhG8w7VNcjIRD4C2Qnp-d8zEXAzX0HXJrBn86fGLYZdrwVLwxqo4mWvomgQVW33guBoeYXqx2R9i4dW6dBkyTlkhlClYB2cyASMeoT7-VvWR9lW3fNTy4CCrvS6j_bQ4HgCMve_WB8uI8AcvxRfiQ";

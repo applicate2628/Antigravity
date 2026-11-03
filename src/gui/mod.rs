@@ -285,6 +285,16 @@ impl App {
                     self.status = Some(*status);
                 }
                 Event::Busy(what) => self.busy = what,
+                #[cfg(target_os = "macos")]
+                Event::RegistrationCode(result) => match result {
+                    Ok(code) if self.lifetime.accepts_user_action() => {
+                        let copied = crate::utils::set_clipboard_text(&format!("/ag+{code}"));
+                        self.log.push((if copied { Level::Info } else { Level::Err },
+                            if copied { "Команда скопирована — отправьте её в группе." } else { "Не удалось скопировать команду." }.into()));
+                    },
+                    Ok(_) => {},
+                    Err(error) => self.log.push((Level::Err, format!("Код устройства недоступен: {error}"))),
+                },
                 Event::ShutdownReady => self.shutdown_ready = true,
             }
         }

@@ -329,6 +329,8 @@ pub enum Event {
     /// `Some(what)` while an action runs, `None` when the queue drains. The UI
     /// dims the switches in between so a second click cannot queue a race.
     Busy(Option<String>),
+    #[cfg(target_os = "macos")]
+    RegistrationCode(Result<String, String>),
     /// Every owned GUI operation actually settled and Settings were saved.
     ShutdownReady,
 }
@@ -386,6 +388,8 @@ pub enum Cmd {
     SetOwnProxy(String),
     SetCustomDns(String),
     SetGroupKey(String),
+    #[cfg(target_os = "macos")]
+    CopyGroupRegistration,
     SetProvider(String, bool),
     /// The whole pool in the order the user dragged it into.
     ReorderProviders(Vec<String>),
@@ -433,6 +437,11 @@ pub struct GuiLifetime {
     action: Mutex<Option<crate::instances::GuiReplacementAction>>,
 }
 impl GuiLifetime {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn accepts_user_action(&self) -> bool {
+        !self.abort_requested.load(Ordering::SeqCst) && !self.handoff_requested.load(Ordering::SeqCst)
+            && !self.channel_lost.load(Ordering::SeqCst)
+    }
     pub(crate) fn hold_automatic_effects(&self, reason: String) -> Result<(), String> {
         *self.bootstrap_hold.lock().map_err(|_| "GUI startup hold receiving lock poisoned")? = Some(reason);
         Ok(())
@@ -1092,24 +1101,11 @@ fn run_worker(
             command @ (Cmd::Set(_, _) | Cmd::SetBypass(_) | Cmd::EnableAll | Cmd::Repair
                 | Cmd::SetOwnProxy(_) | Cmd::SetGroupKey(_) | Cmd::Unlocked
                 | Cmd::AddPath(_) | Cmd::PatchInstall(_)) => {
-                native_cancel.store(false, Ordering::SeqCst);
-                native_apply_pending.store(true, Ordering::SeqCst);
-                ctx.busy(Some("Применение выбранного действия"));
-                push_status(&mut ctx, Scan::Settings);
-                let shared = shared.clone();
-                native_job = match std::thread::Builder::new().name("settings-command".into()).spawn(move || {
-                    let mut ctx = shared.lock().map_err(|_| "settings owner lock was poisoned".to_owned())?;
-                    dispatch_owned_command(&mut ctx, command)
-                }) {
-                    Ok(job) => Some(job),
-                    Err(error) => {
-                        native_apply_pending.store(false, Ordering::SeqCst);
-                        ctx.log(Level::Err, format!("Не удалось начать выбранное действие: {error}"));
-                        ctx.busy(None);
-                        push_status(&mut ctx, Scan::Settings);
-                        None
-                    }
-                };
+                native_job = start_owned_command(&mut ctx, shared.clone(), command);
+            },
+            #[cfg(target_os = "macos")]
+            command @ Cmd::CopyGroupRegistration => {
+                native_job = start_owned_command(&mut ctx, shared.clone(), command);
             },
             Cmd::ForgetPath(p) => {
                 ctx.settings.manual_paths.retain(|x| x != &p);
@@ -1324,6 +1320,27 @@ fn wsl_status(ctx: &Ctx) -> crate::wsl_api::WslStatus {
     status
 }
 
+fn start_owned_command(ctx: &mut Ctx, shared: Arc<Mutex<Ctx>>, command: Cmd)
+    -> Option<std::thread::JoinHandle<Result<NativeCompletion, String>>> {
+    ctx.native_cancel.store(false, Ordering::SeqCst);
+    ctx.native_apply_pending.store(true, Ordering::SeqCst);
+    ctx.busy(Some("Применение выбранного действия"));
+    push_status(ctx, Scan::Settings);
+    match std::thread::Builder::new().name("settings-command".into()).spawn(move || {
+        let mut ctx = shared.lock().map_err(|_| "settings owner lock was poisoned".to_owned())?;
+        dispatch_owned_command(&mut ctx, command)
+    }) {
+        Ok(job) => Some(job),
+        Err(error) => {
+            ctx.native_apply_pending.store(false, Ordering::SeqCst);
+            ctx.log(Level::Err, format!("Не удалось начать выбранное действие: {error}"));
+            ctx.busy(None);
+            push_status(ctx, Scan::Settings);
+            None
+        }
+    }
+}
+
 /// The existing native job owns Ctx while the outer loop receives cancel/close.
 /// These selected command effects run off the command-receiving thread.
 fn dispatch_owned_command(ctx: &mut Ctx, command: Cmd) -> Result<NativeCompletion, String> {
@@ -1358,8 +1375,17 @@ fn dispatch_owned_command(ctx: &mut Ctx, command: Cmd) -> Result<NativeCompletio
             }
             Cmd::SetGroupKey(text) => {
                 ctx.busy(Some("Проверка ключа"));
-                match crate::group_key::parse_key(&text) {
+                #[cfg(not(target_os = "macos"))]
+                let parsed = crate::group_key::parse_key(&text);
+                #[cfg(target_os = "macos")]
+                let parsed = crate::group_key::parse_key_with_allowed(&text,
+                    &|| !ctx.native_cancel.load(Ordering::SeqCst));
+                #[cfg(target_os = "macos")]
+                if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Действие отменено после проверки ключа.".into()); }
+                match parsed {
                     Ok(_) => {
+                        #[cfg(target_os = "macos")]
+                        if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Действие отменено до изменения настроек группы.".into()); }
                         ctx.settings.group_key = text.trim().to_string();
                         ctx.settings.group_key_at = crate::gate::now_unix();
                         ctx.settings.group_proxy = true;
@@ -1388,6 +1414,19 @@ fn dispatch_owned_command(ctx: &mut Ctx, command: Cmd) -> Result<NativeCompletio
                 if auto_patch_found(ctx) { push_status(ctx, Scan::Deep); }
                 else { push_status(ctx, Scan::System); }
             } else { push_status(ctx, Scan::Settings); }
+        },
+        #[cfg(target_os = "macos")]
+        Cmd::CopyGroupRegistration => {
+            let result = crate::hwid::pc_code().map(str::to_owned).map_err(|error| error.to_string());
+            if ctx.native_cancel.load(Ordering::SeqCst) {
+                return match result { Ok(_) => Err("Получение кода отменено.".into()),
+                    Err(error) => Err(format!("Код устройства недоступен: {error}; получение отменено.")) };
+            }
+            if ctx.events.send(Event::RegistrationCode(result)).is_err() {
+                ctx.lifetime.channel_lost.store(true, Ordering::SeqCst);
+                return Err("Окно получения кода недоступно.".into());
+            }
+            if let Ok(wake) = ctx.wake.lock() { (wake)(); }
         },
         Cmd::AddPath(path) => {
             if !ctx.settings.manual_paths.contains(&path) {
@@ -2187,6 +2226,12 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) -> Result<(), String> {
             }
         }
         (Cap::GroupProxy, on) => {
+            #[cfg(target_os = "macos")]
+            if on && !ctx.settings.group_key.trim().is_empty() {
+                if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Действие отменено до получения кода.".into()); }
+                crate::hwid::pc_code().map_err(|error| format!("Код устройства недоступен: {error}"))?;
+                if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Действие отменено после получения кода.".into()); }
+            }
             ctx.settings.group_proxy = on;
             ctx.log(
                 Level::Ok,

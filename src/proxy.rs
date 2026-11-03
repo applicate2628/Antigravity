@@ -523,10 +523,10 @@ impl DesiredRouteProfile {
     }
 
     #[cfg(target_os = "macos")]
-    fn capture(_target: &GateTarget443<'_>) -> Result<Self, String> {
+    fn capture(_target: &GateTarget443<'_>, allowed: &dyn Fn() -> bool) -> Result<Self, String> {
         let (settings, group, own) = crate::group::capture_route_profile(|settings| {
             if settings.own_proxy_enabled { upstream::configured() } else { Ok(None) }
-        })?;
+        }, allowed)?;
         Ok(Self { settings, own, group })
     }
 
@@ -834,7 +834,12 @@ pub fn route_usable(kind: routes::Kind, host: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn checked_route_profile(host: &str) -> Result<DesiredRouteProfile, String> {
-    DesiredRouteProfile::capture(&GateTarget443 { host })
+    checked_route_profile_with(host, &|| true)
+}
+
+#[cfg(target_os = "macos")]
+fn checked_route_profile_with(host: &str, allowed: &dyn Fn() -> bool) -> Result<DesiredRouteProfile, String> {
+    DesiredRouteProfile::capture(&GateTarget443 { host }, allowed)
 }
 
 #[cfg(target_os = "macos")]
@@ -1301,7 +1306,7 @@ fn serve_gate(client: TcpStream, host: &str, port: u16) {
     let mut client = client;
     let mut tried_direct = false;
     #[cfg(target_os = "macos")]
-    let profile = match checked_route_profile(host) {
+    let profile = match checked_route_profile_with(host, &|| started.elapsed() < GATE_OPEN_BUDGET) {
         Ok(profile) => profile,
         Err(error) => { crate::dns_forwarder::log_proxy(&format!("route configuration unavailable: {error}")); let _ = client.write_all(RESP_BAD_GATEWAY); return; }
     };
@@ -1337,7 +1342,15 @@ fn serve_gate(client: TcpStream, host: &str, port: u16) {
             routes::Kind::Group => try_group(client, host, port),
             #[cfg(target_os = "macos")]
             routes::Kind::Group => match profile.group.as_ref() {
-                Some(key) => crate::group::tunnel_captured(client, host, port, key),
+                Some(key) => match crate::group::tunnel_captured(client, host, port, key) {
+                    Ok(()) => Ok(()),
+                    Err(crate::group::MacGroupTunnelError::Unavailable(client)) => Err(client),
+                    Err(crate::group::MacGroupTunnelError::Configuration(mut client, error)) => {
+                        crate::dns_forwarder::log_proxy(&format!("group identity unavailable: {error}"));
+                        let _ = client.write_all(RESP_BAD_GATEWAY);
+                        return;
+                    },
+                },
                 None => Err(client),
             },
             routes::Kind::Exits => try_builtin_exit(client, host, port),

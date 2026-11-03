@@ -1,5 +1,76 @@
 use std::sync::OnceLock;
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HwidError {
+    RegistryCommand,
+    RegistryExit,
+    PlistSpawn,
+    PlistInput,
+    PlistInputAndExit,
+    PlistExit,
+    PlistWait,
+    PlistInputAndWait,
+    InvalidUuid,
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for HwidError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::RegistryCommand => "не удалось выполнить чтение идентификатора",
+            Self::RegistryExit => "система не предоставила идентификатор",
+            Self::PlistSpawn => "не удалось запустить извлечение идентификатора",
+            Self::PlistInput => "не удалось передать системные данные для извлечения",
+            Self::PlistInputAndExit => "передача системных данных не удалась; извлечение завершилось с ошибкой",
+            Self::PlistExit => "система не вернула идентификатор нужного типа",
+            Self::PlistWait => "не подтверждено завершение извлечения идентификатора",
+            Self::PlistInputAndWait => "передача системных данных и наблюдение завершения не удались",
+            Self::InvalidUuid => "идентификатор отсутствует или имеет неверный формат",
+        };
+        f.write_str(message)
+    }
+}
+
+/// Accept only canonical non-nil UUID text. Neither failure nor its diagnostic
+/// includes the source bytes; normalization matches the existing Mac port.
+#[cfg(target_os = "macos")]
+fn normalize_mac_uuid(bytes: &[u8]) -> Result<String, HwidError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| HwidError::InvalidUuid)?.trim_matches(|c: char| c.is_ascii_whitespace());
+    let raw = text.as_bytes();
+    if raw.len() != 36 { return Err(HwidError::InvalidUuid); }
+    let mut normalized = String::with_capacity(32);
+    for (index, &byte) in raw.iter().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            if byte != b'-' { return Err(HwidError::InvalidUuid); }
+        } else {
+            if !byte.is_ascii_hexdigit() { return Err(HwidError::InvalidUuid); }
+            normalized.push((byte as char).to_ascii_lowercase());
+        }
+    }
+    if normalized.bytes().all(|byte| byte == b'0') { return Err(HwidError::InvalidUuid); }
+    Ok(format!("smbios-uuid:{normalized}"))
+}
+
+#[cfg(target_os = "macos")]
+fn derive_mac_code_with(bytes: &[u8], hash: impl FnOnce(&str) -> String) -> Result<String, HwidError> {
+    let raw = normalize_mac_uuid(bytes)?;
+    Ok(hash(&raw))
+}
+
+#[cfg(target_os = "macos")]
+fn receive_registry_with<T>(success: bool, extract: impl FnOnce() -> Result<T, HwidError>) -> Result<T, HwidError> {
+    if !success { return Err(HwidError::RegistryExit); }
+    extract()
+}
+
+#[cfg(target_os = "macos")]
+fn finish_extraction_with(success: bool, bytes: &[u8], hash: impl FnOnce(&str) -> String) -> Result<String, HwidError> {
+    if !success { return Err(HwidError::PlistExit); }
+    derive_mac_code_with(bytes, hash)
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn pc_code() -> &'static str {
     static CODE: OnceLock<String> = OnceLock::new();
     CODE.get_or_init(|| {
@@ -7,6 +78,51 @@ pub fn pc_code() -> &'static str {
         agu2_pc_code(&raw)
     })
     .as_str()
+}
+
+#[cfg(target_os = "macos")]
+static MAC_CODE: OnceLock<Result<String, HwidError>> = OnceLock::new();
+
+/// Inspect only the cached outcome; this never queries hardware.
+#[cfg(target_os = "macos")]
+pub fn cached_availability() -> Option<Result<(), HwidError>> {
+    MAC_CODE.get().map(|result| result.as_ref().map(|_| ()).map_err(Clone::clone))
+}
+
+#[cfg(target_os = "macos")]
+pub fn pc_code() -> Result<&'static str, HwidError> {
+    MAC_CODE.get_or_init(acquire_mac_code).as_deref().map_err(Clone::clone)
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_mac_code() -> Result<String, HwidError> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let registry = Command::new("/usr/sbin/ioreg")
+        .args(["-r", "-d", "1", "-c", "IOPlatformExpertDevice", "-a"])
+        .output().map_err(|_| HwidError::RegistryCommand)?;
+    let registry_ok = registry.status.success();
+    receive_registry_with(registry_ok, || {
+    let mut child = Command::new("/usr/bin/plutil")
+        .args(["-extract", "0.IOPlatformUUID", "raw", "-expect", "string", "-o", "-", "-"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().map_err(|_| HwidError::PlistSpawn)?;
+    let write = match child.stdin.take() {
+        Some(mut input) => input.write_all(&registry.stdout).map_err(|_| HwidError::PlistInput),
+        None => Err(HwidError::PlistInput),
+    };
+    drop(registry);
+    // wait_with_output closes stdin and reaps this exact child on the documented
+    // success path. A failed write is retained even if waiting also fails.
+    let output = child.wait_with_output();
+    match (write, output) {
+        (Err(_), Err(_)) => Err(HwidError::PlistInputAndWait),
+        (Err(_), Ok(output)) if !output.status.success() => Err(HwidError::PlistInputAndExit),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(()), Err(_)) => Err(HwidError::PlistWait),
+        (Ok(()), Ok(output)) => finish_extraction_with(output.status.success(), &output.stdout, agu2_pc_code),
+    }
+    })
 }
 
 fn agu2_pc_code(raw: &str) -> String {
@@ -207,7 +323,7 @@ fn parse_smbios(mut data: &[u8]) -> Option<String> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn get_raw_hwid() -> String {
     use std::fs;
     if let Ok(uuid) = fs::read_to_string("/sys/class/dmi/id/product_uuid") {
@@ -229,6 +345,33 @@ fn get_raw_hwid() -> String {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_uuid_validation_precedes_hash_and_preserves_valid_vector() {
+        use std::cell::Cell;
+        let hashes = Cell::new(0);
+        let code = derive_mac_code_with(b" 00112233-4455-6677-8899-AABBCCDDEEFF\n", |raw| {
+            hashes.set(hashes.get() + 1);
+            assert_eq!(raw, "smbios-uuid:00112233445566778899aabbccddeeff");
+            agu2_pc_code(raw)
+        }).unwrap();
+        assert_eq!(code, "8rs6jz2g");
+        assert_eq!(hashes.get(), 1);
+        let extraction_calls = Cell::new(0);
+        assert_eq!(receive_registry_with(false, || { extraction_calls.set(extraction_calls.get() + 1); Ok(()) }), Err(HwidError::RegistryExit));
+        assert_eq!(extraction_calls.get(), 0);
+        assert_eq!(finish_extraction_with(false, b"synthetic-secret-marker", |_| {
+            hashes.set(hashes.get() + 1); "unexpected".into()
+        }), Err(HwidError::PlistExit));
+        assert_eq!(hashes.get(), 1);
+        for invalid in [&b""[..], &b"00000000-0000-0000-0000-000000000000"[..], &b"synthetic-secret-marker"[..], &b"00112233-4455-6677-8899-AABBCCDDEEFG"[..]] {
+            let error = derive_mac_code_with(invalid, |_| { hashes.set(hashes.get() + 1); "unexpected".into() }).unwrap_err();
+            assert_eq!(error, HwidError::InvalidUuid);
+            assert!(!error.to_string().contains("synthetic-secret-marker"));
+        }
+        assert_eq!(hashes.get(), 1);
+    }
+
     #[test]
     fn pc_code_vectors() {
         assert_eq!(agu2_pc_code("ABC"), "cgcxprbk");
@@ -237,6 +380,7 @@ mod tests {
     /// Prints which source the code came from on this machine and the code.
     ///
     ///     cargo test this_pc_code -- --ignored --nocapture
+    #[cfg(not(target_os = "macos"))]
     #[test]
     #[ignore = "reads this machine's firmware tables"]
     fn this_pc_code() {

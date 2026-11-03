@@ -189,6 +189,7 @@ fn status_part(out: &mut String, s: &Status) {
     let _ = writeln!(out, "Локальный прокси: {}", onoff(&s.local_proxy));
     let _ = writeln!(out, "Встроенные выходы: {}", onoff(&s.builtin_exits));
     let key_present = if crate::settings::group_key().is_empty() { "нет" } else { "есть" };
+    #[cfg(not(target_os = "macos"))]
     let _ = writeln!(
         out,
         "Прокси из группы: {}, ключ: {}, код ПК: {}",
@@ -196,6 +197,9 @@ fn status_part(out: &mut String, s: &Status) {
         key_present,
         crate::hwid::pc_code()
     );
+    #[cfg(target_os = "macos")]
+    let _ = writeln!(out, "Прокси из группы: {}, ключ: {}, код устройства: {}", onoff(&s.group_proxy), key_present,
+        match crate::hwid::cached_availability() { None => "не проверен".to_owned(), Some(Ok(())) => "доступен".to_owned(), Some(Err(error)) => format!("недоступен: {error}") });
     let _ = writeln!(out, "Свой прокси: {}", onoff(&s.own_proxy));
     #[cfg(not(target_os = "macos"))]
     let _ = writeln!(

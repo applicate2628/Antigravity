@@ -267,10 +267,15 @@ pub(crate) fn open_selected_route<'a>(
     #[cfg(not(target_os = "macos"))]
     let profile = DesiredRouteProfile::capture(target);
     #[cfg(target_os = "macos")]
-    let profile = DesiredRouteProfile::capture(target).map_err(OpenFailure::Configuration)?;
+    let profile = match DesiredRouteProfile::capture(target, &|| !cancelled.load(Ordering::Acquire) && Instant::now() < deadline) {
+        Ok(profile) => profile,
+        Err(error) => { remaining(deadline, cancelled)?; return Err(OpenFailure::Configuration(error)); }
+    };
     let mut tried_direct = false;
     let mut denied_direct = false;
     let mut last_error = None;
+    #[cfg(target_os = "macos")]
+    let group_error = std::cell::RefCell::new(None::<String>);
     let opened = walk_routes(profile.order(target.host()), deadline, cancelled, |kind, budget| {
         match kind {
             routes::Kind::Own => profile.own.as_ref().and_then(|up| {
@@ -284,9 +289,18 @@ pub(crate) fn open_selected_route<'a>(
                     }
                 }
             }),
+            #[cfg(not(target_os = "macos"))]
             routes::Kind::Group => profile.group.as_ref()
                 .and_then(|key| crate::group::open_group(target, key, deadline, cancelled))
                 .map(OpenedRoute::Group),
+            #[cfg(target_os = "macos")]
+            routes::Kind::Group => match profile.group.as_ref() {
+                Some(key) => match crate::group::open_group(target, key, deadline, cancelled) {
+                    Ok(opened) => opened.map(OpenedRoute::Group),
+                    Err(error) => { *group_error.borrow_mut() = Some(error); None },
+                },
+                None => None,
+            },
             routes::Kind::Direct => {
                 tried_direct = true;
                 match direct(target, deadline, cancelled, checks, false) {
@@ -314,6 +328,7 @@ pub(crate) fn open_selected_route<'a>(
     }, |kind| {
         #[cfg(target_os = "macos")]
         if kind == routes::Kind::Group {
+            if let Some(error) = group_error.borrow_mut().take() { return Err(OpenFailure::Configuration(error)); }
             let received = match profile.group.as_ref() {
                 Some(key) => crate::group::stumble_if_current(key), None => Ok(false),
             };
