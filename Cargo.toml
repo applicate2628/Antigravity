@@ -5,6 +5,9 @@ edition = "2021"
 description = "Antigravity Configuration Tool"
 authors = ["Brent t.me/nova_txt", "Fuheshka github.com/Fuheshka"]
 
+[features]
+personal-build = []
+
 [dependencies]
 obfstr = "0.4"
 sha2 = "0.10"

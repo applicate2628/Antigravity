@@ -391,17 +391,13 @@ fn without_source_location(msg: &str) -> &str {
         .unwrap_or(msg)
 }
 
-/// The licence screen, always - except in a *debug* build started with
-/// `AG_UNLOCKER_DEV_SKIP_KEY` set, so the main screen can be looked at while it
-/// is being worked on. Compiled out of every release build (`build_rust.py`
-/// builds release), so a shipped exe has no way past the key.
+/// Local entry uses the shared licence, personal-build and debug policy.
 fn first_screen(settings: &Settings) -> Screen {
     #[cfg(debug_assertions)]
-    if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
-        return Screen::Main;
-    }
-    // A key accepted before and still good for this version: no screen.
-    if crate::auth::verify_key(&settings.license_key) {
+    let debug_skip = std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some();
+    #[cfg(not(debug_assertions))]
+    let debug_skip = false;
+    if crate::auth::entry_allowed(&settings.license_key, debug_skip) {
         return Screen::Main;
     }
     Screen::License
