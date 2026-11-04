@@ -1287,10 +1287,7 @@ fn spawn_proxy_env_maintainer() {
             // The port that answered is the one named: the proxy may have moved
             // while this waited (P26), and only our own listener counts - not a
             // program of someone else's answering on the default port.
-            #[cfg(target_os = "windows")]
             let received_listener = proxy::wait_for_our_listener(PROXY_START_BUDGET);
-            #[cfg(not(target_os = "windows"))]
-            let received_listener: Result<Option<u16>, String> = Ok(proxy::wait_for_our_listener(PROXY_START_BUDGET));
             let port = match received_listener {
                 Ok(Some(port)) => port,
                 Err(error) => {

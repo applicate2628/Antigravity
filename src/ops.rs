@@ -3085,6 +3085,7 @@ fn disable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
         disable_local_proxy_effect(ctx)?;
     }
 
+    #[cfg(windows)]
     remove_dns_rules_effect(ctx)?;
     if keep_relay {
         ctx.log(
@@ -3104,6 +3105,7 @@ fn disable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn remove_dns_rules_effect(ctx: &mut Ctx) -> Result<(), String> {
     dns::remove_dns_nrpt_checked()?;
     dns::invalidate_cache();
