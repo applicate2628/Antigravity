@@ -77,6 +77,27 @@ pub(crate) struct GuiApplyContinuation {
     #[serde(with = "sha256_hex")]
     pub(crate) saved_settings_sha256: [u8; 32],
     pub(crate) targets: Vec<GuiTargetExpectation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retirement_input: Option<GuiRetirementInputRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct GuiRetirementInputRef {
+    pub(crate) path: PathBuf,
+    pub(crate) native_id: NativeObjectId,
+    #[serde(serialize_with = "sha256_hex::serialize", deserialize_with = "lower_sha256")]
+    pub(crate) sha256: [u8; 32],
+}
+fn lower_sha256<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<[u8; 32], D::Error> {
+    use serde::Deserialize;
+    let value = String::deserialize(deserializer)?;
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err(serde::de::Error::custom("expected lowercase SHA-256"));
+    }
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(value, &mut bytes).map_err(serde::de::Error::custom)?;
+    Ok(bytes)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -116,6 +137,24 @@ pub(crate) enum GuiCurrentExpectation {
         #[serde(rename = "currentSha256", with = "sha256_hex")]
         current_sha256: [u8; 32],
     },
+    VendorUpdate {
+        #[serde(rename = "slotId")]
+        slot_id: String,
+        #[serde(rename = "priorCurrentSha256", with = "sha256_hex")]
+        prior_current_sha256: [u8; 32],
+        #[serde(rename = "newParentId")]
+        new_parent_id: NativeObjectId,
+        #[serde(rename = "newResourcesId")]
+        new_resources_id: NativeObjectId,
+        #[serde(rename = "newArchiveId")]
+        new_archive_id: NativeObjectId,
+        #[serde(rename = "newExecutableSha256", with = "sha256_hex")]
+        new_executable_sha256: [u8; 32],
+        #[serde(rename = "newArchiveSha256", with = "sha256_hex")]
+        new_archive_sha256: [u8; 32],
+        #[serde(rename = "newBindingSha256", with = "sha256_hex")]
+        new_binding_sha256: [u8; 32],
+    },
     NotApplicable {},
 }
 
@@ -134,7 +173,7 @@ impl GuiReplacementAction {
                 match (&expectation.target.kind, &expectation.current) {
                     (
                         GuiTargetKind::Desktop,
-                        GuiCurrentExpectation::Absent {} | GuiCurrentExpectation::Present { .. },
+                        GuiCurrentExpectation::Absent {} | GuiCurrentExpectation::Present { .. } | GuiCurrentExpectation::VendorUpdate { .. },
                     )
                     | (
                         GuiTargetKind::Ide | GuiTargetKind::Cli,
@@ -143,6 +182,7 @@ impl GuiReplacementAction {
                     _ => return Err("GUI Apply target kind/current expectation mismatch".into()),
                 }
                 if matches!(&expectation.current, GuiCurrentExpectation::Present { slot_id, .. } if slot_id.is_empty())
+                    || matches!(&expectation.current, GuiCurrentExpectation::VendorUpdate { slot_id, .. } if slot_id.is_empty())
                 {
                     return Err("GUI Apply current slot ID is missing".into());
                 }
@@ -856,6 +896,20 @@ impl Rendezvous {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retirement_descriptor_is_optional_closed_and_digest_bound() {
+        let mut action = serde_json::to_value(resume_action()).unwrap();
+        assert!(action.get("retirementInput").is_none());
+        action["retirementInput"] = serde_json::json!({"path":"C:\\synthetic\\selection.json",
+            "nativeId":{"volume":7,"file":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]}, "sha256":"a".repeat(64)});
+        assert!(serde_json::from_value::<GuiReplacementAction>(action.clone()).is_ok());
+        let mut bad = action.clone(); bad["retirementInput"]["sha256"] = "A".repeat(64).into();
+        assert!(serde_json::from_value::<GuiReplacementAction>(bad).is_err());
+        let mut bad = action.clone(); bad["retirementInput"].as_object_mut().unwrap().remove("nativeId");
+        assert!(serde_json::from_value::<GuiReplacementAction>(bad).is_err());
+        let mut bad = action; bad["retirementInput"]["extra"] = true.into();
+        assert!(serde_json::from_value::<GuiReplacementAction>(bad).is_err());
+    }
     use super::*;
     fn request() -> Vec<OsString> {
         [
@@ -913,6 +967,7 @@ mod tests {
         GuiReplacementAction::ResumeApply(GuiApplyContinuation {
             request_id: "synthetic correlation".into(),
             saved_settings_sha256: [3; 32],
+            retirement_input: None,
             targets: vec![
                 GuiTargetExpectation {
                     target: target(
@@ -960,6 +1015,44 @@ mod tests {
         args[1] = "2".into();
         args.extend(["--action".into(), action.into()]);
         args
+    }
+
+    #[test]
+    fn vendor_update_continuation_requires_every_bound_field() {
+        let mut action = resume_action();
+        let GuiReplacementAction::ResumeApply(ref mut continuation) = action else { panic!("fixture") };
+        let id = NativeObjectId { volume: 42, file: [9; 16] };
+        continuation.targets[0].current = GuiCurrentExpectation::VendorUpdate {
+            slot_id: "vendor-slot".into(), prior_current_sha256: [1; 32], new_parent_id: id.clone(),
+            new_resources_id: id.clone(), new_archive_id: id, new_executable_sha256: [2; 32],
+            new_archive_sha256: [3; 32], new_binding_sha256: [4; 32],
+        };
+        let value = serde_json::to_value(&action).unwrap();
+        assert_eq!(value["targets"][0]["current"]["state"], "vendorUpdate");
+        assert_eq!(value["targets"][0]["current"]["priorCurrentSha256"], hex::encode([1; 32]));
+        assert_eq!(GuiReplacementAction::receive_json(&value.to_string()).unwrap(), action);
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "state", rename_all = "camelCase", deny_unknown_fields)]
+        enum OlderCurrent { Absent {}, Present {}, NotApplicable {} }
+        assert!(serde_json::from_value::<OlderCurrent>(value["targets"][0]["current"].clone()).is_err());
+        for field in ["slotId", "priorCurrentSha256", "newParentId", "newResourcesId", "newArchiveId",
+            "newExecutableSha256", "newArchiveSha256", "newBindingSha256"] {
+            let mut missing = value.clone();
+            missing["targets"][0]["current"].as_object_mut().unwrap().remove(field);
+            assert!(GuiReplacementAction::receive_json(&missing.to_string()).is_err(), "{field}");
+            let mut null = value.clone();
+            null["targets"][0]["current"][field] = serde_json::Value::Null;
+            assert!(GuiReplacementAction::receive_json(&null.to_string()).is_err(), "{field}");
+        }
+        let mut extra = value.clone();
+        extra["targets"][0]["current"]["unrecognized"] = true.into();
+        assert!(GuiReplacementAction::receive_json(&extra.to_string()).is_err());
+        let mut malformed = value.clone();
+        malformed["targets"][0]["current"]["newBindingSha256"] = "invalid".into();
+        assert!(GuiReplacementAction::receive_json(&malformed.to_string()).is_err());
+        let mut wrong_kind = value;
+        wrong_kind["targets"][0]["target"]["kind"] = "ide".into();
+        assert!(GuiReplacementAction::receive_json(&wrong_kind.to_string()).is_err());
     }
 
     #[test]
