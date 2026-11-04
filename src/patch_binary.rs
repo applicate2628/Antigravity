@@ -32,6 +32,7 @@ use std::time::Duration;
 /// old binary or the new one, never a truncated 135 MB executable that would fail
 /// to launch. A locked Windows image requires a normal close; this module owns
 /// no creator process handle and cannot terminate a process by image name.
+#[cfg(not(target_os = "macos"))]
 fn write_binary(bin_path: &Path, data: &[u8]) -> Result<(), String> {
     #[cfg(windows)]
     let canonical_guard = crate::windows_coordinator::windows_installation::admit_native_binary(bin_path,
@@ -40,15 +41,11 @@ fn write_binary(bin_path: &Path, data: &[u8]) -> Result<(), String> {
         Ok(()) => {
             #[cfg(windows)]
             canonical_guard.recheck().map_err(|error| format!("Файл заменён, но каноническая проверка не завершилась: {error}"))?;
-            #[cfg(target_os = "macos")]
-            resign_macho_ad_hoc(bin_path)?;
             return Ok(());
         },
         Err(error) => {
             #[cfg(windows)]
             return Err(format!("Файл не заменён; закройте использующее его приложение обычным способом: {error}"));
-            #[cfg(target_os = "macos")]
-            return Err(format!("Файл не заменён: {error}"));
             #[cfg(all(not(windows), not(target_os = "macos")))]
             let _ = error;
         }
@@ -62,15 +59,146 @@ fn write_binary(bin_path: &Path, data: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn resign_macho_ad_hoc(bin_path: &Path) -> Result<(), String> {
-    let status = Command::new("codesign")
-        .args(["--force", "-s", "-"])
-        .arg(bin_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status().map_err(|error| format!("Файл заменён, но codesign не запущен: {error}"))?;
-    if !status.success() { return Err(format!("Файл заменён, но codesign завершился с ошибкой: {status}")); }
-    Ok(())
+fn read_mac_preimage(path: &Path) -> Result<(fs::File, Vec<u8>), String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
+        .open(path).map_err(|e| format!("исходный файл: {e}"))?;
+    let held = file.metadata().map_err(|e| e.to_string())?;
+    let named = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !held.is_file() || !named.is_file() || held.nlink() != 1 || held.dev() != named.dev() || held.ino() != named.ino() {
+        return Err("неоднозначная идентичность исходного файла".into());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let after = file.metadata().map_err(|e| e.to_string())?;
+    let named_after = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if held.dev() != after.dev() || held.ino() != after.ino() || held.size() != after.size()
+        || held.mtime() != after.mtime() || held.mtime_nsec() != after.mtime_nsec()
+        || after.dev() != named_after.dev() || after.ino() != named_after.ino() {
+        return Err("исходный файл изменился во время чтения".into());
+    }
+    Ok((file, bytes))
+}
+
+#[cfg(target_os = "macos")]
+fn write_binary(bin_path: &Path, data: &[u8], preimage: &[u8], original: &mut fs::File) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+
+    fn open_checked(path: &Path, write: bool) -> Result<fs::File, String> {
+        let file = fs::OpenOptions::new().read(true).write(write)
+            .custom_flags(libc::O_NOFOLLOW).open(path).map_err(|e| e.to_string())?;
+        let held = file.metadata().map_err(|e| e.to_string())?;
+        let named = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !held.is_file() || !named.is_file() || held.nlink() != 1
+            || held.dev() != named.dev() || held.ino() != named.ino() {
+            return Err("неоднозначная идентичность файла".into());
+        }
+        Ok(file)
+    }
+    fn same(file: &fs::File, path: &Path) -> Result<(), String> {
+        let held = file.metadata().map_err(|e| e.to_string())?;
+        let named = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if held.dev() != named.dev() || held.ino() != named.ino() || named.file_type().is_symlink()
+            || held.is_dir() != named.is_dir() || held.is_file() != named.is_file()
+            || (held.is_file() && held.nlink() != 1) {
+            return Err("идентичность пути изменилась".into());
+        }
+        Ok(())
+    }
+    fn read_all(file: &mut fs::File) -> Result<Vec<u8>, String> {
+        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
+    fn native(command: &mut Command, label: &str) -> Result<(), String> {
+        let output = command.output().map_err(|e| format!("{label}: запуск: {e}"))?;
+        #[cfg(test)]
+        let capture = (|| -> std::io::Result<()> {
+            let mut stderr = std::io::stderr().lock();
+            writeln!(stderr, "AG_MAC_NATIVE {label} status={:?}", output.status)?;
+            stderr.write_all(b"AG_MAC_NATIVE_STDOUT_BEGIN\n")?;
+            stderr.write_all(&output.stdout)?;
+            stderr.write_all(b"\nAG_MAC_NATIVE_STDERR_BEGIN\n")?;
+            stderr.write_all(&output.stderr)?;
+            stderr.write_all(b"\nAG_MAC_NATIVE_END\n")
+        })();
+        if !output.status.success() {
+            #[cfg(test)]
+            let capture_detail = format!("; capture={capture:?}");
+            #[cfg(not(test))]
+            let capture_detail = "";
+            return Err(format!("{label}: {:?}; stdout={:?}; stderr={:?}", output.status,
+                String::from_utf8_lossy(&output.stdout), format!("{}{}", String::from_utf8_lossy(&output.stderr), capture_detail)));
+        }
+        #[cfg(test)]
+        capture.map_err(|e| format!("{label}: status={:?}; capture: {e}", output.status))?;
+        Ok(())
+    }
+
+    if data.len() != preimage.len() { return Err("Файл не заменён: длина подготовленных данных изменилась".into()); }
+    let parent = bin_path.parent().ok_or("Файл не заменён: отсутствует родитель")?;
+    let name = bin_path.file_name().ok_or("Файл не заменён: отсутствует имя")?;
+    let mut ancestor = PathBuf::new();
+    for part in parent.components() {
+        ancestor.push(part.as_os_str());
+        let m = fs::symlink_metadata(&ancestor).map_err(|e| format!("Файл не заменён: родитель: {e}"))?;
+        if m.file_type().is_symlink() || !m.is_dir() { return Err("Файл не заменён: неоднозначный родитель".into()); }
+    }
+    let parent_handle = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
+        .open(parent).map_err(|e| format!("Файл не заменён: родитель: {e}"))?;
+    same(&parent_handle, parent).map_err(|e| format!("Файл не заменён: {e}"))?;
+    same(original, bin_path).map_err(|e| format!("Файл не заменён: {e}"))?;
+    if read_all(original)? != preimage { return Err("Файл не заменён: исходные данные изменились".into()); }
+    let stage_dir = temp_path(bin_path);
+    fs::DirBuilder::new().mode(0o700).create(&stage_dir)
+        .map_err(|e| format!("Файл не заменён: создание staging: {e}"))?;
+    let staged = stage_dir.join(name);
+    let operation = (|| -> Result<(), String> {
+        let stage_parent = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
+            .open(&stage_dir).map_err(|e| format!("staging parent: {e}"))?;
+        same(&parent_handle, parent)?;
+        same(&stage_parent, &stage_dir)?;
+        let mut copy = Command::new("/usr/bin/ditto");
+        copy.args(["--rsrc", "--extattr", "--qtn", "--acl"]).arg(bin_path).arg(&staged);
+        for key in ["DITTOABORT", "DITTONORSRC", "DITTOKEEPBINARIESPATTERN", "DITTOKEEPBINARIESDIR", "DITTO_TEST_OPTIONS"] { copy.env_remove(key); }
+        native(&mut copy, "ditto")?;
+        same(&parent_handle, parent)?; same(&stage_parent, &stage_dir)?; same(original, bin_path)?;
+        if read_all(original)? != preimage { return Err("исходные данные изменились после копирования".into()); }
+        let mut stage = open_checked(&staged, true)?;
+        if read_all(&mut stage)? != preimage { return Err("копия не соответствует исходным данным".into()); }
+        stage.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        stage.write_all(data).map_err(|e| format!("запись staging: {e}"))?;
+        stage.sync_all().map_err(|e| format!("синхронизация staging: {e}"))?;
+        if read_all(&mut stage)? != data { return Err("проверка записи staging не прошла".into()); }
+        same(&stage, &staged)?; same(&stage_parent, &stage_dir)?;
+        native(Command::new("/usr/bin/codesign").args(["--force", "--sign", "-", "--preserve-metadata=identifier,entitlements,flags,runtime,launch-constraints,library-constraints"]).arg(&staged), "codesign")?;
+        same(&stage_parent, &stage_dir)?;
+        let mut signed = open_checked(&staged, false)?;
+        let signed_bytes = read_all(&mut signed)?;
+        native(Command::new("/usr/bin/codesign").args(["--verify", "--strict"]).arg(&staged), "stage verify")?;
+        same(&signed, &staged)?; same(&stage_parent, &stage_dir)?; same(&parent_handle, parent)?; same(original, bin_path)?;
+        if read_all(&mut signed)? != signed_bytes || read_all(original)? != preimage {
+            return Err("данные изменились перед заменой".into());
+        }
+        fs::rename(&staged, bin_path).map_err(|e| format!("атомарная замена: {e}"))?;
+        let received = (|| -> Result<(), String> {
+            same(&parent_handle, parent)?;
+            let mut published = open_checked(bin_path, false)?;
+            if read_all(&mut published)? != signed_bytes { return Err("опубликованные данные отличаются".into()); }
+            native(Command::new("/usr/bin/codesign").args(["--verify", "--strict"]).arg(bin_path), "published verify")?;
+            same(&published, bin_path)?; same(&parent_handle, parent)?;
+            if read_all(&mut published)? != signed_bytes { return Err("опубликованные данные изменились после проверки".into()); }
+            Ok(())
+        })();
+        if let Err(error) = received { return Err(format!("TARGET_CHANGED: проверка после замены не завершена: {error}")); }
+        same(&stage_parent, &stage_dir).map_err(|e| format!("TARGET_CHANGED: staging cleanup: {e}"))?;
+        fs::remove_dir(&stage_dir).map_err(|e| format!("TARGET_CHANGED: staging cleanup: {e}"))?;
+        Ok(())
+    })();
+    operation.map_err(|e| if e.starts_with("TARGET_CHANGED:") { e } else { format!("Файл не заменён; staging сохранён {}: {e}", stage_dir.display()) })
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
@@ -186,7 +314,12 @@ fn rewrite(bin_path: &Path, from: &[u8], to: &[u8]) -> Result<usize, String> {
 }
 
 fn rewrite_result(bin_path: &Path, from: &[u8], to: &[u8]) -> Result<usize, RewriteFailure> {
+    #[cfg(not(target_os = "macos"))]
     let mut data = fs::read(bin_path).map_err(|e| RewriteFailure::Io(e.to_string()))?;
+    #[cfg(target_os = "macos")]
+    let (mut original, mut data) = read_mac_preimage(bin_path).map_err(RewriteFailure::Io)?;
+    #[cfg(target_os = "macos")]
+    let preimage = data.clone();
     let replaced = replace_all(&mut data, from, to);
     if replaced == 0 {
         // Nothing to do - report whether the target state is already in place.
@@ -196,7 +329,8 @@ fn rewrite_result(bin_path: &Path, from: &[u8], to: &[u8]) -> Result<usize, Rewr
             Err(RewriteFailure::MissingSignature)
         };
     }
-    write_binary(bin_path, &data).map_err(RewriteFailure::Io)?;
+    write_binary(bin_path, &data, #[cfg(target_os = "macos")] &preimage,
+        #[cfg(target_os = "macos")] &mut original).map_err(RewriteFailure::Io)?;
     Ok(replaced)
 }
 
@@ -304,17 +438,23 @@ pub enum RepatchOutcome {
 ///
 /// Unlike `patch_binary`, this never conflates "nothing to patch because the
 /// signature is gone" with "already patched": that distinction is the whole
-/// point of the watchdog. `write_binary` still kills a process holding the file
-/// open and retries, so a running-but-unpatched Language Server is replaced in
-/// the same step - which is what enforces "no unpatched server keeps running"
-/// without ever touching the editor shell.
+/// point of the watchdog. Platform-specific write and process policies remain
+/// with the selected writer.
 pub fn repatch_if_needed(bin_path: &Path) -> RepatchOutcome {
     let (from, to) = field_signatures();
     let proxy_from = proxy_var_original();
+    #[cfg(not(target_os = "macos"))]
     let mut data = match fs::read(bin_path) {
         Ok(d) => d,
         Err(e) => return RepatchOutcome::Failed(e.to_string()),
     };
+    #[cfg(target_os = "macos")]
+    let (mut original, mut data) = match read_mac_preimage(bin_path) {
+        Ok(received) => received,
+        Err(error) => return RepatchOutcome::Failed(error),
+    };
+    #[cfg(target_os = "macos")]
+    let preimage = data.clone();
     let replaced = replace_all(&mut data, &from, &to);
     // Both renames ride in one read and one write. An update restores both at
     // once, and a machine upgrading from a build that only knew the first one
@@ -328,12 +468,11 @@ pub fn repatch_if_needed(bin_path: &Path) -> RepatchOutcome {
         // that alone, but report what the watchdog cares about: nothing about
         // the unlock itself changed.
         //
-        // `write_atomic`, deliberately not `write_binary`: the latter answers a
-        // locked file by killing whatever holds it, and this edit is additive -
-        // the server is unlocked and working, it just has no local-proxy route
-        // yet. Killing a running language server mid-session for that is a worse
-        // outcome than waiting; the file settles and the next poll retries.
+        // This additive change must not trigger the non-Mac retry that may
+        // terminate a holder. Mac uses its preserving writer for both edits.
         if proxy > 0 {
+            #[cfg(not(target_os = "macos"))]
+            {
             #[cfg(windows)]
             let canonical_guard = match crate::windows_coordinator::windows_installation::admit_native_binary(bin_path,
                 binary_targets, crate::windows_coordinator::receive_saved_context) {
@@ -345,10 +484,16 @@ pub fn repatch_if_needed(bin_path: &Path) -> RepatchOutcome {
             }
             #[cfg(windows)]
             if let Err(error) = canonical_guard.recheck() { return RepatchOutcome::Failed(error); }
+            }
+            #[cfg(target_os = "macos")]
+            if let Err(error) = write_binary(bin_path, &data, &preimage, &mut original) {
+                return RepatchOutcome::Failed(error);
+            }
         }
         return RepatchOutcome::AlreadyPatched;
     }
-    match write_binary(bin_path, &data) {
+    match write_binary(bin_path, &data, #[cfg(target_os = "macos")] &preimage,
+        #[cfg(target_os = "macos")] &mut original) {
         Ok(()) => RepatchOutcome::Repatched(replaced),
         Err(e) => RepatchOutcome::Failed(e),
     }
@@ -755,6 +900,32 @@ pub fn inspect_install(install: &std::path::Path) -> InstallState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_writer_rejects_changed_preimage_and_occupied_stage() {
+        let parent = std::env::temp_dir().canonicalize().expect("ordinary temp parent");
+        let dir = parent.join(format!("ag-mac-writer-{}", std::process::id()));
+        fs::create_dir(&dir).expect("vacant owned test directory");
+        let target = dir.join("target");
+        fs::write(&target, b"original").unwrap();
+        let (mut original, before) = read_mac_preimage(&target).unwrap();
+        fs::write(&target, b"changed!").unwrap();
+        assert!(write_binary(&target, b"modified", &before, &mut original).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"changed!");
+        assert!(!temp_path(&target).exists());
+        drop(original);
+        let (mut original, current) = read_mac_preimage(&target).unwrap();
+        let occupied = temp_path(&target);
+        fs::create_dir(&occupied).unwrap();
+        assert!(write_binary(&target, b"modified", &current, &mut original).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"changed!");
+        assert!(occupied.is_dir());
+        drop(original);
+        fs::remove_dir(&occupied).unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
 
     #[cfg(windows)]
     #[test]
