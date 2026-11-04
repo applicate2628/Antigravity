@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Antigravity Unlocker - macOS App Bundle Builder
+# Builds the native release binary and packages it into Antigravity Unlocker.app
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$DIR"
+
+# Определение полной версии релиза
+if grep -q 'VERSION = "' "$DIR/build_rust.py" 2>/dev/null; then
+    VERSION=$(grep 'VERSION = "' "$DIR/build_rust.py" | head -n1 | cut -d '"' -f2)
+else
+    VERSION=$(grep '^version =' "$DIR/Cargo.toml" | head -n1 | cut -d '"' -f2)
+fi
+# Ревизия форка (macos/FORK_REV) попадает в AG_FULL_VERSION и совпадает с тегом
+# релиза vX.Y.Z-macos.N: по ней приложение сравнивает себя с релизами форка.
+BASE_VERSION="$VERSION"
+if [ -f "$DIR/macos/FORK_REV" ]; then
+    VERSION="$BASE_VERSION-macos.$(tr -d '[:space:]' < "$DIR/macos/FORK_REV")"
+fi
+export AG_FULL_VERSION="$VERSION"
+echo "==> Версия приложения: $VERSION (AG_FULL_VERSION=$AG_FULL_VERSION)"
+
+echo "==> Сборка релизного бинарника для macOS (Apple Silicon + Intel, universal)..."
+FEATURE_ARGS=()
+if [[ "${1:-}" == "--personal" ]]; then
+    FEATURE_ARGS=(--features personal-build)
+    shift
+fi
+if [[ $# -ne 0 ]]; then
+    echo "Использование: $0 [--personal]" >&2
+    exit 1
+fi
+for T in aarch64-apple-darwin x86_64-apple-darwin; do
+    cargo build --release --target "$T" "${FEATURE_ARGS[@]}"
+done
+
+APP_NAME="Antigravity Unlocker.app"
+APP_DIR="$DIR/target/release/$APP_NAME"
+CONTENTS="$APP_DIR/Contents"
+MACOS_DIR="$CONTENTS/MacOS"
+RESOURCES_DIR="$CONTENTS/Resources"
+
+echo "==> Создание структуры бандла $APP_NAME..."
+rm -rf "$APP_DIR"
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
+
+# Копирование исполняемого файла
+lipo -create -output "$MACOS_DIR/ag_unlocker" \
+    "$DIR/target/aarch64-apple-darwin/release/ag_unlocker" \
+    "$DIR/target/x86_64-apple-darwin/release/ag_unlocker"
+chmod +x "$MACOS_DIR/ag_unlocker"
+
+# Копирование иконки приложения
+if [ -f "$DIR/macos/AppIcon.icns" ]; then
+    cp "$DIR/macos/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+fi
+
+# Создание Info.plist
+cat > "$CONTENTS/Info.plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Antigravity Unlocker</string>
+    <key>CFBundleDisplayName</key>
+    <string>Antigravity Unlocker</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.antigravity.unlocker</string>
+    <key>CFBundleVersion</key>
+    <string>$BASE_VERSION</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$BASE_VERSION</string>
+    <key>CFBundleExecutable</key>
+    <string>ag_unlocker</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSRequiresAquaSystemAppearance</key>
+    <false/>
+    <key>NSHumanReadableCopyright</key>
+    <string>© 2026 Fuheshka. macOS Edition. Open Source.</string>
+</dict>
+</plist>
+EOF
+
+echo "==> Выполнение ad-hoc подписи (codesign)..."
+# Requirement по bundle id, а не по cdhash: macOS сохраняет выданные разрешения между пересборками
+codesign --force --deep -s - -r='designated => identifier "com.antigravity.unlocker"' "$APP_DIR"
+
+echo "==> Готово! Бандл создан в: $APP_DIR"
+echo "Для установки в систему выполните: ./macos/install.sh"

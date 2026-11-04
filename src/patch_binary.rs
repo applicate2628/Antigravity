@@ -40,16 +40,20 @@ fn write_binary(bin_path: &Path, data: &[u8]) -> Result<(), String> {
         Ok(()) => {
             #[cfg(windows)]
             canonical_guard.recheck().map_err(|error| format!("Файл заменён, но каноническая проверка не завершилась: {error}"))?;
+            #[cfg(target_os = "macos")]
+            resign_macho_ad_hoc(bin_path)?;
             return Ok(());
         },
         Err(error) => {
             #[cfg(windows)]
             return Err(format!("Файл не заменён; закройте использующее его приложение обычным способом: {error}"));
-            #[cfg(not(windows))]
+            #[cfg(target_os = "macos")]
+            return Err(format!("Файл не заменён: {error}"));
+            #[cfg(all(not(windows), not(target_os = "macos")))]
             let _ = error;
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
     kill_holder(bin_path);
     thread::sleep(Duration::from_millis(500));
@@ -57,7 +61,19 @@ fn write_binary(bin_path: &Path, data: &[u8]) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn resign_macho_ad_hoc(bin_path: &Path) -> Result<(), String> {
+    let status = Command::new("codesign")
+        .args(["--force", "-s", "-"])
+        .arg(bin_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status().map_err(|error| format!("Файл заменён, но codesign не запущен: {error}"))?;
+    if !status.success() { return Err(format!("Файл заменён, но codesign завершился с ошибкой: {status}")); }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn kill_holder(bin_path: &Path) {
     let name = bin_path
         .file_name()
@@ -356,22 +372,50 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
         .join("antigravity")
         .join("bin");
 
+    // macOS .app bundle locations
+    let mac_resources_bin = inst.join("Contents").join("Resources").join("bin");
+    let mac_ext_bin = inst
+        .join("Contents")
+        .join("Resources")
+        .join("app")
+        .join("extensions")
+        .join("antigravity")
+        .join("bin");
+    let mac_macos_bin = inst.join("Contents").join("MacOS");
+
     let mut targets: Vec<PathBuf> = vec![
         // CLI: `agy.exe` on Windows, bare `agy` on Linux/macOS.
         inst.join("agy.exe"),
         inst.join("agy"),
+        inst.join("bin").join("agy"),
         // Desktop's own language server.
         resources_bin.join("language_server.exe"),
         resources_bin.join("language_server"),
-        // IDE's bundled language server, Windows-named.
+        mac_resources_bin.join("language_server"),
+        mac_resources_bin.join("language_server_macos_arm"),
+        mac_resources_bin.join("language_server_macos_x64"),
+        // IDE's bundled language server, Windows & macOS named.
         ext_bin.join("language_server_windows_x64.exe"),
         ext_bin.join("language_server.exe"),
+        ext_bin.join("language_server_macos_arm"),
+        ext_bin.join("language_server_macos_x64"),
+        mac_ext_bin.join("language_server_macos_arm"),
+        mac_ext_bin.join("language_server_macos_x64"),
+        mac_ext_bin.join("language_server"),
+        mac_macos_bin.join("language_server"),
+        mac_macos_bin.join("language_server_macos_arm"),
     ];
 
-    // Any other `language_server*` in the two bin dirs - catches the Linux/macOS
-    // platform-suffixed names (`language_server_linux_x64`, `..._darwin_arm64`, …)
+    // Any other `language_server*` in candidate bin dirs - catches the Linux/macOS
+    // platform-suffixed names (`language_server_linux_x64`, `language_server_macos_arm`, …)
     // without pinning the exact spelling.
-    for dir in [&ext_bin, &resources_bin] {
+    for dir in [
+        &ext_bin,
+        &resources_bin,
+        &mac_ext_bin,
+        &mac_resources_bin,
+        &mac_macos_bin,
+    ] {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -436,7 +480,7 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
 /// console to print to and reports the step in the log pane itself. The one
 /// second afterwards is functional, not cosmetic — `taskkill` returns before the
 /// image handle is actually released.
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn kill_affected_processes() {
     kill_platform_processes();
     thread::sleep(Duration::from_millis(1000));
@@ -447,7 +491,7 @@ pub fn kill_affected_processes() {
 /// platform suffix is (`language_server_linux_x64`), it is caught. The `agy` CLI
 /// and the two language-server basenames are killed; the editor shell is left
 /// running, same rule as Windows.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn kill_platform_processes() {
     // -f matches against the whole command line, so a full install path still
     // matches; the patterns are the binary basenames the patcher targets.

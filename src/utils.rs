@@ -206,7 +206,22 @@ pub fn message_box(title: &str, text: &str) {
 /// run from a shell); the dialog is the copy the desktop user can see. Best
 /// effort by design: none of these three is guaranteed to be installed, and a
 /// missing one must not turn a diagnostic into a second failure.
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub fn message_box(title: &str, text: &str) {
+    eprintln!("{}: {}", title, text);
+    let script = format!(
+        "display dialog \"{}\" with title \"{}\" buttons {{\"OK\"}} default button \"OK\" with icon stop",
+        text.replace('\\', "\\\\").replace('"', "\\\""),
+        title.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let _ = Command::new("osascript")
+        .args(["-e", &script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn message_box(title: &str, text: &str) {
     eprintln!("{}: {}", title, text);
     let tried = [
@@ -266,7 +281,11 @@ pub fn open_url(url: &str) {
             );
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(url).status().ok();
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         Command::new("xdg-open").arg(url).status().ok();
     }
@@ -460,7 +479,17 @@ pub fn reveal_in_explorer(path: &Path) {
         cmd.raw_arg(format!("/select,\"{}\"", path.display()));
         no_window(&mut cmd).spawn().ok();
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok();
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         if let Some(dir) = path.parent() {
             Command::new("xdg-open")

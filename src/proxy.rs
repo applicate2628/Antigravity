@@ -246,6 +246,9 @@ fn ours_answers(port: u16) -> Result<bool, String> {
         // The relay asking about itself: `PORT` is set before `PROXY_BOUND`.
         return Ok(PORT.load(std::sync::atomic::Ordering::Relaxed) == port);
     }
+    #[cfg(target_os = "macos")]
+    return crate::background::owned_proxy_listener_at(port);
+    #[cfg(not(target_os = "macos"))]
     if !answers_at(addr_at(port)) {
         return Ok(false);
     }
@@ -267,7 +270,7 @@ fn ours_answers(port: u16) -> Result<bool, String> {
         return Ok(crate::portcheck::listener_image(addr_at(port))
             .is_none_or(|n| names.contains(&n.to_ascii_lowercase())));
     }
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     Ok(true)
 }
 
@@ -289,7 +292,15 @@ fn addr_at(port: u16) -> std::net::SocketAddr {
 /// with it, the language server's own OAuth call included (G31). Nothing may set
 /// that variable without asking this first.
 pub fn listener_answers() -> bool {
+    #[cfg(target_os = "macos")]
+    { return checked_listener_answers().unwrap_or(false); }
+    #[cfg(not(target_os = "macos"))]
     answers_at(listen_addr())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn checked_listener_answers() -> Result<bool, String> {
+    ours_answers(port())
 }
 
 /// The check above, with the address given: the product asks about its own port,
@@ -317,7 +328,7 @@ fn wait_at(addr: std::net::SocketAddr, budget: Duration) -> bool {
     }
 }
 
-const POLL_FOR_LISTENER: Duration = Duration::from_millis(250);
+pub(crate) const POLL_FOR_LISTENER: Duration = Duration::from_millis(250);
 
 /// Takes the CA back out of the trust store and deletes its key.
 ///
@@ -1745,6 +1756,7 @@ mod tests {
     /// Windows only: on Linux the proxy never moves (`another_port_helps`).
     #[cfg(windows)]
     #[test]
+    #[cfg(windows)]
     fn a_held_port_moves_the_proxy_to_the_next_one_at_once() {
         let holder = TcpListener::bind("127.0.0.1:0").unwrap();
         let held = holder.local_addr().unwrap().port();

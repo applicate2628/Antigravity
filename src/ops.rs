@@ -347,6 +347,7 @@ pub enum Cmd {
     SetOwnProxy(String),
     SetCustomDns(String),
     SetGroupKey(String),
+    CopyGroupCommand,
     SetProvider(String, bool),
     /// The whole pool in the order the user dragged it into.
     ReorderProviders(Vec<String>),
@@ -1034,7 +1035,7 @@ fn run_worker(
                 ctx.busy(None);
             }
             command @ (Cmd::Set(_, _) | Cmd::EnableAll | Cmd::Repair
-                | Cmd::SetOwnProxy(_) | Cmd::SetGroupKey(_) | Cmd::Unlocked
+                | Cmd::SetOwnProxy(_) | Cmd::SetGroupKey(_) | Cmd::CopyGroupCommand | Cmd::Unlocked
                 | Cmd::AddPath(_) | Cmd::PatchInstall(_)) => {
                 native_cancel.store(false, Ordering::SeqCst);
                 native_apply_pending.store(true, Ordering::SeqCst);
@@ -1309,6 +1310,17 @@ fn dispatch_owned_command(ctx: &mut Ctx, command: Cmd) -> Result<NativeCompletio
                     }
                 }
             }
+            Cmd::CopyGroupCommand => {
+                #[cfg(target_os = "macos")]
+                {
+                    let code = crate::hwid::pc_code().map_err(|error| format!("Код устройства недоступен: {error}"))?;
+                    if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Копирование отменено.".into()); }
+                    if !crate::utils::set_clipboard_text(&format!("/ag+{code}")) { return Err("Команду не удалось скопировать.".into()); }
+                    ctx.log(Level::Ok, "Команда скопирована — отправьте её в группе.");
+                }
+                #[cfg(not(target_os = "macos"))]
+                return Err("Команда недоступна на этой платформе.".into());
+            }
             Cmd::EnableAll => {
                 ctx.busy(Some("Включаю"));
                 enable_all(ctx)?;
@@ -1355,7 +1367,7 @@ fn dispatch_owned_command(ctx: &mut Ctx, command: Cmd) -> Result<NativeCompletio
 fn genuine_command(command: &Cmd) -> bool {
     matches!(command, Cmd::RequestElevation | Cmd::ApplySettings | Cmd::SetWslEnabled(_) | Cmd::SetWslDistro { .. }
         | Cmd::Set(_, _) | Cmd::AddPath(_) | Cmd::ForgetPath(_) | Cmd::PatchInstall(_) | Cmd::SetOwnProxy(_)
-        | Cmd::SetCustomDns(_) | Cmd::SetGroupKey(_) | Cmd::SetProvider(_, _) | Cmd::ReorderProviders(_)
+        | Cmd::SetCustomDns(_) | Cmd::SetGroupKey(_) | Cmd::CopyGroupCommand | Cmd::SetProvider(_, _) | Cmd::ReorderProviders(_)
         | Cmd::EnableAll | Cmd::Repair)
 }
 
@@ -2409,6 +2421,8 @@ fn apply_receiving_failure(error: &str, recovery_results: &[String]) -> String {
 fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
     #[cfg(windows)] plan: &AllTargetApplyPlan) -> Result<(), String> {
     if cancellation.load(Ordering::SeqCst) { return Ok(()); }
+    #[cfg(target_os = "macos")]
+    let mac_relay = crate::proxy::checked_listener_answers()?;
     #[cfg(windows)]
     let Some(mut native) = inspect_native_apply(wanted, cancellation)? else { return Ok(()); };
     #[cfg(windows)]
@@ -2469,6 +2483,9 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
     #[cfg(not(windows))]
     {
     let rules = dns::is_nrpt_applied();
+    #[cfg(target_os = "macos")]
+    let relay = mac_relay;
+    #[cfg(not(target_os = "macos"))]
     let relay = background::is_running();
     let relay_outdated = background::relay_is_outdated();
     if wanted.dns && (!rules || !relay || relay_outdated) {
@@ -2477,6 +2494,12 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
     } else if !wanted.dns && rules { disable_dns_effect(ctx)?; }
     if cancellation.load(Ordering::SeqCst) { return Ok(()); }
     let local_applied = endpoint::proxy_env_is_ours();
+    #[cfg(target_os = "macos")]
+    if wanted.local_proxy && (!local_applied || !relay || background::relay_is_outdated()) {
+        if relay && !background::relay_is_outdated() { enable_local_proxy_effect(ctx)?; }
+        else { ensure_route_carrier(ctx)?; }
+    } else if !wanted.local_proxy && local_applied { disable_local_proxy_effect(ctx)?; }
+    #[cfg(not(target_os = "macos"))]
     if wanted.local_proxy && (!local_applied || !background::is_running() || background::relay_is_outdated()) {
         if background::is_running() && !background::relay_is_outdated() { enable_local_proxy_effect(ctx)?; }
         else { ensure_route_carrier(ctx)?; }
@@ -2712,7 +2735,7 @@ fn legacy_client_targets(ctx: &Ctx) -> Vec<PathBuf> {
 
 fn enable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&AllTargetApplyPlan>) -> Result<bool, String> {
     ctx.log(Level::Step, "Патч клиента Antigravity");
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     patch_binary::kill_affected_processes();
 
     #[cfg(windows)]
@@ -2870,7 +2893,7 @@ fn revert_client_primary(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&AllTargetA
     let mut receiving = crate::elevate::Reverted::default();
     let primary = (|| -> Result<(), String> {
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     patch_binary::kill_affected_processes();
 
 

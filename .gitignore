@@ -5,3 +5,12 @@ __pycache__/
 *.pyc
 /wsl/ag_wsl_launch
 /wsl/helper.sha256
+**/*.rs.bk
+*.swp
+*~
+.DS_Store
+.relay_key
+.exits
+/dist/
+proxy.log
+watchdog.log

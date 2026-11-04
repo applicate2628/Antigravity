@@ -921,12 +921,17 @@ fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         if ui.button("Скопировать команду").clicked() {
+            #[cfg(target_os = "macos")]
+            app.worker.send(crate::ops::Cmd::CopyGroupCommand);
+            #[cfg(not(target_os = "macos"))]
+            {
             let cmd = format!("/ag+{}", crate::hwid::pc_code());
             crate::utils::set_clipboard_text(&cmd);
             app.log.push((
                 Level::Info,
                 "Команда скопирована — отправьте её в группе.".to_string(),
             ));
+            }
         }
         if ui.button("Открыть группу").clicked() {
             crate::utils::open_url(GROUP_ROOM_URL);
@@ -1196,6 +1201,20 @@ fn footer(ui: &mut egui::Ui) {
             .clicked()
         {
             crate::utils::open_url(TELEGRAM_GROUP_URL);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            ui.label(
+                egui::RichText::new("|")
+                    .size(FOOTER_TEXT)
+                    .color(theme::LINE),
+            );
+            if ui
+                .link(egui::RichText::new("by @Fuheshka").size(FOOTER_TEXT))
+                .clicked()
+            {
+                crate::utils::open_url("https://github.com/Fuheshka/Antigravity-Unlocker");
+            }
         }
     });
 }

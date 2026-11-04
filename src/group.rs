@@ -365,6 +365,16 @@ fn receive_key_locked(state: &mut GroupState, settings_key: &str) -> Option<Grou
     if state.key_string == settings_key {
         return state.parsed.clone();
     }
+    #[cfg(target_os = "macos")]
+    let parsed = match crate::group_key::parse_key(&settings_key) {
+        Ok(key) => Some(key),
+        Err(crate::group_key::KeyError::IdentityUnavailable(error)) => {
+            eprintln!("Код устройства недоступен: {error}");
+            return None;
+        }
+        Err(_) => None,
+    };
+    #[cfg(not(target_os = "macos"))]
     let parsed = crate::group_key::parse_key(&settings_key).ok();
     let servers = parsed.as_ref().map(initial_servers).unwrap_or_default();
     state.key_string = settings_key.to_owned();
@@ -561,7 +571,19 @@ fn open_agu2_with_budget(
     cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(ClientConnection, TcpStream, Vec<u8>), String> {
     let deadline = Instant::now() + budget;
-    let (mut tls, mut sock) = open_tls(key, server, force_refresh, budget, cancelled)?;
+    #[cfg(target_os = "macos")]
+    let own_code = {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) { return Err("операция отменена".into()); }
+        let code = crate::hwid::pc_code().map_err(|error| format!("Код устройства недоступен: {error}"))?;
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) || Instant::now() >= deadline { return Err("операция отменена или время вышло".into()); }
+        if key.code != code { return Err("Ключ выдан для другого устройства".into()); }
+        code
+    };
+    #[cfg(target_os = "macos")]
+    let open_budget = deadline.saturating_duration_since(Instant::now());
+    #[cfg(not(target_os = "macos"))]
+    let open_budget = budget;
+    let (mut tls, mut sock) = open_tls(key, server, force_refresh, open_budget, cancelled)?;
     if cancelled.is_some_and(|c| c.load(Ordering::Acquire)) || !server_authorized(key, server) {
         return Err("группа изменилась".to_string());
     }
@@ -573,8 +595,9 @@ fn open_agu2_with_budget(
     let nonce_hex = fresh_nonce()?;
 
     // Signed with this PC's own code, never the one inside the key text.
-    let auth_header =
-        crate::group_key::auth_header(key, crate::hwid::pc_code(), ts, &nonce_hex, target_host);
+    #[cfg(not(target_os = "macos"))]
+    let own_code = crate::hwid::pc_code();
+    let auth_header = crate::group_key::auth_header(key, own_code, ts, &nonce_hex, target_host);
 
     let req = format!(
         "CONNECT {}:443 HTTP/1.1\r\nHost: {}:443\r\nProxy-Authorization: {}\r\n\r\n",
@@ -1125,6 +1148,10 @@ struct Status {
 }
 
 fn fetch_status(key: &GroupKey, server: &str) -> Result<Status, String> {
+    #[cfg(target_os = "macos")]
+    let own_code = crate::hwid::pc_code().map_err(|error| format!("Код устройства недоступен: {error}"))?;
+    #[cfg(target_os = "macos")]
+    if key.code != own_code { return Err("Ключ выдан для другого устройства".into()); }
     obfstr::obfstr! {
         let status_host = "agu2.status";
         let path = "/agu2/status";
@@ -1141,8 +1168,9 @@ fn fetch_status(key: &GroupKey, server: &str) -> Result<Status, String> {
         .unwrap()
         .as_secs();
     let nonce_hex = fresh_nonce()?;
-    let auth =
-        crate::group_key::auth_header(key, crate::hwid::pc_code(), ts, &nonce_hex, status_host);
+    #[cfg(not(target_os = "macos"))]
+    let own_code = crate::hwid::pc_code();
+    let auth = crate::group_key::auth_header(key, own_code, ts, &nonce_hex, status_host);
     let req = format!(
         "GET {} HTTP/1.1\r\nHost: x\r\nProxy-Authorization: {}\r\n\r\n",
         path, auth
@@ -1687,6 +1715,9 @@ mod tests {
         let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{} not set", k));
         let master = hex::decode(env("AGU2_E2E_MASTER")).unwrap();
         let addr: SocketAddr = env("AGU2_E2E_ADDR").parse().unwrap();
+        #[cfg(target_os = "macos")]
+        let code = crate::hwid::pc_code().expect("device identity").to_string();
+        #[cfg(not(target_os = "macos"))]
         let code = crate::hwid::pc_code().to_string();
         let issued = SystemTime::now()
             .duration_since(UNIX_EPOCH)

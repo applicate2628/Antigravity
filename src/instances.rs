@@ -29,7 +29,7 @@ fn is_service_args(args: &[String]) -> bool {
 
 /// Closes every other copy of the window. Best effort and silent: a copy that
 /// refuses to die (another user's, a higher integrity level) is left running.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn close_others() {
     let Ok(me) = std::env::current_exe() else {
         return;
@@ -59,7 +59,7 @@ pub fn acquire_gui_writer(
     Ok(lease)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 mod platform {
     use super::{is_service_args, is_window_name};
 
@@ -108,6 +108,43 @@ mod platform {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    pub fn acquire_gui_writer() -> Result<File, String> {
+        let directory = crate::dns_forwarder::log_dir();
+        if !directory.is_absolute() { return Err("путь настроек должен быть абсолютным".into()); }
+        std::fs::create_dir_all(&directory).map_err(|error| format!("каталог настроек: {error}"))?;
+        let path = directory.join("settings-writer.lock");
+        let file = OpenOptions::new().read(true).write(true).create(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path)
+            .map_err(|error| format!("файл блокировки настроек: {error}"))?;
+        let recheck = || -> Result<(), String> {
+            let held = file.metadata().map_err(|error| error.to_string())?;
+            let entry = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if !held.is_file() || !entry.is_file() || held.uid() != unsafe { libc::geteuid() }
+                || held.nlink() != 1 || held.len() != 0 || held.mode() & 0o077 != 0
+                || held.dev() != entry.dev() || held.ino() != entry.ino()
+                || held.uid() != entry.uid() || held.mode() != entry.mode() || entry.nlink() != 1 {
+                return Err("небезопасная или изменённая блокировка настроек".into());
+            }
+            Ok(())
+        };
+        recheck()?;
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => "другое окно уже использует настройки".to_owned(),
+            std::fs::TryLockError::Error(error) => format!("блокировка настроек: {error}"),
+        })?;
+        recheck()?;
+        Ok(file)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use platform::acquire_gui_writer;
 
 #[cfg(test)]
 mod tests {

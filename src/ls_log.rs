@@ -380,40 +380,76 @@ fn count_refusals(buf: &[u8]) -> usize {
 /// walks `%APPDATA%` and then the IDE's `logs` folder, which has one sub-folder
 /// per launch, and a window ticking every three seconds must not do that.
 pub fn candidate_logs() -> Vec<PathBuf> {
-    let Some(root) = profile_root() else {
+    let root = profile_root();
+    #[cfg(target_os = "macos")]
+    let macos_logs = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("Library").join("Logs"));
+    #[cfg(not(target_os = "macos"))]
+    let macos_logs: Option<PathBuf> = None;
+
+    let Some(mut out) = candidate_logs_in(root.as_deref(), macos_logs.as_deref(), cfg!(not(target_os = "macos"))) else {
         return Vec::new();
     };
-    let Ok(entries) = fs::read_dir(&root) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut products = 0usize;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.to_ascii_lowercase().starts_with("antigravity") {
-            continue;
-        }
-        products += 1;
-        if products > MAX_PRODUCTS {
-            break;
-        }
-        let logs = entry.path().join("logs");
-        let desktop = logs.join("language_server.log");
-        if desktop.is_file() {
-            out.push(desktop);
-        }
-        if let Some(session) = newest_session(&logs) {
-            let ide = session.join("ls-main.log");
-            if ide.is_file() {
-                out.push(ide);
-            }
-        }
-    }
     if let Some(cli) = newest_cli_log() {
         out.push(cli);
     }
     out
+}
+
+fn candidate_logs_in(profile_root: Option<&Path>, macos_logs: Option<&Path>, require_profile: bool) -> Option<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let entries = match profile_root.and_then(|root| fs::read_dir(root).ok()) {
+        Some(entries) => Some(entries),
+        None if require_profile => return None,
+        None => None,
+    };
+    if let Some(entries) = entries {
+            let mut products = 0usize;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.to_ascii_lowercase().starts_with("antigravity") {
+                    continue;
+                }
+                products += 1;
+                if products > MAX_PRODUCTS {
+                    break;
+                }
+                let logs = entry.path().join("logs");
+                let desktop = logs.join("language_server.log");
+                if desktop.is_file() {
+                    out.push(desktop);
+                }
+                if let Some(session) = newest_session(&logs) {
+                    let ide = session.join("ls-main.log");
+                    if ide.is_file() {
+                        out.push(ide);
+                    }
+                }
+            }
+    }
+    if let Some(logs_dir) = macos_logs {
+        if let Ok(entries) = fs::read_dir(logs_dir) {
+            let mut products = 0usize;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.to_ascii_lowercase().starts_with("antigravity") {
+                    continue;
+                }
+                products += 1;
+                if products > MAX_PRODUCTS {
+                    break;
+                }
+                let desktop = entry.path().join("language_server.log");
+                if desktop.is_file() && !out.contains(&desktop) {
+                    out.push(desktop);
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 /// The CLI's current session log: the newest `cli-*.log`.
@@ -458,9 +494,16 @@ fn profile_root() -> Option<PathBuf> {
     std::env::var("APPDATA").ok().map(PathBuf::from)
 }
 
+#[cfg(target_os = "macos")]
+fn profile_root() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+}
+
 /// Linux keeps the same layout under `~/.config`; nothing tails it there yet
 /// because the DNS layer it would steer is not ported, but the path is right.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn profile_root() -> Option<PathBuf> {
     match std::env::var("XDG_CONFIG_HOME") {
         Ok(x) if !x.is_empty() => Some(PathBuf::from(x)),
@@ -1039,6 +1082,12 @@ fn month_before(m: u16) -> u16 {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn missing_profile_retains_non_macos_early_return() {
+        assert!(candidate_logs_in(None, None, true).is_none());
+        assert_eq!(candidate_logs_in(None, None, false), Some(Vec::new()));
+    }
 
     fn temp_log(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("ag_unlocker_ls_log_tests");

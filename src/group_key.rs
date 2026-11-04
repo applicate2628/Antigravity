@@ -26,6 +26,8 @@ pub enum KeyError {
     NotAKey,
     Damaged,
     OtherPc,
+    #[cfg(target_os = "macos")]
+    IdentityUnavailable(&'static str),
 }
 
 impl fmt::Display for KeyError {
@@ -33,11 +35,16 @@ impl fmt::Display for KeyError {
         match self {
             KeyError::NotAKey => write!(f, "Это не ключ доступа — скопируйте ответ бота целиком"),
             KeyError::Damaged => write!(f, "Ключ повреждён"),
+            #[cfg(not(target_os = "macos"))]
             KeyError::OtherPc => write!(
                 f,
                 "Этот ключ выдан для другого ПК (код {})",
                 crate::hwid::pc_code()
             ),
+            #[cfg(target_os = "macos")]
+            KeyError::OtherPc => write!(f, "Этот ключ выдан для другого ПК"),
+            #[cfg(target_os = "macos")]
+            KeyError::IdentityUnavailable(error) => write!(f, "Код устройства недоступен: {error}"),
         }
     }
 }
@@ -155,6 +162,8 @@ fn unwrap(t: &[u8], token: &str) -> Result<Vec<u8>, KeyError> {
 include!(concat!(env!("OUT_DIR"), "/group_gen.rs"));
 
 pub fn parse_key(text: &str) -> Result<GroupKey, KeyError> {
+    #[cfg(target_os = "macos")]
+    if text.trim().is_empty() { return Err(KeyError::NotAKey); }
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce as AesNonce};
     let plain_group = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&GROUP_KEY))
@@ -166,7 +175,11 @@ pub fn parse_key(text: &str) -> Result<GroupKey, KeyError> {
     if t_hex.len() != 64 || hex::decode_to_slice(&t_hex, &mut t).is_err() {
         return Err(KeyError::Damaged); // internal error: baked T is invalid
     }
-    parse_with(&t, text, crate::hwid::pc_code())
+    #[cfg(target_os = "macos")]
+    let code = crate::hwid::pc_code().map_err(KeyError::IdentityUnavailable)?;
+    #[cfg(not(target_os = "macos"))]
+    let code = crate::hwid::pc_code();
+    parse_with(&t, text, code)
 }
 
 /// The parse itself, with the wrap key and this PC's code passed in, so the

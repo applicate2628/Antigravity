@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+#[cfg(not(target_os = "macos"))]
 pub fn pc_code() -> &'static str {
     static CODE: OnceLock<String> = OnceLock::new();
     CODE.get_or_init(|| {
@@ -7,6 +8,20 @@ pub fn pc_code() -> &'static str {
         agu2_pc_code(&raw)
     })
     .as_str()
+}
+
+#[cfg(target_os = "macos")]
+static MAC_CODE: OnceLock<Result<String, &'static str>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+pub fn pc_code() -> Result<&'static str, &'static str> {
+    MAC_CODE.get_or_init(|| get_raw_hwid().map(|raw| agu2_pc_code(&raw)))
+        .as_deref().map_err(|error| *error)
+}
+
+#[cfg(target_os = "macos")]
+pub fn cached_pc_code() -> Option<Result<&'static str, &'static str>> {
+    MAC_CODE.get().map(|value| value.as_deref().map_err(|error| *error))
 }
 
 fn agu2_pc_code(raw: &str) -> String {
@@ -207,7 +222,36 @@ fn parse_smbios(mut data: &[u8]) -> Option<String> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn get_raw_hwid() -> Result<String, &'static str> {
+    let out = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output().map_err(|_| "не удалось прочитать идентификатор устройства")?;
+    if !out.status.success() { return Err("система не предоставила идентификатор устройства"); }
+    let text = std::str::from_utf8(&out.stdout).map_err(|_| "неверный идентификатор устройства")?;
+    let uuid = parse_ioreg_uuid(text).ok_or("идентификатор устройства отсутствует или неверен")?;
+    Ok(format!("smbios-uuid:{}", uuid))
+}
+
+/// Extracts `IOPlatformUUID` from `ioreg` output, normalised like the Linux
+/// DMI product_uuid (lowercase, no dashes).
+#[cfg(any(target_os = "macos", test))]
+fn parse_ioreg_uuid(text: &str) -> Option<String> {
+    let mut matches = text.lines().filter(|line| line.split_once('=').is_some_and(|(key, _)| key.trim().ends_with("\"IOPlatformUUID\"")));
+    let line = matches.next()?;
+    if matches.next().is_some() { return None; }
+    let value = line.split_once('=')?.1.trim().strip_prefix('"')?.strip_suffix('"')?;
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 { return None; }
+    let mut uuid = String::with_capacity(32);
+    for (index, &byte) in bytes.iter().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) { if byte != b'-' { return None; } }
+        else { if !byte.is_ascii_hexdigit() { return None; } uuid.push((byte as char).to_ascii_lowercase()); }
+    }
+    if uuid.bytes().all(|byte| byte == b'0') { None } else { Some(uuid) }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn get_raw_hwid() -> String {
     use std::fs;
     if let Ok(uuid) = fs::read_to_string("/sys/class/dmi/id/product_uuid") {
@@ -234,11 +278,22 @@ mod tests {
         assert_eq!(agu2_pc_code("ABC"), "cgcxprbk");
     }
 
+    #[test]
+    fn ioreg_uuid_parse() {
+        let sample = "    | \"IOPlatformSerialNumber\" = \"X\"\n    | \"IOPlatformUUID\" = \"ABCDEF12-3456-7890-ABCD-EF1234567890\"\n";
+        assert_eq!(
+            parse_ioreg_uuid(sample),
+            Some("abcdef1234567890abcdef1234567890".to_string())
+        );
+        assert_eq!(parse_ioreg_uuid("nothing"), None);
+    }
+
     /// Prints which source the code came from on this machine and the code.
     ///
     ///     cargo test this_pc_code -- --ignored --nocapture
     #[test]
     #[ignore = "reads this machine's firmware tables"]
+    #[cfg(not(target_os = "macos"))]
     fn this_pc_code() {
         let raw = get_raw_hwid();
         let source = raw.split(':').next().unwrap_or("");

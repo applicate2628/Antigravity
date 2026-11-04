@@ -130,6 +130,19 @@ fn is_install_root_checked(path: &Path) -> Result<bool, String> {
             if discovery_metadata(&resources.join(child))?.is_some() { return Ok(true); }
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS .app bundle layout: Contents/Resources/app[.asar] or Contents/MacOS.
+        let mac_resources = path.join("Contents").join("Resources");
+        if discovery_metadata(&mac_resources)?.is_some_and(|value| value.is_dir()) {
+            for child in ["app.asar", "app", "bin"] {
+                if discovery_metadata(&mac_resources.join(child))?.is_some() { return Ok(true); }
+            }
+        }
+        if discovery_metadata(&path.join("Contents").join("MacOS"))?.is_some_and(|value| value.is_dir()) {
+            return Ok(true);
+        }
+    }
     // `is_file`, not `exists`: `%LOCALAPPDATA%\agy` is the CLI's *directory*, and
     // an `exists()` check there made the parent-walk treat `%LOCALAPPDATA%` itself
     // as an install root. A launcher/CLI is always a file.
@@ -177,6 +190,9 @@ fn resolve_install_root_checked(raw: &Path) -> Result<Option<PathBuf>, String> {
     }
 
     let subfolder_candidates = [
+        "Antigravity IDE.app",
+        "Antigravity Tools.app",
+        "Antigravity.app",
         "Antigravity IDE",
         "Antigravity",
         "agy",
@@ -236,6 +252,27 @@ fn windows_standard_candidates(local: Option<PathBuf>, program: Option<PathBuf>,
 fn standard_install_candidates() -> Vec<PathBuf> {
     let home = env::var("HOME").unwrap_or_default();
     let mut v: Vec<PathBuf> = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        for app in [
+            "/Applications/Antigravity IDE.app",
+            "/Applications/Antigravity Tools.app",
+            "/Applications/Antigravity.app",
+        ] {
+            v.push(PathBuf::from(app));
+        }
+        if !home.is_empty() {
+            let h = PathBuf::from(&home);
+            v.push(h.join("Applications/Antigravity IDE.app"));
+            v.push(h.join("Applications/Antigravity Tools.app"));
+            v.push(h.join("Applications/Antigravity.app"));
+            v.push(h.join(".gemini/bin"));
+        }
+        v.push(PathBuf::from("/opt/homebrew/bin"));
+        v.push(PathBuf::from("/usr/local/bin"));
+    }
+
     // System-wide install roots, both capitalisations the packaging might use.
     for base in ["/opt", "/usr/share", "/usr/lib", "/usr/local/share"] {
         for name in [
@@ -254,10 +291,9 @@ fn standard_install_candidates() -> Vec<PathBuf> {
         v.push(h.join(".local/share/Antigravity IDE"));
         v.push(h.join("Antigravity"));
         v.push(h.join("Antigravity IDE"));
-        // The `agy` CLI: measured at `~/.local/bin/agy` on a real install, so its
-        // bin dir is an install root in its own right (binary_targets scopes to
-        // `agy`/`language_server*`, so a shared bin dir patches only ours).
+        // The `agy` CLI: measured at `~/.local/bin/agy` or `~/.gemini/bin/agy`
         v.push(h.join(".local/bin"));
+        v.push(h.join(".gemini/bin"));
         v.push(h.join(".agy/bin"));
         v.push(h.join(".agy"));
         v.push(h.join(".local/share/agy/bin"));
@@ -276,8 +312,10 @@ fn find_agy_dir() -> Option<PathBuf> {
     if let Ok(path) = env::var("PATH") {
         dirs.extend(path.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
     }
+    dirs.push(PathBuf::from(format!("{}/.gemini/bin", home)));
     dirs.push(PathBuf::from(format!("{}/.local/bin", home)));
     dirs.push(PathBuf::from(format!("{}/.agy/bin", home)));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
     dirs.push(PathBuf::from("/usr/local/bin"));
     dirs.push(PathBuf::from("/usr/bin"));
     // Never a snap dir: `/snap/bin/agy` is a read-only wrapper, not the real
@@ -295,20 +333,25 @@ fn is_snap_path(p: &Path) -> bool {
     p.starts_with("/snap") || p.starts_with("/var/lib/snapd")
 }
 
-/// Scans the usual Linux prefixes for any `*antigravity*` directory, so an
+/// Scans the usual Linux/macOS prefixes for any `*antigravity*` directory, so an
 /// install whose name is not hardcoded is still found - the analogue of the
 /// Windows registry scan. Returns candidate roots to be resolved.
 #[cfg(not(target_os = "windows"))]
 fn scan_antigravity_dirs() -> Vec<PathBuf> {
     let home = env::var("HOME").unwrap_or_default();
     let mut out = Vec::new();
-    let bases = [
+    let mut bases = vec![
         "/opt".to_string(),
         "/usr/share".to_string(),
         "/usr/lib".to_string(),
         "/usr/local/share".to_string(),
         format!("{}/.local/share", home),
     ];
+    #[cfg(target_os = "macos")]
+    {
+        bases.push("/Applications".to_string());
+        bases.push(format!("{}/Applications", home));
+    }
     for base in bases {
         if let Ok(entries) = fs::read_dir(&base) {
             for e in entries.flatten() {
@@ -317,7 +360,7 @@ fn scan_antigravity_dirs() -> Vec<PathBuf> {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.to_lowercase().contains("antigravity"));
-                if hit && p.is_dir() {
+                if hit && (p.is_dir() || p.extension().is_some_and(|ext| ext == "app")) {
                     out.push(p);
                 }
             }
@@ -500,6 +543,16 @@ pub struct InstallOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InstallationKind { Desktop, Ide, Cli }
 
+/// Project the install root to the existing platform's resources directory.
+pub(crate) fn installation_resources(install: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let resources = install.join("Contents").join("Resources");
+        if resources.exists() { return resources; }
+    }
+    install.join("resources")
+}
+
 #[cfg(windows)]
 pub(crate) struct InstallationLayout {
     pub(crate) kind: InstallationKind,
@@ -562,7 +615,7 @@ pub(crate) fn process_install_received(install: &Path, expected: Option<Installa
     if expected.is_some_and(|expected| expected != layout.kind) { return Err("installation effect kind changed before execution".into()); }
     #[cfg(not(windows))]
     let _ = expected;
-    let resources = install.join("resources");
+    let resources = installation_resources(install);
     let app_dir = resources.join("app");
     let app_asar = resources.join("app.asar");
     #[cfg(windows)]
@@ -834,7 +887,15 @@ fn main() {
             return;
         }
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let _settings_writer = match instances::acquire_gui_writer() {
+        Ok(lease) => lease,
+        Err(error) => {
+            utils::message_box("Antigravity Unlocker", &format!("Окно не запущено: {error}"));
+            return;
+        }
+    };
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     instances::close_others();
 
     if !gui_replacement && tui::requested() {
@@ -950,6 +1011,16 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("agy"), b"binary").unwrap();
+        assert!(is_install_root(&base));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_app_bundle_is_an_install_root() {
+        let base = env::temp_dir().join("Antigravity IDE.app");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("Contents").join("Resources").join("app")).unwrap();
         assert!(is_install_root(&base));
         fs::remove_dir_all(&base).ok();
     }

@@ -236,7 +236,14 @@ struct ListenerGuard {
 
 impl ListenerGuard {
     fn check(&mut self) {
-        if crate::proxy::listener_answers() {
+        #[cfg(target_os = "macos")]
+        let listener_ready = match crate::proxy::checked_listener_answers() {
+            Ok(value) => value,
+            Err(error) => { eprintln!("Проверка службы недоступна: {error}"); return; }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let listener_ready = crate::proxy::listener_answers();
+        if listener_ready {
             self.misses = 0;
             return;
         }
@@ -359,7 +366,12 @@ fn inspect(target: &Path, st: &mut FileState) {
                 log("файл оставлен без изменений: требуется обычное закрытие приложения или общий владелец WSL");
                 return;
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "macos")]
+            {
+                log("файл оставлен без изменений: закройте приложение обычным способом");
+                return;
+            }
+            #[cfg(all(not(windows), not(target_os = "macos")))]
             {
             if st.blocked >= MAX_LAUNCH_HOLDS {
                 if st.blocked == MAX_LAUNCH_HOLDS {
@@ -554,6 +566,7 @@ mod tests {
     fn a_reverted_binary_in_an_install_is_repatched_after_settling() {
         let inst = std::env::temp_dir().join("ag_watchdog_wiring");
         fs::create_dir_all(&inst).expect("temp inst");
+        let inst = fs::canonicalize(&inst).unwrap_or(inst);
         let agy = inst.join("agy.exe");
         // Stand-in for a Language Server an update reverted to the gated name.
         fs::write(&agy, b"header..ineligible..tail").unwrap();

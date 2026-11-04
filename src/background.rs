@@ -19,7 +19,10 @@ pub const PROXY_FLAG: &str = "--proxy";
 #[cfg(target_os = "windows")]
 pub use windows_impl::*;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub use macos_impl::*;
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub use unix_impl::*;
 
 #[cfg(target_os = "windows")]
@@ -1783,12 +1786,1010 @@ mod windows_impl {
     }
 }
 
+// macOS: runs the local CONNECT proxy (`proxy::run`, via `--proxy`) as a
+// LaunchAgent in ~/Library/LaunchAgents/com.antigravity.unlocker.proxy.plist.
+// Unprivileged, no root required, auto-starts on user login.
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use std::fs;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    use super::PROXY_FLAG;
+
+    const LABEL: &str = "com.antigravity.unlocker.proxy";
+    const SOURCE_DIGEST: &str = "AG_UNLOCKER_SOURCE_SHA256";
+    const HELPER_DIGEST: &str = "AG_UNLOCKER_HELPER_SHA256";
+
+    fn recheck_directory(path: &Path, file: &fs::File, uid: u32) -> Result<(), String> {
+        let held = file.metadata().map_err(|error| format!("проверка каталога службы: {error}"))?;
+        let entry = fs::symlink_metadata(path).map_err(|error| format!("проверка каталога службы: {error}"))?;
+        if !held.is_dir() || !entry.is_dir() || held.uid() != uid || held.mode() & 0o022 != 0
+            || held.dev() != entry.dev() || held.ino() != entry.ino()
+            || held.uid() != entry.uid() || held.mode() != entry.mode() {
+            return Err("каталог службы изменён или не принадлежит текущему пользователю".into());
+        }
+        Ok(())
+    }
+
+    fn owned_directory(path: &Path, uid: u32) -> Result<fs::File, String> {
+        let directory = fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY | libc::O_CLOEXEC)
+            .open(path).map_err(|error| format!("открытие каталога службы: {error}"))?;
+        recheck_directory(path, &directory, uid)?;
+        Ok(directory)
+    }
+
+    fn owned_child_directory(parent: &fs::File, parent_path: &Path, name: &str, uid: u32)
+        -> Result<fs::File, String> {
+        recheck_directory(parent_path, parent, uid)?;
+        let name = std::ffi::CString::new(name).map_err(|_| "неверное имя каталога службы")?;
+        let open = || unsafe {
+            libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY |
+                libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        };
+        let mut fd = open();
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("открытие каталога службы: {error}"));
+            }
+            let made = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+            if made != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(format!("создание каталога службы: {error}"));
+                }
+            }
+            fd = open();
+            if fd < 0 { return Err(format!("открытие каталога службы: {}", std::io::Error::last_os_error())); }
+        }
+        let directory = unsafe { fs::File::from_raw_fd(fd) };
+        recheck_directory(parent_path, parent, uid)?;
+        let path = parent_path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
+        recheck_directory(&path, &directory, uid)?;
+        Ok(directory)
+    }
+
+    fn file_digest(file: &fs::File) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let before = file.metadata().map_err(|error| format!("проверка файла службы: {error}"))?;
+        let mut input = file.try_clone().map_err(|error| format!("копия дескриптора: {error}"))?;
+        input.seek(SeekFrom::Start(0)).map_err(|error| format!("позиция файла: {error}"))?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            let count = input.read(&mut buffer).map_err(|error| format!("чтение файла службы: {error}"))?;
+            if count == 0 { break; }
+            hash.update(&buffer[..count]);
+        }
+        let after = file.metadata().map_err(|error| format!("проверка файла службы: {error}"))?;
+        if before.dev() != after.dev() || before.ino() != after.ino() || before.len() != after.len()
+            || before.mtime() != after.mtime() || before.mtime_nsec() != after.mtime_nsec()
+            || before.ctime() != after.ctime() || before.ctime_nsec() != after.ctime_nsec() {
+            return Err("файл изменился во время чтения".into());
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    }
+
+    fn optional_owned_file(path: &Path, uid: u32) -> Result<Option<fs::File>, String> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => checked_file(path, uid).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("проверка файла службы: {error}")),
+        }
+    }
+
+    fn entry_id(path: &Path, uid: u32) -> Result<Option<(u64, u64)>, String> {
+        match fs::symlink_metadata(path) {
+            Ok(info) if info.is_file() && info.uid() == uid && info.nlink() == 1 && info.mode() & 0o022 == 0 =>
+                Ok(Some((info.dev(), info.ino()))),
+            Ok(_) => Err("файл службы не является безопасным собственным файлом".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("проверка файла службы: {error}")),
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum StagePosition { Before, Published, Conflict }
+
+    fn stage_position(stage: Option<(u64, u64)>, live: Option<(u64, u64)>,
+        staged: (u64, u64), prior: Option<(u64, u64)>) -> StagePosition {
+        if stage == Some(staged) && live == prior { StagePosition::Before }
+        else if live == Some(staged) && stage == prior { StagePosition::Published }
+        else { StagePosition::Conflict }
+    }
+
+    struct StagedFile<'a> {
+        parent: &'a fs::File,
+        parent_path: &'a Path,
+        live_name: &'static str,
+        stage_name: &'static str,
+        uid: u32,
+        prior: Option<fs::File>,
+        staged: fs::File,
+    }
+
+    impl<'a> StagedFile<'a> {
+        fn create(parent: &'a fs::File, parent_path: &'a Path, live_name: &'static str,
+            stage_name: &'static str, prior: Option<fs::File>, uid: u32, mode: u32) -> Result<Self, String> {
+            recheck_directory(parent_path, parent, uid)?;
+            let name = std::ffi::CString::new(stage_name).map_err(|_| "неверное имя временного файла")?;
+            let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode) };
+            if fd < 0 { return Err(format!("создание временного файла службы: {}", std::io::Error::last_os_error())); }
+            let staged = unsafe { fs::File::from_raw_fd(fd) };
+            let result = Self { parent, parent_path, live_name, stage_name, uid, prior, staged };
+            if let Err(primary) = recheck_directory(parent_path, parent, uid)
+                .and_then(|_| recheck_file(&parent_path.join(stage_name), &result.staged, uid)) {
+                return match result.remove_exact(stage_name, &result.staged) {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(format!("{primary}; временный файл сохранён: {cleanup}")),
+                };
+            }
+            Ok(result)
+        }
+
+        fn stage_path(&self) -> PathBuf { self.parent_path.join(self.stage_name) }
+        fn live_path(&self) -> PathBuf { self.parent_path.join(self.live_name) }
+
+        fn position(&self) -> Result<StagePosition, String> {
+            recheck_directory(self.parent_path, self.parent, self.uid)?;
+            let stage = entry_id(&self.stage_path(), self.uid)?;
+            let live = entry_id(&self.live_path(), self.uid)?;
+            let staged = self.staged.metadata().map_err(|error| error.to_string())?;
+            let staged = (staged.dev(), staged.ino());
+            let prior = match &self.prior {
+                Some(file) => { let info = file.metadata().map_err(|error| error.to_string())?; Some((info.dev(), info.ino())) },
+                None => None,
+            };
+            Ok(stage_position(stage, live, staged, prior))
+        }
+
+        fn rename(&self, flags: libc::c_uint) -> Result<(), String> {
+            let stage = std::ffi::CString::new(self.stage_name).map_err(|_| "неверное имя временного файла")?;
+            let live = std::ffi::CString::new(self.live_name).map_err(|_| "неверное имя файла службы")?;
+            if unsafe { libc::renameatx_np(self.parent.as_raw_fd(), stage.as_ptr(),
+                self.parent.as_raw_fd(), live.as_ptr(), flags) } == 0 { Ok(()) }
+            else { Err(format!("атомарная замена файла службы: {}", std::io::Error::last_os_error())) }
+        }
+
+        fn publish(&self) -> Result<(), String> {
+            if self.position()? != StagePosition::Before { return Err("временный файл или прежний файл изменён".into()); }
+            recheck_file(&self.stage_path(), &self.staged, self.uid)?;
+            if let Some(prior) = &self.prior { recheck_file(&self.live_path(), prior, self.uid)?; }
+            let result = self.rename(if self.prior.is_some() { libc::RENAME_SWAP } else { libc::RENAME_EXCL });
+            let position = self.position();
+            match (result, position) {
+                (Ok(()), Ok(StagePosition::Published)) => Ok(()),
+                (Err(error), Ok(actual)) => Err(format!("{error}; положение файлов: {actual:?}")),
+                (Err(error), Err(readback)) => Err(format!("{error}; проверка положения: {readback}")),
+                (Ok(()), Ok(actual)) => Err(format!("замена не подтверждена; положение файлов: {actual:?}")),
+                (Ok(()), Err(readback)) => Err(format!("замена выполнена, но положение не проверено: {readback}")),
+            }
+        }
+
+        fn remove_exact(&self, name: &str, file: &fs::File) -> Result<(), String> {
+            recheck_directory(self.parent_path, self.parent, self.uid)?;
+            let path = self.parent_path.join(name);
+            recheck_file(&path, file, self.uid)?;
+            let component = std::ffi::CString::new(name).map_err(|_| "неверное имя файла службы")?;
+            let status = unsafe { libc::unlinkat(self.parent.as_raw_fd(), component.as_ptr(), 0) };
+            let error = (status != 0).then(std::io::Error::last_os_error);
+            let readback = recheck_directory(self.parent_path, self.parent, self.uid)
+                .and_then(|_| entry_id(&path, self.uid));
+            match (error, readback) {
+                (None, Ok(None)) => Ok(()),
+                (Some(error), Ok(actual)) => Err(format!("удаление проверенного файла: {error}; остаток: {actual:?}")),
+                (Some(error), Err(readback)) => Err(format!("удаление проверенного файла: {error}; проверка: {readback}")),
+                (None, Ok(actual)) => Err(format!("удаление не подтверждено; остаток: {actual:?}")),
+                (None, Err(readback)) => Err(format!("удаление выполнено, но проверка не удалась: {readback}")),
+            }
+        }
+
+        fn rollback(&self) -> Result<(), String> {
+            match self.position()? {
+                StagePosition::Before => self.remove_exact(self.stage_name, &self.staged),
+                StagePosition::Published if self.prior.is_some() => {
+                    let restored = self.rename(libc::RENAME_SWAP);
+                    let position = self.position();
+                    match (restored, position) {
+                        (Ok(()), Ok(StagePosition::Before)) => self.remove_exact(self.stage_name, &self.staged),
+                        (Err(error), Ok(actual)) => Err(format!("{error}; положение после восстановления: {actual:?}")),
+                        (Err(error), Err(readback)) => Err(format!("{error}; проверка восстановления: {readback}")),
+                        (Ok(()), Ok(actual)) => Err(format!("восстановление не подтверждено; положение: {actual:?}")),
+                        (Ok(()), Err(readback)) => Err(format!("восстановление выполнено, но проверка не удалась: {readback}")),
+                    }
+                }
+                StagePosition::Published => self.remove_exact(self.live_name, &self.staged),
+                StagePosition::Conflict => Err("положение файлов службы неоднозначно; файлы сохранены".into()),
+            }
+        }
+
+        fn settle_success(&self) -> Result<(), String> {
+            if self.position()? != StagePosition::Published { return Err("итоговое положение файлов не подтверждено".into()); }
+            if let Some(prior) = &self.prior { self.remove_exact(self.stage_name, prior)?; }
+            Ok(())
+        }
+    }
+
+    fn plist_value(helper: &Path, log: &Path, source_digest: &str, helper_digest: &str)
+        -> Result<serde_json::Value, String> {
+        let helper = helper.to_str().ok_or("путь службы не поддерживается в plist")?;
+        let log = log.to_str().ok_or("путь журнала не поддерживается в plist")?;
+        Ok(serde_json::json!({
+            "Label": LABEL, "ProgramArguments": [helper, PROXY_FLAG],
+            "RunAtLoad": true, "KeepAlive": true,
+            "StandardOutPath": log, "StandardErrorPath": log,
+            "EnvironmentVariables": { (SOURCE_DIGEST): source_digest, (HELPER_DIGEST): helper_digest }
+        }))
+    }
+
+    fn encode_plist(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+        use std::process::Stdio;
+        let bytes = serde_json::to_vec(value).map_err(|error| format!("кодирование plist: {error}"))?;
+        let mut child = Command::new("/usr/bin/plutil").args(["-convert", "xml1", "-o", "-", "--", "-"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().map_err(|error| format!("plutil не запущен: {error}"))?;
+        let input = match child.stdin.take() {
+            Some(mut input) => input.write_all(&bytes).map_err(|error| format!("передача plist в plutil: {error}")),
+            None => Err("stdin plutil недоступен".to_owned()),
+        };
+        let output = child.wait_with_output().map_err(|error| format!("ожидание plutil: {error}"));
+        match (input, output) {
+            (Err(primary), Err(wait)) => Err(format!("{primary}; {wait}")),
+            (Err(primary), Ok(output)) => Err(format!("{primary}; plutil завершён: {}", output.status)),
+            (Ok(()), Err(wait)) => Err(wait),
+            (Ok(()), Ok(output)) if !output.status.success() || !output.stderr.is_empty() || output.stdout.is_empty() =>
+                Err(format!("преобразование plist не подтверждено: {}", output.status)),
+            (Ok(()), Ok(output)) => Ok(output.stdout),
+        }
+    }
+
+    fn read_plist(path: &Path, held: &fs::File, uid: u32) -> Result<serde_json::Value, String> {
+        recheck_file(path, held, uid)?;
+        let output = Command::new("/usr/bin/plutil").args(["-convert", "json", "-o", "-", "--"]).arg(path)
+            .output().map_err(|error| format!("проверка plist: {error}"))?;
+        recheck_file(path, held, uid)?;
+        if !output.status.success() || !output.stderr.is_empty() {
+            return Err(format!("проверка plist не завершена: {}", output.status));
+        }
+        serde_json::from_slice(&output.stdout).map_err(|error| format!("неверный plist службы: {error}"))
+    }
+
+    fn valid_digest(value: &str) -> bool {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn plist_generation(value: &serde_json::Value, helper: &Path, log: &Path)
+        -> Result<Option<(String, String)>, String> {
+        let helper = helper.to_str().ok_or("путь службы не поддерживается в plist")?;
+        let log = log.to_str().ok_or("путь журнала не поддерживается в plist")?;
+        let object = value.as_object().ok_or("plist службы не является словарём")?;
+        if object.keys().any(|key| !["Label", "ProgramArguments", "RunAtLoad", "KeepAlive",
+            "StandardOutPath", "StandardErrorPath", "EnvironmentVariables"].contains(&key.as_str()))
+            || value.get("Label").and_then(|entry| entry.as_str()) != Some(LABEL)
+            || value.get("ProgramArguments") != Some(&serde_json::json!([helper, PROXY_FLAG]))
+            || value.get("RunAtLoad").and_then(|entry| entry.as_bool()) != Some(true)
+            || value.get("KeepAlive").and_then(|entry| entry.as_bool()) != Some(true)
+            || value.get("StandardOutPath").and_then(|entry| entry.as_str()) != Some(log)
+            || value.get("StandardErrorPath").and_then(|entry| entry.as_str()) != Some(log) {
+            return Err("plist службы не совпадает с известной конфигурацией".into());
+        }
+        let Some(environment) = value.get("EnvironmentVariables") else { return Ok(None); };
+        let environment = environment.as_object().ok_or("неверное окружение службы")?;
+        if environment.is_empty() { return Ok(None); }
+        if environment.len() != 2 { return Err("окружение службы содержит неизвестные значения".into()); }
+        let source = environment.get(SOURCE_DIGEST).and_then(|entry| entry.as_str()).ok_or("нет исходного отпечатка службы")?;
+        let helper = environment.get(HELPER_DIGEST).and_then(|entry| entry.as_str()).ok_or("нет отпечатка файла службы")?;
+        if !valid_digest(source) || !valid_digest(helper) { return Err("неверные отпечатки службы".into()); }
+        Ok(Some((source.to_owned(), helper.to_owned())))
+    }
+
+    fn generation_is_current(plist: Option<&(String, String)>, loaded: Option<&(String, String)>,
+        registered: bool, source_digest: &str, helper_digest: &str) -> Result<bool, String> {
+        if registered && plist != loaded { return Err("окружение зарегистрированной службы не совпадает с plist".into()); }
+        if !registered && loaded.is_some() { return Err("окружение отсутствующей службы неоднозначно".into()); }
+        Ok(plist.is_some_and(|(source, helper)| source == source_digest && helper == helper_digest))
+    }
+
+    fn write_stage(stage: &mut StagedFile<'_>, bytes: &[u8], mode: u32) -> Result<(), String> {
+        recheck_directory(stage.parent_path, stage.parent, stage.uid)?;
+        recheck_file(&stage.stage_path(), &stage.staged, stage.uid)?;
+        stage.staged.set_permissions(fs::Permissions::from_mode(mode)).map_err(|error| format!("права временного файла: {error}"))?;
+        stage.staged.write_all(bytes).map_err(|error| format!("запись временного файла: {error}"))?;
+        stage.staged.sync_all().map_err(|error| format!("сохранение временного файла: {error}"))?;
+        recheck_file(&stage.stage_path(), &stage.staged, stage.uid)
+    }
+
+    fn sign_helper_stage(stage: &mut StagedFile<'_>) -> Result<String, String> {
+        recheck_directory(stage.parent_path, stage.parent, stage.uid)?;
+        recheck_file(&stage.stage_path(), &stage.staged, stage.uid)?;
+        let output = Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--preserve-metadata=identifier,entitlements,flags,runtime"])
+            .arg(stage.stage_path()).output().map_err(|error| format!("подпись файла службы не запущена: {error}"));
+        let observed = recheck_directory(stage.parent_path, stage.parent, stage.uid)
+            .and_then(|_| checked_file(&stage.stage_path(), stage.uid));
+        match (output, observed) {
+            (Err(primary), Err(readback)) => return Err(format!("{primary}; проверка временного файла: {readback}")),
+            (Err(primary), Ok(file)) => { stage.staged = file; return Err(primary); },
+            (Ok(output), Err(readback)) => return Err(format!("подпись завершена: {}; проверка временного файла: {readback}", output.status)),
+            (Ok(output), Ok(file)) => {
+                stage.staged = file;
+                if !output.status.success() { return Err(format!("подпись файла службы не завершена: {}", output.status)); }
+            }
+        }
+        let verify = Command::new("/usr/bin/codesign").args(["--verify", "--strict"]).arg(stage.stage_path())
+            .output().map_err(|error| format!("проверка подписи службы: {error}"))?;
+        recheck_directory(stage.parent_path, stage.parent, stage.uid)?;
+        recheck_file(&stage.stage_path(), &stage.staged, stage.uid)?;
+        if !verify.status.success() || !verify.stderr.is_empty() {
+            return Err(format!("подпись файла службы не подтверждена: {}", verify.status));
+        }
+        file_digest(&stage.staged)
+    }
+
+    fn source_file(path: &Path) -> Result<fs::File, String> {
+        let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW_ANY | libc::O_CLOEXEC)
+            .open(path).map_err(|error| format!("открытие текущего приложения: {error}"))?;
+        recheck_source(path, &file)?;
+        Ok(file)
+    }
+
+    fn recheck_source(path: &Path, file: &fs::File) -> Result<(), String> {
+        let held = file.metadata().map_err(|error| format!("проверка приложения: {error}"))?;
+        let entry = fs::symlink_metadata(path).map_err(|error| format!("проверка приложения: {error}"))?;
+        if !held.is_file() || !entry.is_file() || held.dev() != entry.dev() || held.ino() != entry.ino()
+            || held.mode() != entry.mode() || held.len() != entry.len()
+            || held.mtime() != entry.mtime() || held.mtime_nsec() != entry.mtime_nsec() {
+            return Err("текущее приложение изменилось при подготовке службы".into());
+        }
+        Ok(())
+    }
+
+    fn prepare_helper(stage: &mut StagedFile<'_>, source_path: &Path, source: &fs::File,
+        expected_digest: &str) -> Result<String, String> {
+        recheck_source(source_path, source)?;
+        recheck_file(&stage.stage_path(), &stage.staged, stage.uid)?;
+        let mut input = source.try_clone().map_err(|error| format!("копия приложения: {error}"))?;
+        input.seek(SeekFrom::Start(0)).map_err(|error| format!("позиция приложения: {error}"))?;
+        stage.staged.set_permissions(fs::Permissions::from_mode(0o700)).map_err(|error| format!("права службы: {error}"))?;
+        std::io::copy(&mut input, &mut stage.staged).map_err(|error| format!("копия приложения: {error}"))?;
+        stage.staged.sync_all().map_err(|error| format!("сохранение копии приложения: {error}"))?;
+        recheck_source(source_path, source)?;
+        if file_digest(source)? != expected_digest || file_digest(&stage.staged)? != expected_digest {
+            return Err("копия приложения или исходный файл изменились".into());
+        }
+        sign_helper_stage(stage)
+    }
+
+    fn prepare_plist(stage: &mut StagedFile<'_>, value: &serde_json::Value) -> Result<(), String> {
+        let xml = encode_plist(value)?;
+        write_stage(stage, &xml, 0o600)?;
+        recheck_directory(stage.parent_path, stage.parent, stage.uid)?;
+        if read_plist(&stage.stage_path(), &stage.staged, stage.uid)? != *value {
+            return Err("содержимое подготовленного plist не совпадает с запросом".into());
+        }
+        recheck_directory(stage.parent_path, stage.parent, stage.uid)
+    }
+
+    fn home() -> PathBuf {
+        PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    }
+
+    pub fn install_dir() -> PathBuf {
+        home().join("Library").join("Application Support").join("AGUnlocker")
+    }
+
+    pub fn installed_exe() -> PathBuf {
+        install_dir().join("ag_proxy")
+    }
+
+    fn plist_path() -> PathBuf {
+        home().join("Library").join("LaunchAgents").join(format!("{}.plist", LABEL))
+    }
+
+    pub fn is_enabled() -> bool {
+        plist_path().exists()
+    }
+
+    pub fn is_watchdog_enabled() -> bool {
+        false
+    }
+
+    pub fn is_running() -> bool {
+        owned_proxy_listener_at(crate::proxy::port()).unwrap_or(false)
+    }
+
+    pub fn relay_is_outdated() -> bool {
+        false
+    }
+
+    pub fn ensure_running() -> Result<(), String> {
+        ensure_owned_running(crate::proxy::port())
+    }
+
+    pub fn enable() -> Result<(), String> {
+        ensure_running()
+    }
+
+    pub fn enable_watchdog() -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn ensure_installed() -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn disable_watchdog() {}
+
+    fn ensure_owned_running(port: u16) -> Result<(), String> {
+        let uid = unsafe { libc::geteuid() };
+        let home = home();
+        if !home.is_absolute() { return Err("домашний каталог не задан абсолютным путём".into()); }
+        let source_path = std::env::current_exe().map_err(|error| format!("нет пути к приложению: {error}"))?;
+        let source = source_file(&source_path)?;
+        let source_digest = file_digest(&source)?;
+        let helper = installed_exe(); let plist = plist_path(); let log = install_dir().join("proxy.log");
+        if source_path == helper { return Err("служба не может обновлять собственный исполняемый файл".into()); }
+        if disabled_override(uid)? { return Err("служба явно отключена в launchd; настройка сохранена".into()); }
+        let old_job = received_job(uid, &plist, &helper)?;
+        let old_helper = optional_owned_file(&helper, uid)?;
+        let old_plist = optional_owned_file(&plist, uid)?;
+        if old_helper.is_some() != old_plist.is_some() || (old_job.is_some() && old_helper.is_none())
+            || (old_job.is_none() && old_helper.is_some()) {
+            return Err("файлы и регистрация службы не образуют проверенное поколение".into());
+        }
+        let home_dir = owned_directory(&home, uid)?;
+        let library_path = home.join("Library");
+        let library = owned_child_directory(&home_dir, &home, "Library", uid)?;
+        let support_path = library_path.join("Application Support");
+        let support = owned_child_directory(&library, &library_path, "Application Support", uid)?;
+        let install_path = support_path.join("AGUnlocker");
+        let install = owned_child_directory(&support, &support_path, "AGUnlocker", uid)?;
+        let agents_path = library_path.join("LaunchAgents");
+        let agents = owned_child_directory(&library, &library_path, "LaunchAgents", uid)?;
+        let old_pair = match (&old_plist, &old_helper, &old_job) {
+            (Some(plist_file), Some(helper_file), Some(job)) => {
+                let pair = plist_generation(&read_plist(&plist, plist_file, uid)?, &helper, &log)?;
+                if pair.as_ref() != job.generation.as_ref() { return Err("окружение службы не совпадает с plist".into()); }
+                let helper_digest = file_digest(helper_file)?;
+                if pair.as_ref().is_some_and(|(_, digest)| *digest != helper_digest) { return Err("файл службы не совпадает с plist".into()); }
+                if generation_is_current(pair.as_ref(), job.generation.as_ref(), true, &source_digest, &helper_digest)? {
+                    receive_ready(uid, &plist, &helper, pair.as_ref(), port, None)?;
+                    recheck_source(&source_path, &source)?; recheck_file(&plist, plist_file, uid)?; recheck_file(&helper, helper_file, uid)?;
+                    return Ok(());
+                }
+                pair
+            },
+            (None, None, None) => None,
+            _ => return Err("неполная конфигурация службы".into()),
+        };
+        let old_digests = match (&old_plist, &old_helper) {
+            (Some(plist_file), Some(helper_file)) => Some((file_digest(plist_file)?, file_digest(helper_file)?)),
+            (None, None) => None,
+            _ => return Err("неполные прежние файлы службы".into()),
+        };
+        let mut helper_stage = StagedFile::create(&install, &install_path, "ag_proxy", "ag_proxy.stage", old_helper, uid, 0o700)?;
+        let mut plist_stage = match StagedFile::create(&agents, &agents_path, "com.antigravity.unlocker.proxy.plist", "com.antigravity.unlocker.proxy.plist.stage", old_plist, uid, 0o600) {
+            Ok(stage) => stage,
+            Err(primary) => return match helper_stage.rollback() { Ok(()) => Err(primary), Err(error) => Err(format!("{primary}; очистка копии: {error}")) },
+        };
+        let mut new_pair = None;
+        let attempt = (|| -> Result<(), String> {
+            let helper_digest = prepare_helper(&mut helper_stage, &source_path, &source, &source_digest)?;
+            let pair = (source_digest.clone(), helper_digest);
+            prepare_plist(&mut plist_stage, &plist_value(&helper, &log, &pair.0, &pair.1)?)?;
+            new_pair = Some(pair.clone());
+            recheck_source(&source_path, &source)?;
+            if file_digest(&source)? != source_digest || disabled_override(uid)? { return Err("исходное приложение или настройка службы изменились".into()); }
+            if let Some(job) = &old_job {
+                stop_owned_job(uid, &plist, &helper, job, plist_stage.prior.as_ref().ok_or("нет старого plist")?, helper_stage.prior.as_ref().ok_or("нет старой службы")?)?;
+            } else if received_job(uid, &plist, &helper)?.is_some() { return Err("служба появилась во время подготовки".into()); }
+            helper_stage.publish()?; plist_stage.publish()?;
+            bootstrap(uid, &plist)?;
+            receive_ready(uid, &plist, &helper, Some(&pair), port, None)?;
+            recheck_file(&helper, &helper_stage.staged, uid)?; recheck_file(&plist, &plist_stage.staged, uid)?;
+            if file_digest(&helper_stage.staged)? != pair.1 { return Err("новый файл службы изменился".into()); }
+            Ok(())
+        })();
+        if let Err(primary) = attempt {
+            let mut errors = Vec::new();
+            let mut may_restore = true;
+            match received_job(uid, &plist, &helper) {
+                Ok(Some(job)) if new_pair.as_ref().is_some_and(|pair| job.generation.as_ref() == Some(pair)) => {
+                    if let Err(error) = stop_owned_job(uid, &plist, &helper, &job, &plist_stage.staged, &helper_stage.staged) {
+                        errors.push(format!("остановка нового поколения: {error}")); may_restore = false;
+                    }
+                },
+                Ok(Some(job)) if old_job.as_ref() == Some(&job) => {},
+                Ok(None) => {},
+                Ok(Some(_)) => { errors.push("регистрация службы изменилась; файлы сохранены".into()); may_restore = false; },
+                Err(error) => { errors.push(format!("состояние службы: {error}")); may_restore = false; },
+            }
+            if may_restore {
+                if let Err(error) = plist_stage.rollback() { errors.push(format!("восстановление plist: {error}")); }
+                if let Err(error) = helper_stage.rollback() { errors.push(format!("восстановление файла службы: {error}")); }
+                if errors.is_empty() && old_job.is_some() {
+                    let recovery = (|| -> Result<(), String> {
+                        if disabled_override(uid)? { return Err("служба отключена; настройка сохранена".into()); }
+                        if received_job(uid, &plist, &helper)?.is_none() { bootstrap(uid, &plist)?; }
+                        let digests = old_digests.as_ref().ok_or("нет отпечатков прежней службы")?;
+                        let prior = PriorWitness {
+                            plist: plist_stage.prior.as_ref().ok_or("нет прежнего plist")?,
+                            helper: helper_stage.prior.as_ref().ok_or("нет прежнего файла службы")?,
+                            plist_digest: &digests.0, helper_digest: &digests.1, pair: old_pair.as_ref(),
+                        };
+                        receive_ready(uid, &plist, &helper, old_pair.as_ref(), port, Some(&prior))
+                    })();
+                    if let Err(error) = recovery { errors.push(format!("возобновление прежней службы: {error}")); }
+                }
+            }
+            return if errors.is_empty() { Err(primary) } else { Err(format!("{primary}; {}", errors.join("; "))) };
+        }
+        let mut cleanup = Vec::new();
+        if let Err(error) = plist_stage.settle_success() { cleanup.push(format!("старый plist: {error}")); }
+        if let Err(error) = helper_stage.settle_success() { cleanup.push(format!("старый файл службы: {error}")); }
+        if cleanup.is_empty() { Ok(()) } else { Err(format!("служба запущена, прежние файлы требуют проверки: {}", cleanup.join("; "))) }
+    }
+
+    fn listener_output(status: Option<i32>, stdout: &[u8], stderr: &[u8], pid: u32, port: u16) -> Result<bool, String> {
+        let warnings = std::str::from_utf8(stderr).map_err(|_| "неверная диагностика lsof")?;
+        if !warnings.is_empty() {
+            if !warnings.ends_with('\n') { return Err(format!("неполная диагностика lsof: {warnings}")); }
+            let mut lines = warnings.lines();
+            while let Some(first) = lines.next() {
+                let second = lines.next(); let third = lines.next();
+                if !first.starts_with("lsof: WARNING: can't stat() ")
+                    || second != Some("      Output information may be incomplete.")
+                    || !third.is_some_and(|line| line.starts_with("      assuming \"dev=") && line.ends_with("\" from mount table")) {
+                    return Err(format!("неподдерживаемая диагностика lsof: {warnings}"));
+                }
+            }
+            eprint!("{warnings}");
+        }
+        if status == Some(1) && stdout.is_empty() { return Ok(false); }
+        if status != Some(0) { return Err(format!("проверка сокета lsof не завершена: {status:?}; {warnings}")); }
+        let text = std::str::from_utf8(stdout).map_err(|_| "неверный ответ lsof")?;
+        if !text.ends_with('\n') { return Err("неполный ответ lsof".into()); }
+        let mut lines = text.lines();
+        let process = format!("p{pid}"); let address = format!("n127.0.0.1:{port}");
+        if lines.next() != Some(process.as_str()) { return Err("неверный процесс в ответе lsof".into()); }
+        let descriptor = lines.next().and_then(|line| line.strip_prefix('f')).ok_or("нет дескриптора сокета")?;
+        if descriptor.is_empty() || !descriptor.bytes().all(|byte| byte.is_ascii_digit())
+            || lines.next() != Some(address.as_str()) || lines.next().is_some() {
+            return Err("неверный сокет в ответе lsof".into());
+        }
+        Ok(true)
+    }
+
+    fn observe_listener(pid: u32, port: u16) -> Result<bool, String> {
+        let output = Command::new("/usr/sbin/lsof").args(["-a", "-p", &pid.to_string(), &format!("-iTCP:{port}"),
+            "-sTCP:LISTEN", "-nP", "-Fpfn"]).output().map_err(|error| format!("проверка сокета не запущена: {error}"))?;
+        listener_output(output.status.code(), &output.stdout, &output.stderr, pid, port)
+    }
+
+    pub fn owned_proxy_listener_at(port: u16) -> Result<bool, String> {
+        listener_for(port, None)
+    }
+
+    struct PriorWitness<'a> {
+        plist: &'a fs::File, helper: &'a fs::File,
+        plist_digest: &'a str, helper_digest: &'a str, pair: Option<&'a (String, String)>,
+    }
+
+    fn listener_for(port: u16, prior: Option<&PriorWitness<'_>>) -> Result<bool, String> {
+        let uid = unsafe { libc::geteuid() };
+        let plist = plist_path(); let helper = installed_exe();
+        let Some(job) = received_job(uid, &plist, &helper)? else { return Ok(false); };
+        let pid = job.pid.ok_or("нет PID зарегистрированной службы")?;
+        if job.state != "running" { return Err("состояние зарегистрированной службы не подтверждено".into()); }
+        let plist_file = checked_file(&plist, uid)?;
+        let helper_file = checked_file(&helper, uid)?;
+        let plist_digest = file_digest(&plist_file)?;
+        let pair = plist_generation(&read_plist(&plist, &plist_file, uid)?, &helper, &install_dir().join("proxy.log"))?;
+        if job.generation.as_ref() != pair.as_ref() {
+            return Err("поколение службы изменилось".into());
+        }
+        let helper_digest = file_digest(&helper_file)?;
+        let source = if let Some(prior) = prior {
+            recheck_file(&plist, prior.plist, uid)?; recheck_file(&helper, prior.helper, uid)?;
+            if pair.as_ref() != prior.pair || plist_digest != prior.plist_digest || helper_digest != prior.helper_digest {
+                return Err("прежние файлы службы изменились".into());
+            }
+            None
+        } else {
+            let pair = pair.as_ref().ok_or("у службы нет проверенного поколения")?;
+            if helper_digest != pair.1 { return Err("файл службы не совпадает с поколением".into()); }
+            let path = std::env::current_exe().map_err(|error| format!("путь приложения: {error}"))?;
+            let file = source_file(&path)?;
+            if file_digest(&file)? != pair.0 { return Err("исходное приложение не совпадает с поколением службы".into()); }
+            Some((path, file, pair.0.clone()))
+        };
+        let identity = generation(pid, uid)?.ok_or("процесс службы завершился")?;
+        check_process_image(pid, &helper)?;
+        let observation = observe_listener(pid, port);
+        let recheck = (|| -> Result<(), String> {
+            if let Some((path, file, digest)) = &source {
+                recheck_source(path, file)?;
+                if file_digest(file)? != *digest { return Err("исходное приложение изменилось".into()); }
+            }
+            recheck_file(&plist, &plist_file, uid)?; recheck_file(&helper, &helper_file, uid)?;
+            if file_digest(&plist_file)? != plist_digest || file_digest(&helper_file)? != helper_digest
+                || generation(pid, uid)? != Some(identity) || received_job(uid, &plist, &helper)?.as_ref() != Some(&job) {
+                return Err("поколение службы изменилось при проверке сокета".into());
+            }
+            check_process_image(pid, &helper)
+        })();
+        match (observation, recheck) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(primary), Err(later)) => Err(format!("{primary}; повторная проверка: {later}")),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(later)) => Err(later),
+        }
+    }
+
+    fn bootstrap(uid: u32, plist: &Path) -> Result<(), String> {
+        let output = Command::new("/bin/launchctl").args(["bootstrap", &format!("gui/{uid}")]).arg(plist)
+            .output().map_err(|error| format!("загрузка службы не запущена: {error}"))?;
+        if !output.status.success() || !output.stderr.is_empty() {
+            return Err(format!("загрузка службы не подтверждена: {}", output.status));
+        }
+        Ok(())
+    }
+
+    fn receive_ready(uid: u32, plist: &Path, helper: &Path, pair: Option<&(String, String)>, port: u16, prior: Option<&PriorWitness<'_>>) -> Result<(), String> {
+        let mut job = received_job(uid, plist, helper)?.ok_or("служба не зарегистрирована")?;
+        if job.generation.as_ref() != pair { return Err("поколение зарегистрированной службы не совпадает".into()); }
+        if job.state != "running" || !listener_for(port, prior)? {
+            let target = format!("gui/{uid}/{LABEL}");
+            let output = Command::new("/bin/launchctl").args(["kickstart", "-p", &target]).output()
+                .map_err(|error| format!("запуск службы не выполнен: {error}"))?;
+            if !output.status.success() || !output.stderr.is_empty() { return Err(format!("запуск службы не подтверждён: {}", output.status)); }
+            let pid = std::str::from_utf8(&output.stdout).map_err(|_| "неверный PID службы")?.trim()
+                .parse::<u32>().ok().filter(|pid| *pid != 0).ok_or("нет PID службы")?;
+            let deadline = std::time::Instant::now() + crate::dns_forwarder::PROXY_START_BUDGET;
+            loop {
+                if listener_for(port, prior)? { break; }
+                if std::time::Instant::now() >= deadline { return Err("готовность службы не подтверждена".into()); }
+                std::thread::sleep(crate::proxy::POLL_FOR_LISTENER);
+            }
+            job = received_job(uid, plist, helper)?.ok_or("служба исчезла после запуска")?;
+            if job.pid != Some(pid) { return Err("PID запущенной службы изменился".into()); }
+        }
+        if job.state != "running" || job.generation.as_ref() != pair { return Err("состояние службы изменилось".into()); }
+        let pid = job.pid.ok_or("нет PID службы")?;
+        let identity = generation(pid, uid)?.ok_or("процесс службы завершился")?;
+        check_process_image(pid, helper)?;
+        if generation(pid, uid)? != Some(identity) || received_job(uid, plist, helper)?.as_ref() != Some(&job) {
+            return Err("процесс службы изменился при проверке".into());
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct OwnedJob { pid: Option<u32>, state: String, generation: Option<(String, String)> }
+
+    fn parse_owned_job(text: &str, uid: u32, plist: &Path, helper: &Path) -> Result<OwnedJob, String> {
+        let mut path = None; let mut program = None; let mut domain = None;
+        let mut state = None; let mut pid = None; let mut arguments: Option<Vec<&str>> = None;
+        let mut in_arguments = false;
+        let mut in_environment = false; let mut environment_seen = false;
+        let mut source_digest = None; let mut helper_digest = None;
+        for line in text.lines() {
+            if in_environment {
+                if line == "\t}" { in_environment = false; continue; }
+                let entry = line.strip_prefix("\t\t").ok_or("неверное окружение launchd")?;
+                let (key, value) = entry.split_once(" => ").ok_or("неверное окружение launchd")?;
+                let slot = match key { SOURCE_DIGEST => Some(&mut source_digest), HELPER_DIGEST => Some(&mut helper_digest), _ => None };
+                if let Some(slot) = slot {
+                    if slot.replace(value).is_some() { return Err("повторный отпечаток launchd".into()); }
+                }
+                continue;
+            }
+            if in_arguments {
+                if line == "\t}" { in_arguments = false; continue; }
+                let value = line.strip_prefix("\t\t").ok_or("неверные аргументы launchd")?;
+                arguments.as_mut().ok_or("нет аргументов launchd")?.push(value);
+                continue;
+            }
+            let Some(top) = line.strip_prefix('\t') else { continue; };
+            if top.starts_with('\t') { continue; }
+            let Some((key, value)) = top.split_once(" = ") else { continue; };
+            let slot = match key {
+                "path" => Some(&mut path), "program" => Some(&mut program), "domain" => Some(&mut domain),
+                "state" => Some(&mut state), "pid" => Some(&mut pid),
+                "arguments" if value == "{" => {
+                    if arguments.is_some() { return Err("повторные аргументы launchd".into()); }
+                    arguments = Some(Vec::new()); in_arguments = true; None
+                },
+                "arguments" => return Err("неверные аргументы launchd".into()),
+                "environment" if value == "{" => {
+                    if environment_seen { return Err("повторное окружение launchd".into()); }
+                    environment_seen = true; in_environment = true; None
+                },
+                "environment" => return Err("неверное окружение launchd".into()),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                if value.is_empty() || slot.replace(value).is_some() { return Err("повторное поле launchd".into()); }
+            }
+        }
+        let domain = domain.ok_or("нет домена launchd")?;
+        let prefix = format!("gui/{uid} [");
+        let valid_domain = domain.strip_prefix(&prefix).and_then(|rest| rest.strip_suffix(']'))
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()));
+        let arguments = arguments.ok_or("нет аргументов launchd")?;
+        if in_arguments || in_environment || !environment_seen || !valid_domain || path.map(Path::new) != Some(plist) || program.map(Path::new) != Some(helper)
+            || arguments.len() != 2 || Path::new(arguments[0]) != helper || arguments[1] != PROXY_FLAG {
+            return Err("служба launchd не совпадает с ожидаемой".into());
+        }
+        let state = state.ok_or("нет состояния launchd")?.to_owned();
+        let pid = pid.map(|value| value.parse::<u32>().ok().filter(|pid| *pid != 0).ok_or("неверный PID launchd"))
+            .transpose()?;
+        if state == "running" && pid.is_none() { return Err("нет PID работающей службы".into()); }
+        let generation = match (source_digest, helper_digest) {
+            (None, None) => None,
+            (Some(source), Some(helper)) if valid_digest(source) && valid_digest(helper) => Some((source.to_owned(), helper.to_owned())),
+            _ => return Err("неверные отпечатки окружения launchd".into()),
+        };
+        Ok(OwnedJob { pid, state, generation })
+    }
+
+    fn parse_disabled_override(text: &str) -> Result<bool, String> {
+        let mut lines = text.lines().filter(|line| !line.is_empty());
+        if lines.next() != Some("\tdisabled services = {") { return Err("неверный ответ launchd об отключённых службах".into()); }
+        let target = format!("\t\t\"{LABEL}\" => ");
+        let mut disabled = false;
+        let mut closed = false;
+        for line in lines {
+            if closed { return Err("данные после списка отключённых служб".into()); }
+            if line == "\t}" { closed = true; continue; }
+            if !line.starts_with("\t\t\"") || !line.contains("\" => ") { return Err("неверная запись отключённой службы".into()); }
+            if let Some(value) = line.strip_prefix(&target) {
+                if disabled || value != "disabled" { return Err("неверное или повторное состояние службы".into()); }
+                disabled = true;
+            }
+        }
+        if !closed { return Err("неполный список отключённых служб".into()); }
+        Ok(disabled)
+    }
+
+    fn disabled_override(uid: u32) -> Result<bool, String> {
+        let output = Command::new("/bin/launchctl").args(["print-disabled", &format!("gui/{uid}")]).output()
+            .map_err(|error| format!("проверка отключения службы: {error}"))?;
+        if !output.status.success() || !output.stderr.is_empty() { return Err(format!("состояние отключения не получено: {}", output.status)); }
+        parse_disabled_override(std::str::from_utf8(&output.stdout).map_err(|_| "неверный ответ об отключении службы")?)
+    }
+
+    fn received_job(uid: u32, plist: &Path, helper: &Path) -> Result<Option<OwnedJob>, String> {
+        let target = format!("gui/{uid}/{LABEL}");
+        let output = Command::new("/bin/launchctl").args(["print", &target]).output()
+            .map_err(|error| format!("проверка launchd: {error}"))?;
+        if output.status.success() {
+            if !output.stderr.is_empty() { return Err("проверка launchd вернула предупреждение".into()); }
+            return parse_owned_job(std::str::from_utf8(&output.stdout).map_err(|_| "неверный ответ launchd")?, uid, plist, helper).map(Some);
+        }
+        let absent = format!("Bad request.\nCould not find service \"{LABEL}\" in domain for user gui: {uid}\n");
+        if output.status.code() == Some(113) && output.stdout.is_empty() && output.stderr == absent.as_bytes() { return Ok(None); }
+        Err(format!("состояние launchd не получено: {}", output.status))
+    }
+
+    fn checked_file(path: &Path, uid: u32) -> Result<fs::File, String> {
+        let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path).map_err(|error| format!("проверка файла службы: {error}"))?;
+        recheck_file(path, &file, uid)?;
+        Ok(file)
+    }
+
+    fn recheck_file(path: &Path, file: &fs::File, uid: u32) -> Result<(), String> {
+        let held = file.metadata().map_err(|error| error.to_string())?;
+        let entry = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        if !held.is_file() || !entry.is_file() || held.uid() != uid || held.nlink() != 1 || held.mode() & 0o022 != 0
+            || held.dev() != entry.dev() || held.ino() != entry.ino() || held.uid() != entry.uid()
+            || held.mode() != entry.mode() || entry.nlink() != 1 {
+            return Err("файл службы изменён или не принадлежит текущему пользователю".into());
+        }
+        Ok(())
+    }
+
+    fn generation(pid: u32, uid: u32) -> Result<Option<(u64, u64)>, String> {
+        let pid = i32::try_from(pid).map_err(|_| "неверный PID службы")?;
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>();
+        unsafe { *libc::__error() = 0; }
+        let read = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size as libc::c_int) };
+        if read != size as libc::c_int {
+            if read == 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) { return Ok(None); }
+            return Err("идентификатор процесса службы не получен".into());
+        }
+        let info = unsafe { info.assume_init() };
+        if info.pbi_pid != pid as u32 || info.pbi_uid != uid || info.pbi_start_tvsec == 0 {
+            return Err("процесс службы не совпадает с текущим пользователем".into());
+        }
+        Ok(Some((info.pbi_start_tvsec, info.pbi_start_tvusec)))
+    }
+
+    fn check_process_image(pid: u32, helper: &Path) -> Result<(), String> {
+        let mut bytes = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let read = unsafe { libc::proc_pidpath(pid as i32, bytes.as_mut_ptr().cast(), bytes.len() as u32) };
+        if read <= 0 { return Err("путь процесса службы не получен".into()); }
+        let raw = std::ffi::CStr::from_bytes_until_nul(&bytes).map_err(|_| "неверный путь процесса службы")?;
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(raw.to_bytes()));
+        if fs::canonicalize(path).map_err(|error| error.to_string())? != fs::canonicalize(helper).map_err(|error| error.to_string())? {
+            return Err("процесс службы запущен из другого файла".into());
+        }
+        Ok(())
+    }
+
+    pub fn disable() -> Result<(), String> {
+        let home = home();
+        if !home.is_absolute() { return Err("домашний каталог не задан абсолютным путём".into()); }
+        let uid = unsafe { libc::geteuid() };
+        let plist = plist_path();
+        let helper = installed_exe();
+        let Some(job) = received_job(uid, &plist, &helper)? else {
+            if fs::symlink_metadata(&plist).is_ok() || fs::symlink_metadata(&helper).is_ok() {
+                return Err("служба отсутствует, но её файлы требуют проверки владельца".into());
+            }
+            for path in [&plist, &helper] {
+                if let Err(error) = fs::symlink_metadata(path) {
+                    if error.kind() != std::io::ErrorKind::NotFound { return Err(format!("проверка файла службы: {error}")); }
+                } else { return Err("файл службы появился во время проверки".into()); }
+            }
+            return Ok(());
+        };
+        let plist_file = checked_file(&plist, uid)?;
+        let helper_file = checked_file(&helper, uid)?;
+        stop_owned_job(uid, &plist, &helper, &job, &plist_file, &helper_file)?;
+        recheck_file(&plist, &plist_file, uid)?;
+        recheck_file(&helper, &helper_file, uid)?;
+        fs::remove_file(&plist).map_err(|error| format!("служба остановлена, plist сохранён: {error}"))?;
+        recheck_file(&helper, &helper_file, uid).map_err(|error| format!("plist удалён, файл службы сохранён: {error}"))?;
+        fs::remove_file(&helper).map_err(|error| format!("plist удалён, файл службы сохранён: {error}"))?;
+        Ok(())
+    }
+
+    fn stop_owned_job(uid: u32, plist: &Path, helper: &Path, job: &OwnedJob,
+        plist_file: &fs::File, helper_file: &fs::File) -> Result<(), String> {
+        let plist_output = Command::new("/usr/bin/plutil").args(["-convert", "json", "-o", "-", "--"]).arg(&plist).output()
+            .map_err(|error| format!("проверка plist: {error}"))?;
+        recheck_file(&plist, &plist_file, uid)?;
+        recheck_file(&helper, &helper_file, uid)?;
+        if !plist_output.status.success() || !plist_output.stderr.is_empty() { return Err("plist службы не прочитан".into()); }
+        let value: serde_json::Value = serde_json::from_slice(&plist_output.stdout).map_err(|error| format!("неверный plist службы: {error}"))?;
+        let helper_text = helper.to_str().ok_or("путь службы не поддерживается в plist")?;
+        if value.get("Label").and_then(|value| value.as_str()) != Some(LABEL)
+            || value.get("ProgramArguments") != Some(&serde_json::json!([helper_text, PROXY_FLAG])) {
+            return Err("plist службы не совпадает с ожидаемым".into());
+        }
+        let original = match job.pid { Some(pid) => {
+            let first = generation(pid, uid)?.ok_or("процесс службы уже завершился")?;
+            check_process_image(pid, &helper)?;
+            if generation(pid, uid)? != Some(first) { return Err("процесс службы изменился при проверке".into()); }
+            Some((pid, first))
+        }, None => None };
+        if received_job(uid, &plist, &helper)?.as_ref() != Some(job) { return Err("служба изменилась до остановки".into()); }
+        recheck_file(&plist, &plist_file, uid)?;
+        recheck_file(&helper, &helper_file, uid)?;
+        let target = format!("gui/{uid}/{LABEL}");
+        let status = Command::new("/bin/launchctl").args(["bootout", &target]).status()
+            .map_err(|error| format!("остановка службы не запущена: {error}"))?;
+        if !status.success() { return Err(format!("остановка службы не завершена: {status}")); }
+        let deadline = std::time::Instant::now() + crate::dns_forwarder::PROXY_START_BUDGET;
+        loop {
+            let absent = received_job(uid, &plist, &helper)?.is_none();
+            let exited = match original {
+                Some((pid, initial)) => generation(pid, uid)?.is_none_or(|now| now != initial),
+                None => true,
+            };
+            if absent && exited { break; }
+            if std::time::Instant::now() >= deadline { return Err("остановка службы не подтверждена; файлы сохранены".into()); }
+            std::thread::sleep(crate::proxy::POLL_FOR_LISTENER);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn listener_witness_requires_exact_process_descriptor_and_address() {
+            let warning = b"lsof: WARNING: can't stat() synthetic file system /test-fixtures\n      Output information may be incomplete.\n      assuming \"dev=123\" from mount table\n";
+            assert_eq!(listener_output(Some(0), b"p42\nf3\nn127.0.0.1:1234\n", warning, 42, 1234).unwrap(), true);
+            assert_eq!(listener_output(Some(1), b"", warning, 42, 1234).unwrap(), false);
+            assert!(listener_output(Some(0), b"p43\nf3\nn127.0.0.1:1234\n", b"", 42, 1234).is_err());
+            assert!(listener_output(Some(0), b"p42\nf3\nn*:1234\n", b"", 42, 1234).is_err());
+            assert!(listener_output(Some(0), b"p42\nf3\nn127.0.0.1:1234", b"", 42, 1234).is_err());
+            assert!(listener_output(Some(1), b"", b"permission denied\n", 42, 1234).is_err());
+        }
+
+        #[test]
+        fn staged_publication_requires_the_exact_prior_and_new_entries() {
+            let fresh = (7, 11);
+            let old = (7, 12);
+            assert_eq!(stage_position(Some(fresh), Some(old), fresh, Some(old)), StagePosition::Before);
+            assert_eq!(stage_position(Some(old), Some(fresh), fresh, Some(old)), StagePosition::Published);
+            assert_eq!(stage_position(Some(fresh), None, fresh, None), StagePosition::Before);
+            assert_eq!(stage_position(None, Some(fresh), fresh, None), StagePosition::Published);
+            assert_eq!(stage_position(None, None, fresh, None), StagePosition::Conflict);
+            assert_eq!(stage_position(Some(fresh), Some((7, 13)), fresh, Some(old)), StagePosition::Conflict);
+            assert_eq!(stage_position(Some(old), Some(old), fresh, Some(old)), StagePosition::Conflict);
+        }
+
+        #[test]
+        fn plist_generation_rejects_partial_or_foreign_metadata() {
+            let helper = Path::new("/test-fixtures/ag_proxy");
+            let log = Path::new("/test-fixtures/proxy.log");
+            let source = "a".repeat(64);
+            let binary = "b".repeat(64);
+            let mut value = plist_value(helper, log, &source, &binary).unwrap();
+            assert_eq!(plist_generation(&value, helper, log).unwrap(), Some((source, binary)));
+            value["EnvironmentVariables"].as_object_mut().unwrap().remove(SOURCE_DIGEST);
+            assert!(plist_generation(&value, helper, log).is_err());
+            value.as_object_mut().unwrap().remove("EnvironmentVariables");
+            assert_eq!(plist_generation(&value, helper, log).unwrap(), None);
+            value["ProgramArguments"] = serde_json::json!(["/test-fixtures/foreign", PROXY_FLAG]);
+            assert!(plist_generation(&value, helper, log).is_err());
+        }
+
+        #[test]
+        fn generation_currentness_binds_source_helper_and_loaded_definition() {
+            let source = "a".repeat(64);
+            let helper = "b".repeat(64);
+            let pair = (source.clone(), helper.clone());
+            assert!(generation_is_current(Some(&pair), Some(&pair), true, &source, &helper).unwrap());
+            assert!(generation_is_current(Some(&pair), None, false, &source, &helper).unwrap());
+            assert!(!generation_is_current(Some(&pair), Some(&pair), true, &"c".repeat(64), &helper).unwrap());
+            assert!(!generation_is_current(Some(&pair), Some(&pair), true, &source, &"d".repeat(64)).unwrap());
+            assert!(!generation_is_current(None, None, true, &source, &helper).unwrap());
+            assert!(generation_is_current(Some(&pair), None, true, &source, &helper).is_err());
+            assert!(generation_is_current(None, Some(&pair), true, &source, &helper).is_err());
+        }
+
+        #[test]
+        fn disabled_override_requires_complete_framing_and_exact_label() {
+            assert!(parse_disabled_override("").is_err());
+            assert!(parse_disabled_override("\n\tdisabled services = {\n").is_err());
+            assert!(!parse_disabled_override("\n\tdisabled services = {\n\t\t\"other\" => disabled\n\t}\n").unwrap());
+            let selected = format!("\n\tdisabled services = {{\n\t\t\"{LABEL}\" => disabled\n\t}}\n");
+            assert!(parse_disabled_override(&selected).unwrap());
+            assert!(parse_disabled_override(&selected.replace("disabled\n", "unknown\n")).is_err());
+        }
+
+        #[test]
+        fn stop_accepts_only_the_exact_owned_launchd_definition() {
+            let plist = Path::new("/Users/example/Library/LaunchAgents/owned.plist");
+            let helper = Path::new("/Users/example/Library/Application Support/AGUnlocker/ag_proxy");
+            let text = "service = {\n\tpath = /Users/example/Library/LaunchAgents/owned.plist\n\tprogram = /Users/example/Library/Application Support/AGUnlocker/ag_proxy\n\tdomain = gui/501 [100001]\n\tstate = running\n\tpid = 123\n\targuments = {\n\t\t/Users/example/Library/Application Support/AGUnlocker/ag_proxy\n\t\t--proxy\n\t}\n\tenvironment = {\n\t\tXPC_SERVICE_NAME => fixture\n\t}\n}\n";
+            assert_eq!(parse_owned_job(text, 501, plist, helper).unwrap().pid, Some(123));
+            assert!(parse_owned_job(text, 502, plist, helper).is_err());
+            assert!(parse_owned_job(&text.replace("--proxy", "--watchdog"), 501, plist, helper).is_err());
+            assert!(parse_owned_job(&text.replace("\tpid = 123\n", "\tpid = 123\n\tpid = 456\n"), 501, plist, helper).is_err());
+            assert!(parse_owned_job(&text.replace("\tpid = 123\n", ""), 501, plist, helper).is_err());
+            let source = "a".repeat(64); let binary = "b".repeat(64);
+            let entries = format!("\t\t{SOURCE_DIGEST} => {source}\n\t\t{HELPER_DIGEST} => {binary}\n");
+            let current = text.replace("\t\tXPC_SERVICE_NAME => fixture\n", &entries);
+            assert_eq!(parse_owned_job(&current, 501, plist, helper).unwrap().generation, Some((source, binary)));
+            assert!(parse_owned_job(&current.replace(&format!("\t\t{HELPER_DIGEST} => {}\n", "b".repeat(64)), ""), 501, plist, helper).is_err());
+            assert!(parse_owned_job(&current.replace(&entries, &format!("{entries}{entries}")), 501, plist, helper).is_err());
+            assert!(parse_owned_job(&text.replace("\tenvironment = {\n\t\tXPC_SERVICE_NAME => fixture\n\t}\n", ""), 501, plist, helper).is_err());
+        }
+    }
+}
+
 // Linux: phase 2 is the **proxy route**, not the DNS relay. This runs the local
 // CONNECT proxy (`proxy::run`, via `--proxy`) as a systemd **user** unit - no
 // root, no `:53` listener, so systemd-resolved is never touched. The DNS relay
 // (phase 5) would be a separate, privileged story; this is deliberately the
 // unprivileged half that already lifts the region gate through a permitted exit.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 mod unix_impl {
     use std::fs;
     use std::path::PathBuf;

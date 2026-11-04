@@ -55,9 +55,33 @@ pub fn verify_key(key: &str) -> bool {
     result == 0
 }
 
+/// Decide local application entry without changing or storing a licence key.
+pub(crate) fn entry_allowed(key: &str, debug_skip: bool) -> bool {
+    entry_allowed_for(verify_key(key), cfg!(feature = "personal-build"), debug_skip)
+}
+
+fn entry_allowed_for(valid_key: bool, personal_build: bool, debug_skip: bool) -> bool {
+    valid_key || personal_build || debug_skip
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_policy_preserves_default_and_debug_paths() {
+        assert!(!entry_allowed_for(false, false, false));
+        assert!(entry_allowed_for(true, false, false));
+        assert!(entry_allowed_for(false, true, false));
+        assert!(entry_allowed_for(false, false, true));
+        assert!(!verify_key("not-a-key"));
+    }
+
+    #[test]
+    fn configured_feature_controls_invalid_local_entry() {
+        assert_eq!(entry_allowed("not-a-key", false), cfg!(feature = "personal-build"));
+        assert!(!verify_key("not-a-key"));
+    }
 
     /// Mints a key the way dist_keygen.py does, for an arbitrary secret.
     fn mint_key(nonce: &str, secret: &str) -> String {

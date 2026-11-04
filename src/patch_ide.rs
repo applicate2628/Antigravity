@@ -28,7 +28,7 @@ impl JsTargets {
     }
 }
 pub(crate) fn js_targets(inst: &Path) -> JsTargets {
-    let app = inst.join("resources").join("app");
+    let app = crate::installation_resources(inst).join("app");
     JsTargets { ide_main: app.join("out").join("main.js"),
         desktop_main: app.join("dist").join("main.js"),
         extension: app.join("extensions").join("antigravity").join("dist").join("extension.js") }

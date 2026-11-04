@@ -593,9 +593,14 @@ impl App {
                 self.toast("Открыто в браузере: https://t.me/nova_txt/69864");
             }
             Row::GroupProxyCopy => {
+                #[cfg(target_os = "macos")]
+                self.worker.send(Cmd::CopyGroupCommand);
+                #[cfg(not(target_os = "macos"))]
+                {
                 let cmd = format!("/ag+{}", crate::hwid::pc_code());
                 crate::utils::set_clipboard_text(&cmd);
                 self.toast(format!("Скопировано: {} — отправьте это сообщение в комнате", cmd));
+                }
             }
             Row::GroupProxyPaste => {
                 if let Some(text) = crate::utils::clipboard_text() {
@@ -958,6 +963,13 @@ impl App {
                 switch_line("      ", &name, &state, busy, width)
             }
             Row::GroupProxyText => {
+                #[cfg(target_os = "macos")]
+                let pc = match crate::hwid::cached_pc_code() {
+                    Some(Ok(code)) => code.to_owned(),
+                    Some(Err(error)) => format!("недоступен: {error}"),
+                    None => "не запрошен".to_owned(),
+                };
+                #[cfg(not(target_os = "macos"))]
                 let pc = crate::hwid::pc_code();
                 let key_text = if crate::settings::group_key().is_empty() {
                     "ключа нет"
@@ -1047,8 +1059,13 @@ impl App {
     }
 
     fn title_line(&self) -> Line<'static> {
+        #[cfg(target_os = "macos")]
+        let title_str = format!(" Antigravity Unlocker 2 v{} (macOS Edition by @Fuheshka) ", update::current_version());
+        #[cfg(not(target_os = "macos"))]
+        let title_str = format!(" Antigravity Unlocker 2 v{} ", update::current_version());
+
         let mut spans = vec![Span::styled(
-            format!(" Antigravity Unlocker 2 v{} ", update::current_version()),
+            title_str,
             Style::new().add_modifier(Modifier::BOLD),
         )];
         if let Some(rel) = &self.update {
@@ -1393,13 +1410,13 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
         .min(usize::from(u16::MAX)) as u16
 }
 
+/// Local entry uses the same policy as the window.
 fn first_screen(settings: &crate::settings::Settings) -> Screen {
     #[cfg(debug_assertions)]
-    if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
-        return Screen::Main;
-    }
-    // A key accepted before and still good for this version: no screen.
-    if auth::verify_key(&settings.license_key) {
+    let debug_skip = std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some();
+    #[cfg(not(debug_assertions))]
+    let debug_skip = false;
+    if auth::entry_allowed(&settings.license_key, debug_skip) {
         return Screen::Main;
     }
     Screen::License

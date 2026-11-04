@@ -1192,7 +1192,7 @@ fn human_minutes(d: Duration) -> String {
 
 /// How long the proxy listener is given to appear before the route is treated as
 /// absent. Covers `proxy::bind_listener`'s own retries (15 s) with room to spare.
-const PROXY_START_BUDGET: Duration = Duration::from_secs(30);
+pub(crate) const PROXY_START_BUDGET: Duration = Duration::from_secs(30);
 
 /// Runs until killed, and never returns.
 ///
