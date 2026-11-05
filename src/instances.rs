@@ -118,9 +118,21 @@ mod platform {
         let directory = crate::dns_forwarder::log_dir();
         if !directory.is_absolute() { return Err("путь настроек должен быть абсолютным".into()); }
         std::fs::create_dir_all(&directory).map_err(|error| format!("каталог настроек: {error}"))?;
-        let path = directory.join("settings-writer.lock");
+        acquire_writer(&directory, "settings-writer.lock", libc::O_NOFOLLOW)
+    }
+
+    pub fn acquire_watchdog_worker() -> Result<File, String> {
+        let directory = crate::background::install_dir();
+        let held_directory = crate::background::watchdog_directory()?;
+        let file = acquire_writer(&directory, "watchdog-worker.lock", libc::O_NOFOLLOW_ANY)?;
+        crate::background::recheck_watchdog_directory(&held_directory)?;
+        Ok(file)
+    }
+
+    fn acquire_writer(directory: &std::path::Path, name: &str, flags: i32) -> Result<File, String> {
+        let path = directory.join(name);
         let file = OpenOptions::new().read(true).write(true).create(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path)
+            .custom_flags(flags | libc::O_CLOEXEC).open(&path)
             .map_err(|error| format!("файл блокировки настроек: {error}"))?;
         let recheck = || -> Result<(), String> {
             let held = file.metadata().map_err(|error| error.to_string())?;
@@ -145,6 +157,9 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 pub use platform::acquire_gui_writer;
+
+#[cfg(target_os = "macos")]
+pub use platform::acquire_watchdog_worker;
 
 #[cfg(test)]
 mod tests {

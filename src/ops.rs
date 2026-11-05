@@ -608,13 +608,17 @@ struct Ctx {
     /// that nothing reads any more. Reset on every patch.
     proxy_var_carried: Option<bool>,
     proxy_var_retryable: bool,
-    /// What the last deep pass found, per install.
+    /// Cached per-install inspection. On macOS it is bound to a checked file
+    /// snapshot; other platforms retain their last deep-pass result.
     ///
     /// A shallow refresh must not throw this away: reading a 150 MB binary is
     /// what makes the answer expensive, and without a memory every cheap refresh
     /// would blank the switch back to "not checked yet" — which reads as the
     /// patch having come undone.
+    #[cfg(not(target_os = "macos"))]
     patched_seen: HashMap<PathBuf, bool>,
+    #[cfg(target_os = "macos")]
+    patched_seen: HashMap<PathBuf, MacObservation>,
     /// Last VPN measurement. `egress::detect` drives PowerShell and is capped at
     /// a minute, so it is taken on the deep pass and after anything that could
     /// change it — never on a plain refresh.
@@ -642,6 +646,59 @@ enum Startup {
     Held(String),
     #[cfg(windows)]
     Resume(crate::instances::GuiApplyContinuation),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct MacObservation {
+    settled: Option<(patch_binary::MacTargetSnapshot, Option<bool>)>,
+    pending: Option<patch_binary::MacTargetSnapshot>,
+    pending_ready: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn mac_observe_install(path: &Path, deep: bool, observation: &mut MacObservation) -> Option<bool> {
+    mac_observe_with(path, deep, observation, patch_binary::inspect_file)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_observe_with(path: &Path, deep: bool, observation: &mut MacObservation,
+    mut inspect: impl FnMut(&Path) -> patch_binary::FileState) -> Option<bool> {
+    let before = match patch_binary::mac_target_snapshot(path) {
+        Ok(snapshot) => snapshot,
+        Err(_) => { *observation = MacObservation::default(); return None; }
+    };
+    if !deep {
+        if let Some((snapshot, result)) = &observation.settled {
+            if snapshot == &before { return *result; }
+        }
+        if observation.pending.as_ref() != Some(&before) {
+            observation.settled = None;
+            observation.pending = Some(before);
+            observation.pending_ready = false;
+            return None;
+        }
+        if !observation.pending_ready { return None; }
+    }
+    let mut patched = !before.targets.is_empty();
+    let mut unreadable = false;
+    for (target, _) in &before.targets {
+        match inspect(target) {
+            patch_binary::FileState::Patched => {},
+            patch_binary::FileState::Unreadable(_) => unreadable = true,
+            _ => patched = false,
+        }
+    }
+    let result = if unreadable || before.targets.is_empty() { None } else { Some(patched) };
+    match patch_binary::mac_target_snapshot(path) {
+        Ok(after) if after == before => {
+            observation.settled = Some((before, result));
+            observation.pending = None;
+            observation.pending_ready = false;
+            result
+        },
+        _ => { *observation = MacObservation::default(); None }
+    }
 }
 
 enum NativeCompletion {
@@ -765,6 +822,8 @@ fn run_worker(
     let mut shutdown = false;
     let mut refresh_requested = cfg!(windows);
     let mut native_unsettled = false;
+    #[cfg(target_os = "macos")]
+    let mut last_mac_observation = std::time::Instant::now();
     #[cfg(windows)]
     let mut elevation_progress: Option<Receiver<crate::instances::ElevationProgress>> = None;
     loop {
@@ -870,6 +929,13 @@ fn run_worker(
         if take_wsl_refresh(&mut refresh_requested, !ctx.wsl.is_pending(), &command, &first_command) {
             if let Err(error) = ctx.wsl.request_discovery() { ctx.log(Level::Warn, error); }
             push_status(&mut ctx, Scan::Settings);
+        }
+        #[cfg(target_os = "macos")]
+        if command.is_none() && first_command.is_none() && !ctx.wsl.is_pending()
+            && !matches!(ctx.startup, Startup::Held(_)) && !ctx.vpn_unsettled && ctx.vpn_job.is_none()
+            && !MEASURING_VPN.load(Ordering::SeqCst) && last_mac_observation.elapsed() >= crate::watchdog::POLL {
+            last_mac_observation = std::time::Instant::now();
+            if mac_idle_observation(&mut ctx) { push_mac_idle_status(&mut ctx); }
         }
         let Some(cmd) = command else { continue; };
         if matches!(ctx.startup, Startup::Held(_)) && !matches!(&cmd, Cmd::Shutdown | Cmd::Stop | Cmd::CancelWsl) {
@@ -1265,6 +1331,15 @@ fn scan_after(cap: Cap) -> Scan {
 }
 
 fn push_status(ctx: &mut Ctx, scan: Scan) {
+    push_status_mode(ctx, scan, false)
+}
+
+#[cfg(target_os = "macos")]
+fn push_mac_idle_status(ctx: &mut Ctx) {
+    push_status_mode(ctx, Scan::System, true)
+}
+
+fn push_status_mode(ctx: &mut Ctx, scan: Scan, suppress_unchanged_installs: bool) {
     // The measurement answers "do the client's own sockets leave through a
     // tunnel", which no switch in this window changes — only what we then do
     // about it. So it is taken on the deep pass and when it has never been
@@ -1287,6 +1362,12 @@ fn push_status(ctx: &mut Ctx, scan: Scan) {
         Scan::Deep => read_status(ctx, true),
     };
 
+    if suppress_unchanged_installs && ctx.last.as_ref().is_some_and(|previous| {
+        previous.installs.len() == status.installs.len() && previous.installs.iter().zip(&status.installs)
+            .all(|(a, b)| a.path == b.path && a.label == b.label && a.manual == b.manual && a.patched == b.patched)
+    }) { return; }
+
+    #[cfg(not(target_os = "macos"))]
     if scan == Scan::Deep {
         ctx.patched_seen = status
             .installs
@@ -1602,10 +1683,15 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
     // switch; run at once the refresh costs the slowest one. They only read, so
     // there is nothing here for them to race over.
     let settings = &ctx.settings;
+    #[cfg(not(target_os = "macos"))]
     let patched_seen = &ctx.patched_seen;
+    #[cfg(target_os = "macos")]
+    let patched_seen = &mut ctx.patched_seen;
+    #[cfg(target_os = "macos")]
+    let previous = ctx.last.as_ref();
     let (installs, watchdog, dns_probe, local_proxy, own_proxy, own_proxy_text, relay_outdated) =
         std::thread::scope(|scope| {
-            let installs = scope.spawn(move || collect_installs(settings, deep, patched_seen));
+            let installs = scope.spawn(move || collect_installs(settings, deep, patched_seen, #[cfg(target_os = "macos")] previous));
             let watchdog = scope.spawn(move || read_watchdog(admin));
             let dns_probe = scope.spawn(probe_dns);
             let local_proxy = scope.spawn(move || read_local_proxy(settings));
@@ -1629,7 +1715,15 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
     ctx.dns_probe = dns_probe;
 
     let patched: Vec<bool> = installs.iter().filter_map(|i| i.patched).collect();
-    let client_patch = if patched.is_empty() {
+    #[cfg(target_os = "macos")]
+    let has_unknown = installs.iter().any(|row| row.path.is_some() && row.patched.is_none());
+    #[cfg(not(target_os = "macos"))]
+    let has_unknown = false;
+    let client_patch = if has_unknown {
+        if patched.iter().any(|value| *value) || ctx.settings.client_patch {
+            State::Partial("состояние некоторых установок не проверено".into())
+        } else { State::OffNote("состояние некоторых установок не проверено".into()) }
+    } else if patched.is_empty() {
         // Not inspected yet, or nothing found. Fall back to what the user asked
         // for rather than claiming knowledge we do not have.
         if ctx.settings.client_patch {
@@ -1735,6 +1829,12 @@ fn watchdog_allowed(admin: bool) -> bool {
 }
 
 fn read_watchdog(admin: bool) -> State {
+    #[cfg(target_os = "macos")]
+    { return match background::watchdog_running_checked() {
+        Ok(true) => State::On, Ok(false) => State::Off, Err(error) => State::Blocked(error),
+    }; }
+    #[cfg(not(target_os = "macos"))]
+    {
     if background::is_watchdog_enabled() {
         State::On
     } else if !admin && cfg!(target_os = "windows") {
@@ -1742,6 +1842,21 @@ fn read_watchdog(admin: bool) -> State {
     } else {
         State::Off
     }
+    }
+}
+
+fn watchdog_checked() -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    { background::watchdog_running_checked() }
+    #[cfg(not(target_os = "macos"))]
+    { Ok(background::is_watchdog_enabled()) }
+}
+
+fn stop_watchdog_checked() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    { background::disable_watchdog_checked() }
+    #[cfg(not(target_os = "macos"))]
+    { background::disable_watchdog(); Ok(()) }
 }
 
 /// The two facts about the DNS layer that only the machine can answer: are our
@@ -1859,11 +1974,7 @@ fn read_own_proxy() -> State {
 /// The three kinds, in the order the window lists them.
 const INSTALL_KINDS: [&str; 3] = ["Antigravity 2.0", "Antigravity IDE", "Antigravity CLI"];
 
-fn collect_installs(
-    settings: &Settings,
-    deep: bool,
-    seen: &HashMap<PathBuf, bool>,
-) -> Vec<InstallRow> {
+fn install_rows(settings: &Settings) -> Vec<InstallRow> {
     // A path the user pointed at wins over one the scan found: pointing at it is
     // what they do when the scan picked the wrong copy.
     let mut chosen: Vec<(PathBuf, bool)> = settings
@@ -1871,7 +1982,13 @@ fn collect_installs(
         .iter()
         .map(|p| (p.clone(), true))
         .collect();
-    for path in crate::discover_installs_fast() {
+    #[cfg(all(test, target_os = "macos"))]
+    let discovered = if std::env::var_os("AG_MAC_CACHE_TEST_ROOT").is_some() {
+        Vec::new()
+    } else { crate::discover_installs_fast() };
+    #[cfg(not(all(test, target_os = "macos")))]
+    let discovered = crate::discover_installs_fast();
+    for path in discovered {
         if !chosen.iter().any(|(p, _)| p == &path) {
             chosen.push((path, false));
         }
@@ -1913,10 +2030,78 @@ fn collect_installs(
         });
     }
 
+    rows
+}
+
+#[cfg(target_os = "macos")]
+fn mac_install_rows(settings: &Settings, previous: Option<&Status>) -> Vec<InstallRow> {
+    let mut rows = install_rows(settings);
+    if let Some(previous) = previous {
+        for old in &previous.installs {
+            let Some(path) = &old.path else { continue; };
+            if rows.iter().any(|row| row.path.as_ref() == Some(path)) { continue; }
+            if patch_binary::mac_target_snapshot(path).is_err() {
+                if let Err(error) = std::fs::metadata(path) {
+                    if patch_binary::mac_confirm_absent(path, error).is_ok() { continue; }
+                }
+                let mut unknown = old.clone(); unknown.patched = None;
+                if let Some(slot) = rows.iter_mut().find(|row| row.label == old.label && row.path.is_none()) { *slot = unknown; }
+                else { rows.push(unknown); }
+            }
+        }
+    }
+    rows
+}
+
+#[cfg(target_os = "macos")]
+fn mac_idle_observation(ctx: &mut Ctx) -> bool {
+    let rows = mac_install_rows(&ctx.settings, ctx.last.as_ref());
+    let old = ctx.last.as_ref().map(|status| status.installs.as_slice()).unwrap_or(&[]);
+    let mut changed = rows.len() != old.len() || rows.iter().zip(old).any(|(left, right)|
+        left.path != right.path || left.label != right.label || left.manual != right.manual);
+    for row in &rows {
+        let Some(path) = &row.path else { continue; };
+        let visible = old.iter().find(|prior| prior.path.as_ref() == Some(path)).and_then(|prior| prior.patched);
+        let observation = ctx.patched_seen.entry(path.clone()).or_default();
+        match patch_binary::mac_target_snapshot(path) {
+            Ok(snapshot) if observation.settled.as_ref().is_some_and(|(old, _)| old == &snapshot) => {},
+            Ok(snapshot) if observation.pending.as_ref() == Some(&snapshot) => {
+                if !observation.pending_ready { observation.pending_ready = true; changed = true; }
+            },
+            Ok(snapshot) => {
+                observation.settled = None;
+                observation.pending = Some(snapshot);
+                observation.pending_ready = false;
+                if visible.is_some() { changed = true; }
+            },
+            Err(_) => {
+                *observation = MacObservation::default();
+                if visible.is_some() { changed = true; }
+            },
+        }
+    }
+    ctx.patched_seen.retain(|path, _| rows.iter().any(|row| row.path.as_ref() == Some(path)));
+    changed
+}
+
+fn collect_installs(
+    settings: &Settings,
+    deep: bool,
+    #[cfg(not(target_os = "macos"))] seen: &HashMap<PathBuf, bool>,
+    #[cfg(target_os = "macos")] seen: &mut HashMap<PathBuf, MacObservation>,
+    #[cfg(target_os = "macos")] previous: Option<&Status>,
+) -> Vec<InstallRow> {
+    #[cfg(not(target_os = "macos"))]
+    let mut rows = install_rows(settings);
+    #[cfg(target_os = "macos")]
+    let mut rows = mac_install_rows(settings, previous);
     for row in &mut rows {
         let Some(path) = row.path.clone() else {
             continue;
         };
+        #[cfg(target_os = "macos")]
+        { row.patched = mac_observe_install(&path, deep, seen.entry(path.clone()).or_default()); }
+        #[cfg(not(target_os = "macos"))]
         if deep {
             let state = patch_binary::inspect_install(&path);
             row.patched = if state.is_empty() {
@@ -1962,7 +2147,7 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) -> Result<(), String> {
             // this does not depend on the bypass being wanted.
             if watchdog_allowed(is_admin())
                 && ctx.settings.auto_patch_wanted()
-                && !background::is_watchdog_enabled()
+                && !watchdog_checked()?
             {
                 set_watchdog_effect(ctx, true)?;
             }
@@ -1989,6 +2174,8 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) -> Result<(), String> {
             if on {
                 ctx.settings.patch_declined = false;
             }
+            #[cfg(target_os = "macos")]
+            if !on && !ctx.settings.save() { return Err("Настройки автопатча не сохранены; служба не изменена.".into()); }
             set_watchdog_effect(ctx, on)?;
         }
         (Cap::Dns, on) => {
@@ -2678,10 +2865,14 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
         else { ensure_route_carrier(ctx)?; }
     } else if !wanted.local_proxy && local_applied { disable_local_proxy_effect(ctx)?; }
     if cancellation.load(Ordering::SeqCst) { return Ok(()); }
-    let watchdog = background::is_watchdog_enabled();
-    if wanted.auto_patch != watchdog {
+    let watchdog = watchdog_checked()?;
+    #[cfg(target_os = "macos")]
+    let wanted_watchdog = wanted.auto_patch_wanted();
+    #[cfg(not(target_os = "macos"))]
+    let wanted_watchdog = wanted.auto_patch;
+    if wanted_watchdog != watchdog {
         if cfg!(windows) && !is_admin() { ctx.log(Level::Warn, "Для применения автопатча нужны права администратора."); }
-        else { set_watchdog_effect(ctx, wanted.auto_patch)?; }
+        else { set_watchdog_effect(ctx, wanted_watchdog)?; }
     }
     Ok(())
     }
@@ -2723,7 +2914,7 @@ fn enable_all(ctx: &mut Ctx) -> Result<(), String> {
     }
     // Whether or not the patch found anything to patch: auto-patch is what
     // patches the Antigravity installed after this click (D27).
-    if watchdog_allowed(admin) && !background::is_watchdog_enabled() {
+    if watchdog_allowed(admin) && !watchdog_checked()? {
         apply(ctx, Cap::Watchdog, true)?;
     }
     ctx.log(
@@ -2783,7 +2974,11 @@ fn settle_decline(ctx: &mut Ctx) {
     if !ctx.settings.decline_unrecorded {
         return;
     }
-    ctx.settings.patch_declined = !ctx.settings.client_patch && !background::is_watchdog_enabled();
+    let watchdog = match watchdog_checked() {
+        Ok(value) => value,
+        Err(error) => { ctx.log(Level::Err, format!("Состояние автопатча не получено: {error}")); return; }
+    };
+    ctx.settings.patch_declined = !ctx.settings.client_patch && !watchdog;
     ctx.settings.decline_unrecorded = false;
     ctx.settings.save();
 }
@@ -2867,11 +3062,18 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
         let mut patched = 0usize;
         let mut unknown = 0usize;
         let mut failed: Option<String> = None;
+        #[cfg(not(target_os = "macos"))]
+        let mut permission_denied = false;
         for (_, outcome) in crate::watchdog::patch_now_received(&inst, &ctx.native_cancel) {
             match outcome {
                 patch_binary::RepatchOutcome::Repatched(_) => patched += 1,
                 patch_binary::RepatchOutcome::AlreadyPatched => {}
                 patch_binary::RepatchOutcome::SignatureMissing => unknown += 1,
+                patch_binary::RepatchOutcome::PermissionDenied(e) => {
+                    #[cfg(not(target_os = "macos"))]
+                    { permission_denied = true; }
+                    failed = Some(e.to_string());
+                },
                 patch_binary::RepatchOutcome::Failed(e) => failed = Some(e),
             }
         }
@@ -2884,13 +3086,15 @@ fn patch_found(ctx: &mut Ctx, found: Vec<(&'static str, PathBuf)>) -> bool {
             );
         }
         if let Some(e) = failed {
-            ctx.log(
-                Level::Warn,
-                format!(
-                    "Автопатч: {} — не удалось записать ({}). Закройте Antigravity и нажмите «Включить всё».",
-                    label, e
-                ),
-            );
+            #[cfg(target_os = "macos")]
+            let message = format!("Автопатч: {} — операция отложена или не завершена ({}).", label, e);
+            #[cfg(not(target_os = "macos"))]
+            let message = if permission_denied {
+                format!("Автопатч: {} — отказано в записи ({}).", label, e)
+            } else {
+                format!("Автопатч: {} — не удалось записать ({}). Закройте Antigravity и нажмите «Включить всё».", label, e)
+            };
+            ctx.log(Level::Warn, message);
             break;
         } else if unknown > 0 && patched == 0 {
             // The watchdog's rule (I19): a build this patcher does not know is
@@ -3057,7 +3261,7 @@ fn disable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&Al
     }
     #[cfg(not(windows))]
     {
-        background::disable_watchdog();
+        stop_watchdog_checked()?;
         background::disable()?;
         let primary = revert_client_primary(ctx);
         let restoration = if ctx.settings.dns || routes_want_relay(&ctx.settings) { background::ensure_running() } else { Ok(()) };
@@ -3201,8 +3405,10 @@ fn set_watchdog_effect(ctx: &mut Ctx, on: bool) -> Result<(), String> {
     return background_roles_effect(ctx, ctx.settings.dns || routes_want_relay(&ctx.settings), ctx.settings.auto_patch_wanted());
     #[cfg(not(windows))]
     {
+    #[cfg(target_os = "macos")]
+    if on && !ctx.settings.save() { return Err("Настройки автопатча не сохранены; служба не запущена.".into()); }
     if !on {
-        background::disable_watchdog();
+        stop_watchdog_checked()?;
         ctx.log(Level::Ok, "Автовосстановление патча отключено.");
         return Ok(());
     }
@@ -3257,7 +3463,7 @@ fn enable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
         enable_local_proxy_effect(ctx)?;
     }
     #[cfg(not(windows))]
-    if ctx.settings.auto_patch_wanted() && !background::is_watchdog_enabled() {
+    if ctx.settings.auto_patch_wanted() && !watchdog_checked()? {
         set_watchdog_effect(ctx, true)?;
     }
     Ok(())
@@ -3319,10 +3525,13 @@ fn stop_relay_effect(ctx: &mut Ctx) -> Result<(), String> {
     return background_roles_effect(ctx, false, ctx.settings.auto_patch_wanted());
     #[cfg(not(windows))]
     {
-    let watchdog_enabled = background::is_watchdog_enabled();
+    let watchdog_enabled = watchdog_checked()?;
+    #[cfg(target_os = "macos")]
+    let restore_watchdog = watchdog_enabled;
+    #[cfg(not(target_os = "macos"))]
     let restore_watchdog = ctx.settings.auto_patch && watchdog_enabled;
     if restore_watchdog {
-        background::disable_watchdog();
+        stop_watchdog_checked()?;
         ctx.log(Level::Ok, "Автопатч временно остановлен перед отключением службы.");
     }
     background::disable().map_err(|error| format!("Отключение службы не завершено; следующие действия остановлены: {error}"))?;
@@ -3715,6 +3924,228 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_observation_reuses_stable_snapshot_and_rejects_unstable_scan() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let root = parent.join(format!("ag-mac-observation-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("agy");
+        let replacement = root.join("replacement");
+        std::fs::write(&target, b"ineligible").unwrap();
+        let mut observation = MacObservation::default();
+        let mut scans = 0;
+        assert_eq!(mac_observe_with(&root, true, &mut observation, |path| {
+            scans += 1; patch_binary::inspect_file(path)
+        }), Some(false));
+        assert_eq!(mac_observe_with(&root, false, &mut observation, |_| {
+            scans += 1; panic!("unchanged snapshot must not scan")
+        }), Some(false));
+        assert_eq!(scans, 1);
+        std::fs::write(&replacement, b"inexigible").unwrap();
+        std::fs::rename(&replacement, &target).unwrap();
+        assert_eq!(mac_observe_with(&root, false, &mut observation, |_| panic!("first change must settle")), None);
+        observation.pending_ready = true;
+        assert_eq!(mac_observe_with(&root, false, &mut observation, |path| {
+            scans += 1; patch_binary::inspect_file(path)
+        }), Some(true));
+        assert_eq!(scans, 2);
+        std::fs::write(&replacement, b"ineligible").unwrap();
+        assert_eq!(mac_observe_with(&root, true, &mut observation, |path| {
+            std::fs::rename(&replacement, &target).unwrap();
+            patch_binary::inspect_file(path)
+        }), None, "replacement during structural read must stay unknown");
+        assert!(observation.settled.is_none());
+        assert_eq!(mac_observe_with(&root, true, &mut observation, |_| {
+            patch_binary::FileState::Unreadable("synthetic denial".into())
+        }), None);
+        assert!(observation.settled.is_some(), "stable unreadable result may be cached as unknown");
+        assert_eq!(mac_observe_with(&root, false, &mut observation, |_| panic!("cached unknown must not rescan")), None);
+        let stage = patch_binary::temp_path(&target); std::fs::create_dir(&stage).unwrap();
+        assert_eq!(mac_observe_install(&root, true, &mut observation), None);
+        std::fs::remove_dir(stage).unwrap();
+        std::fs::remove_file(target).unwrap(); std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires an unprivileged native user and a private temporary fixture"]
+    fn mac_observation_unreadable_target_stays_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Err(error) = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o600)) {
+                    eprintln!("owned fixture permission restoration: {error}");
+                }
+            }
+        }
+        assert_ne!(unsafe { libc::geteuid() }, 0);
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!("ag-mac-unreadable-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("agy"); std::fs::write(&target, b"ineligible").unwrap();
+        let restore = Restore(target.clone());
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0)).unwrap();
+        let mut observation = MacObservation::default();
+        assert_eq!(mac_observe_install(&root, true, &mut observation), None);
+        assert!(observation.settled.as_ref().is_some_and(|(_, result)| result.is_none()));
+        drop(restore);
+        std::fs::remove_file(target).unwrap(); std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires AG_MAC_CACHE_TEST_ROOT and XDG_DATA_HOME inside that private root"]
+    fn mac_core_idle_system_publishes_external_replacement_without_deep_refresh() {
+        use std::fs::{self, FileTimes};
+        let parent = PathBuf::from(std::env::var_os("AG_MAC_CACHE_TEST_ROOT").expect("private fixture root")).canonicalize().unwrap();
+        let xdg = PathBuf::from(std::env::var_os("XDG_DATA_HOME").expect("private XDG")).canonicalize().unwrap();
+        assert!(xdg.starts_with(&parent), "XDG must be inside the admitted private root");
+        let root = parent.join(format!("ag-mac-core-observation-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let target = root.join("agy"); let replacement = root.join("replacement");
+        fs::write(&target, b"ineligible").unwrap(); fs::write(&replacement, b"inexigible").unwrap();
+        let timestamp = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        for path in [&target, &replacement] {
+            fs::OpenOptions::new().write(true).open(path).unwrap()
+                .set_times(FileTimes::new().set_modified(timestamp)).unwrap();
+        }
+        let (events, received) = mpsc::channel();
+        let mut settings = Settings::default(); settings.manual_paths = vec![root.clone()];
+        let mut ctx = Ctx {
+            events, wake: Arc::new(Mutex::new(Box::new(|| {}))), settings,
+            wsl: crate::wsl_controller::WslController::default(),
+            native_apply_pending: Arc::new(AtomicBool::new(false)), native_cancel: Arc::new(AtomicBool::new(false)),
+            lifetime: Arc::new(GuiLifetime::default()), vpn_job: None, vpn_unsettled: false,
+            startup: Startup::Explicit, proxy_var_carried: None, proxy_var_retryable: false,
+            patched_seen: HashMap::new(), vpn: Some(VpnSeen::None), relay_egress: None,
+            last: None, dns_probe: (false, false), carrier_set_proxy: false,
+        };
+        for row in install_rows(&ctx.settings) {
+            if let Some(path) = row.path {
+                if path != root {
+                    if let Ok(snapshot) = patch_binary::mac_target_snapshot(&path) {
+                        ctx.patched_seen.entry(path).or_default().settled = Some((snapshot, None));
+                    }
+                }
+            }
+        }
+        assert_eq!(mac_observe_install(&root, true, ctx.patched_seen.entry(root.clone()).or_default()), Some(false));
+        ctx.last = Some(read_status(&mut ctx, false));
+        let selected = |status: &Status| status.installs.iter().find(|row| row.path.as_ref() == Some(&root)).unwrap().patched;
+        assert_eq!(selected(ctx.last.as_ref().unwrap()), Some(false));
+        assert!(!mac_idle_observation(&mut ctx));
+        assert!(received.try_recv().is_err());
+        fs::rename(&replacement, &target).unwrap();
+        assert!(mac_idle_observation(&mut ctx));
+        push_mac_idle_status(&mut ctx);
+        match received.recv().unwrap() { Event::Status(status) => assert_eq!(selected(&status), None), _ => panic!("unexpected event") }
+        assert!(mac_idle_observation(&mut ctx));
+        push_mac_idle_status(&mut ctx);
+        match received.recv().unwrap() { Event::Status(status) => assert_eq!(selected(&status), Some(true)), _ => panic!("unexpected event") }
+        assert!(!mac_idle_observation(&mut ctx));
+        assert!(received.try_recv().is_err());
+        let stage = patch_binary::temp_path(&target); fs::create_dir(&stage).unwrap();
+        assert!(mac_idle_observation(&mut ctx));
+        push_mac_idle_status(&mut ctx);
+        match received.recv().unwrap() { Event::Status(status) => assert_eq!(selected(&status), None), _ => panic!("unexpected event") }
+        assert!(!mac_idle_observation(&mut ctx));
+        assert!(!mac_idle_observation(&mut ctx));
+        assert!(received.try_recv().is_err(), "unchanged unknown state must not flood events");
+        fs::remove_dir(stage).unwrap();
+        fs::remove_file(&target).unwrap(); fs::remove_dir(&root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires an unprivileged user, private AG_MAC_CACHE_TEST_ROOT and XDG_DATA_HOME inside it"]
+    fn mac_core_keeps_unresolved_roots_unknown_until_absence_is_proved() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Err(error) = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)) {
+                    eprintln!("owned fixture permission restoration: {error}");
+                }
+            }
+        }
+        fn prime(ctx: &mut Ctx, lost: &Path, steady: &Path) {
+            ctx.settings.manual_paths = vec![lost.to_path_buf(), steady.to_path_buf()];
+            ctx.patched_seen.clear(); ctx.last = None;
+            let status = read_status(ctx, true);
+            assert_eq!(status.client_patch, State::On);
+            assert_eq!(status.installs.iter().find(|row| row.path.as_deref() == Some(lost)).unwrap().patched, Some(true));
+            assert_eq!(status.installs.iter().find(|row| row.path.as_deref() == Some(steady)).unwrap().patched, Some(true));
+            ctx.last = Some(status);
+            ctx.last.as_mut().unwrap().installs.iter_mut().find(|row| row.path.as_deref() == Some(lost)).unwrap().manual = false;
+            ctx.settings.manual_paths = vec![steady.to_path_buf()];
+        }
+        fn expect_unknown(ctx: &mut Ctx, events: &Receiver<Event>, lost: &Path, steady: &Path) {
+            assert!(mac_idle_observation(ctx));
+            push_mac_idle_status(ctx);
+            let status = match events.recv().unwrap() { Event::Status(status) => status, _ => panic!("unexpected event") };
+            assert_eq!(status.installs.iter().find(|row| row.path.as_deref() == Some(lost)).unwrap().patched, None);
+            assert_eq!(status.installs.iter().find(|row| row.path.as_deref() == Some(steady)).unwrap().patched, Some(true));
+            assert_ne!(status.client_patch, State::On, "unknown root must block an all-patched aggregate");
+            assert!(!mac_idle_observation(ctx));
+            assert!(events.try_recv().is_err(), "unchanged unknown must not flood events");
+        }
+        assert_ne!(unsafe { libc::geteuid() }, 0);
+        let parent = PathBuf::from(std::env::var_os("AG_MAC_CACHE_TEST_ROOT").expect("private fixture root")).canonicalize().unwrap();
+        let xdg = PathBuf::from(std::env::var_os("XDG_DATA_HOME").expect("private XDG")).canonicalize().unwrap();
+        assert!(xdg.starts_with(&parent), "XDG must be inside the admitted private root");
+        let base = parent.join(format!("ag-mac-unresolved-roots-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        let real = base.join("real"); let steady = base.join("steady");
+        std::fs::create_dir(&real).unwrap(); std::fs::create_dir(&steady).unwrap();
+        std::fs::write(steady.join("agy"), b"inexigible").unwrap();
+        let actual = real.join("lost"); std::fs::create_dir(&actual).unwrap();
+        std::fs::write(actual.join("agy"), b"inexigible").unwrap();
+        let link = base.join("link"); symlink(&real, &link).unwrap();
+        let through = link.join("lost");
+        let (events, received) = mpsc::channel();
+        let mut ctx = Ctx {
+            events, wake: Arc::new(Mutex::new(Box::new(|| {}))), settings: Settings::default(),
+            wsl: crate::wsl_controller::WslController::default(),
+            native_apply_pending: Arc::new(AtomicBool::new(false)), native_cancel: Arc::new(AtomicBool::new(false)),
+            lifetime: Arc::new(GuiLifetime::default()), vpn_job: None, vpn_unsettled: false,
+            startup: Startup::Explicit, proxy_var_carried: None, proxy_var_retryable: false,
+            patched_seen: HashMap::new(), vpn: Some(VpnSeen::None), relay_egress: None,
+            last: None, dns_probe: (false, false), carrier_set_proxy: false,
+        };
+        prime(&mut ctx, &through, &steady);
+        let saved = real.join("saved"); std::fs::rename(&actual, &saved).unwrap();
+        symlink(real.join("missing"), &actual).unwrap();
+        expect_unknown(&mut ctx, &received, &through, &steady);
+        std::fs::remove_file(&actual).unwrap(); std::fs::rename(&saved, &actual).unwrap();
+
+        prime(&mut ctx, &through, &steady);
+        std::fs::remove_file(&link).unwrap(); symlink(base.join("missing-parent"), &link).unwrap();
+        expect_unknown(&mut ctx, &received, &through, &steady);
+        std::fs::remove_file(&link).unwrap(); symlink(&real, &link).unwrap();
+
+        prime(&mut ctx, &actual, &steady);
+        std::fs::rename(&actual, &saved).unwrap();
+        assert!(mac_idle_observation(&mut ctx)); push_mac_idle_status(&mut ctx);
+        let status = match received.recv().unwrap() { Event::Status(status) => status, _ => panic!("unexpected event") };
+        assert!(status.installs.iter().all(|row| row.path.as_ref() != Some(&actual)), "genuine absence may be removed");
+        assert_eq!(status.client_patch, State::On);
+        std::fs::rename(&saved, &actual).unwrap();
+
+        let denied = base.join("denied"); std::fs::create_dir(&denied).unwrap();
+        let denied_root = denied.join("lost"); std::fs::create_dir(&denied_root).unwrap();
+        std::fs::write(denied_root.join("agy"), b"inexigible").unwrap();
+        prime(&mut ctx, &denied_root, &steady);
+        let restore = Restore(denied.clone());
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
+        expect_unknown(&mut ctx, &received, &denied_root, &steady);
+        drop(restore);
+        std::fs::remove_file(denied_root.join("agy")).unwrap(); std::fs::remove_dir(&denied_root).unwrap(); std::fs::remove_dir(&denied).unwrap();
+        std::fs::remove_file(&link).unwrap(); std::fs::remove_file(actual.join("agy")).unwrap();
+        std::fs::remove_dir(&actual).unwrap(); std::fs::remove_dir(&real).unwrap();
+        std::fs::remove_file(steady.join("agy")).unwrap(); std::fs::remove_dir(&steady).unwrap(); std::fs::remove_dir(&base).unwrap();
+    }
 
     #[test]
     fn client_undo_keeps_primary_and_required_restoration_failures() {

@@ -42,7 +42,7 @@ use crate::utils::mask_path;
 /// Cheap to run, because a real read only happens when a file's size or mtime
 /// actually changes. Two seconds is far inside the window an update leaves
 /// before the app talks to CloudCode again.
-const POLL: Duration = Duration::from_secs(2);
+pub(crate) const POLL: Duration = Duration::from_secs(2);
 
 /// Re-scan the standard install locations (and the user's own paths) this
 /// often, in polls: 5 x 2 s = 10 s. Uses only filesystem checks - never the
@@ -57,13 +57,15 @@ const REDISCOVER_EVERY: u32 = 5;
 
 const LOG_LIMIT_BYTES: u64 = 64 * 1024;
 
-/// Per-file bookkeeping. `handled` is the (len, mtime) we last acted on;
+/// Per-file bookkeeping. `handled` is the file stamp we last acted on;
+/// macOS includes identity and access metadata as well as size and time.
 /// `pending` is a change we have seen once and are waiting to see hold still,
 /// so we never read a file mid-write.
 #[derive(Default, Clone)]
 struct FileState {
-    handled: Option<(u64, SystemTime)>,
-    pending: Option<(u64, SystemTime)>,
+    permission_hold: Option<patch_binary::NativePermissionDenied>,
+    handled: Option<FileStamp>,
+    pending: Option<FileStamp>,
     /// How many times the patch has been deferred *for this exact file shape*
     /// because it was in use, and which shape that was.
     ///
@@ -72,7 +74,17 @@ struct FileState {
     /// and a counter reset there is a counter that never reaches its limit. That
     /// is a `taskkill` every four seconds, for ever.
     blocked: u32,
-    blocked_for: Option<(u64, SystemTime)>,
+    blocked_for: Option<FileStamp>,
+}
+
+#[cfg(target_os = "macos")]
+type FileStamp = patch_binary::MacFileStamp;
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    size: u64,
+    modified: SystemTime,
 }
 
 /// How many times a settled-but-locked target is worth closing the app for.
@@ -88,21 +100,25 @@ const MAX_LAUNCH_HOLDS: u32 = 3;
 /// abort on panic), so the loop below only ever touches fallible operations
 /// through `Option`/`Result` - never `unwrap` on external data.
 pub fn start() {
-    thread::spawn(run);
+    thread::spawn(|| { let _ = run(); });
 }
 
 /// Runs the watcher on the current thread, forever. This is the standalone
 /// `--watchdog` task's entry point: it has no relay loop to keep it alive, so it
 /// *is* the loop. Same body as `start`'s thread, no network of any kind.
-pub fn run_forever() {
-    run();
+pub fn run_forever() -> Result<(), String> {
+    run()
 }
 
-fn run() {
-    log("start");
+fn run() -> Result<(), String> {
+    try_log("start")?;
     let mut states: HashMap<PathBuf, FileState> = HashMap::new();
+    #[cfg(not(target_os = "macos"))]
     let mut installs = discover();
+    #[cfg(target_os = "macos")]
+    let mut installs = Vec::new();
     let mut cycles: u32 = 0;
+    #[cfg(not(target_os = "macos"))]
     let mut listener = ListenerGuard::default();
     let mut updaters = updater_dirs();
     let mut fast_until: Option<Instant> = None;
@@ -111,6 +127,11 @@ fn run() {
     let mut vendor_states: HashMap<PathBuf, VendorWatchState> = HashMap::new();
 
     loop {
+        #[cfg(target_os = "macos")]
+        let settings = match crate::settings::watchdog_snapshot() {
+            Ok(settings) => settings,
+            Err(error) => { try_log(&error)?; thread::sleep(POLL); continue; }
+        };
         // An update being installed is the one moment a poll every two seconds
         // is too slow: the installer starts the new app the instant it has
         // written the files, and the app starts its Language Server at once.
@@ -123,15 +144,22 @@ fn run() {
         if fast {
             fast_polls = fast_polls.wrapping_add(1);
             if fast_polls % FAST_REDISCOVER_EVERY == 0 {
-                installs = discover();
+                #[cfg(not(target_os = "macos"))]
+                { installs = discover(); }
+                #[cfg(target_os = "macos")]
+                { installs = discover_with_manual(&settings.manual_paths); }
                 updaters = updater_dirs();
             }
-            if crate::settings::auto_patch_wanted() {
+            #[cfg(not(target_os = "macos"))]
+            let wanted = crate::settings::auto_patch_wanted();
+            #[cfg(target_os = "macos")]
+            let wanted = settings.auto_patch_wanted();
+            if wanted {
                 #[cfg(windows)]
                 inspect_vendor_updates(&installs, &mut vendor_states);
                 for inst in &installs {
-                    for target in targets(inst) {
-                        inspect(&target, states.entry(target.clone()).or_default());
+                    for target in automatic_targets(inst) {
+                        inspect(&target, states.entry(target.clone()).or_default(), #[cfg(target_os = "macos")] inst)?;
                     }
                 }
             }
@@ -139,12 +167,16 @@ fn run() {
             continue;
         }
         if cycles % REDISCOVER_EVERY == 0 {
-            installs = discover();
+            #[cfg(not(target_os = "macos"))]
+            { installs = discover(); }
+            #[cfg(target_os = "macos")]
+            { installs = discover_with_manual(&settings.manual_paths); }
             updaters = updater_dirs();
         }
         // Not on the first poll: at logon this task and the relay's start
         // together, and a miss before the relay has bound would start the count
         // early - the log says ninety seconds and it should mean it.
+        #[cfg(not(target_os = "macos"))]
         if cycles > 0 && cycles % LISTENER_CHECK_EVERY == 0 {
             listener.check();
         }
@@ -159,12 +191,16 @@ fn run() {
         // update and put the patch straight back (G38). Not `client_patch`
         // either - that is false on every machine that has not patched *yet*,
         // which is the fresh install this is also for (D27).
-        if crate::settings::auto_patch_wanted() {
+        #[cfg(not(target_os = "macos"))]
+        let wanted = crate::settings::auto_patch_wanted();
+        #[cfg(target_os = "macos")]
+        let wanted = settings.auto_patch_wanted();
+        if wanted {
             #[cfg(windows)]
             inspect_vendor_updates(&installs, &mut vendor_states);
             for inst in &installs {
-                for target in targets(inst) {
-                    inspect(&target, states.entry(target.clone()).or_default());
+                for target in automatic_targets(inst) {
+                    inspect(&target, states.entry(target.clone()).or_default(), #[cfg(target_os = "macos")] inst)?;
                 }
             }
         }
@@ -176,13 +212,13 @@ fn run() {
 #[cfg(windows)]
 #[derive(Default)]
 struct VendorWatchState {
-    pending: Option<(u64, SystemTime)>,
-    handled: Option<(u64, SystemTime)>,
+    pending: Option<FileStamp>,
+    handled: Option<FileStamp>,
     retry_after: Option<Instant>,
 }
 
 #[cfg(windows)]
-fn vendor_observation_ready(state: &mut VendorWatchState, current: (u64, SystemTime), now: Instant) -> bool {
+fn vendor_observation_ready(state: &mut VendorWatchState, current: FileStamp, now: Instant) -> bool {
     if state.handled == Some(current) || state.retry_after.is_some_and(|until| now < until) { return false; }
     if state.pending != Some(current) { state.pending = Some(current); return false; }
     state.pending = None;
@@ -328,17 +364,22 @@ impl ListenerGuard {
 }
 
 /// One file, one poll.
-fn inspect(target: &Path, st: &mut FileState) {
+fn inspect(target: &Path, st: &mut FileState, #[cfg(target_os = "macos")] install: &Path) -> Result<(), String> {
+    inspect_with(target, st, |path| repatch(path, #[cfg(target_os = "macos")] install))
+}
+
+fn inspect_with(target: &Path, st: &mut FileState, apply: impl FnOnce(&Path) -> RepatchOutcome) -> Result<(), String> {
+    if st.permission_hold.is_some() { return Ok(()); }
     let Some(cur) = stat(target) else {
         // Gone for the moment - an update may be swapping it. Try again next
         // poll; do not clear what we knew.
-        return;
+        return Ok(());
     };
     if st.handled == Some(cur) {
-        return;
+        return Ok(());
     }
     // Wait for the file to settle: act only once we have seen the same
-    // (len, mtime) on two consecutive polls, so a file still being written is
+    // stamp on two consecutive polls, so a file still being written is
     // never read or patched.
     if st.pending != Some(cur) {
         st.pending = Some(cur);
@@ -349,33 +390,42 @@ fn inspect(target: &Path, st: &mut FileState) {
             st.blocked = 0;
             st.blocked_for = None;
         }
-        return;
+        return Ok(());
     }
     st.pending = None;
 
-    match repatch(target) {
+    match apply(target) {
         RepatchOutcome::AlreadyPatched => {
             // Our own past write, or an install menu 1 just handled. Record the
             // current shape and stay quiet.
-            st.handled = stat(target).or(Some(cur));
+            #[cfg(target_os = "macos")]
+            { st.handled = Some(cur); }
+            #[cfg(not(target_os = "macos"))]
+            { st.handled = stat(target).or(Some(cur)); }
         }
         RepatchOutcome::Repatched(n) => {
-            log(&format!("patched: {} ({})", show(target), n));
+            try_log(&format!("patched: {} ({})", show(target), n))?;
             st.blocked = 0;
             st.blocked_for = None;
-            // The rename is same-length, so len is unchanged and only mtime
-            // moved; re-stat so our own write is not seen as a new change.
-            st.handled = stat(target).or(Some(cur));
+            // A later path observation may already be another updater's file.
+            #[cfg(target_os = "macos")]
+            { st.handled = Some(cur); }
+            #[cfg(not(target_os = "macos"))]
+            { st.handled = stat(target).or(Some(cur)); }
         }
         RepatchOutcome::SignatureMissing => {
-            log(&format!(
+            try_log(&format!(
                 "signature gone, left untouched so Antigravity shows its error \
                  (update the unlocker): {}",
                 show(target)
-            ));
+            ))?;
             // Do not look at this version again; only a further change (a newer
             // build that we might understand) is worth another attempt.
             st.handled = Some(cur);
+        }
+        RepatchOutcome::PermissionDenied(error) => {
+            st.permission_hold = Some(error.clone());
+            try_log(&format!("permission denied; automatic retry held for {}: {}", show(target), error))?;
         }
         RepatchOutcome::Failed(e) => {
             // The file is settled but the write did not land. Usually that is
@@ -387,7 +437,7 @@ fn inspect(target: &Path, st: &mut FileState) {
             // The *launch* is what gets undone, never the update — a file still
             // being written never settles, so this branch is not reached while
             // one is in progress.
-            log(&format!("deferred, will retry: {} - {}", show(target), e));
+            try_log(&format!("deferred, will retry: {} - {}", show(target), e))?;
 
             // Only a lock. A permission error, a full disk or a read failure is
             // not something closing Antigravity can fix, and `write_binary` has
@@ -409,51 +459,55 @@ fn inspect(target: &Path, st: &mut FileState) {
             let is_native = target.extension().and_then(|e| e.to_str()) != Some("js");
 
             if !is_native || !looks_locked {
-                return;
+                return Ok(());
             }
             #[cfg(windows)]
             {
-                log("файл оставлен без изменений: требуется обычное закрытие приложения или общий владелец WSL");
-                return;
+                try_log("файл оставлен без изменений: требуется обычное закрытие приложения или общий владелец WSL")?;
+                return Ok(());
             }
             #[cfg(target_os = "macos")]
             {
-                log("файл оставлен без изменений: закройте приложение обычным способом");
-                return;
+                try_log("файл оставлен без изменений: закройте приложение обычным способом")?;
+                return Ok(());
             }
             #[cfg(all(not(windows), not(target_os = "macos")))]
             {
             if st.blocked >= MAX_LAUNCH_HOLDS {
                 if st.blocked == MAX_LAUNCH_HOLDS {
                     st.blocked += 1;
-                    log(&format!(
+                    try_log(&format!(
                         "файл занят не Antigravity - оставляю как есть: {}",
                         show(target)
-                    ));
+                    ))?;
                 }
-                return;
+                return Ok(());
             }
             st.blocked += 1;
             st.blocked_for = Some(cur);
-            log(&format!(
+            try_log(&format!(
                 "закрываю запущенный Antigravity, чтобы применить патч ({}/{}): {}",
                 st.blocked,
                 MAX_LAUNCH_HOLDS,
                 show(target)
-            ));
+            ))?;
             patch_binary::kill_holder(target);
             }
         }
     }
+    Ok(())
 }
 
 /// Picks the right patch for a target by kind: the IDE's `main.js` gets the JS
 /// patch, everything else is a native binary.
-fn repatch(target: &Path) -> RepatchOutcome {
+fn repatch(target: &Path, #[cfg(target_os = "macos")] install: &Path) -> RepatchOutcome {
     if target.extension().and_then(|e| e.to_str()) == Some("js") {
         patch_ide::repatch_ide_js(target)
     } else {
-        patch_binary::repatch_if_needed(target)
+        #[cfg(target_os = "macos")]
+        { patch_binary::repatch_for_install(install, target) }
+        #[cfg(not(target_os = "macos"))]
+        { patch_binary::repatch_if_needed(target) }
     }
 }
 
@@ -468,6 +522,13 @@ fn targets(inst: &Path) -> Vec<PathBuf> {
         list.push(ide_js);
     }
     list
+}
+
+fn automatic_targets(inst: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    { patch_binary::binary_targets(inst) }
+    #[cfg(not(target_os = "macos"))]
+    { targets(inst) }
 }
 
 /// Patches every file of one install now, the way the watcher does once a file
@@ -495,7 +556,7 @@ fn patch_now_batch(inst: &Path, cancelled: Option<&std::sync::atomic::AtomicBool
                 received.push((target, RepatchOutcome::Failed("Патч отменён перед следующим файлом.".into())));
                 break;
             }
-            let outcome = repatch(&target);
+            let outcome = repatch(&target, #[cfg(target_os = "macos")] inst);
             if let RepatchOutcome::Repatched(n) = &outcome {
                 log(&format!(
                     "patched from the window: {} ({})",
@@ -503,7 +564,7 @@ fn patch_now_batch(inst: &Path, cancelled: Option<&std::sync::atomic::AtomicBool
                     n
                 ));
             }
-            let failed = matches!(outcome, RepatchOutcome::Failed(_));
+            let failed = matches!(outcome, RepatchOutcome::Failed(_) | RepatchOutcome::PermissionDenied(_));
             received.push((target, outcome));
             if cancelled.is_some() && failed { break; }
     }
@@ -513,9 +574,13 @@ fn patch_now_batch(inst: &Path, cancelled: Option<&std::sync::atomic::AtomicBool
 /// The standard locations plus every path the user pointed the window at: an
 /// install they had to find by hand is exactly the one no scan knows about.
 fn discover() -> Vec<PathBuf> {
+    discover_with_manual(&crate::settings::manual_paths())
+}
+
+fn discover_with_manual(manual_paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut installs = crate::discover_installs_fast();
-    for manual in crate::settings::manual_paths() {
-        if let Some(root) = crate::resolve_install_root(&manual) {
+    for manual in manual_paths {
+        if let Some(root) = crate::resolve_install_root(manual) {
             if !installs.contains(&root) {
                 installs.push(root);
             }
@@ -528,9 +593,14 @@ fn discover() -> Vec<PathBuf> {
     installs
 }
 
-fn stat(p: &Path) -> Option<(u64, SystemTime)> {
+fn stat(p: &Path) -> Option<FileStamp> {
+    #[cfg(target_os = "macos")]
+    { patch_binary::mac_file_stamp(p).ok() }
+    #[cfg(not(target_os = "macos"))]
+    {
     let m = fs::metadata(p).ok()?;
-    Some((m.len(), m.modified().ok()?))
+    Some(FileStamp { size: m.len(), modified: m.modified().ok()? })
+    }
 }
 
 fn show(p: &Path) -> String {
@@ -549,6 +619,14 @@ fn log(line: &str) {
     if cfg!(test) {
         return;
     }
+    #[cfg(target_os = "macos")]
+    {
+        let stamp = crate::utils::local_clock().map_or_else(String::new, |c| c.hms());
+        eprintln!("{} {}", stamp, line);
+        return;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     let dir = dns_forwarder::log_dir();
     let path = dir.join("watchdog.log");
     fs::create_dir_all(&dir).ok();
@@ -559,19 +637,50 @@ fn log(line: &str) {
         let stamp = crate::utils::local_clock().map_or_else(String::new, |c| c.hms());
         writeln!(f, "{} {}", stamp, line).ok();
     }
+    }
+}
+
+fn try_log(line: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        #[cfg(test)]
+        if std::env::var_os("AG_MAC_PERMISSION_TEST_LOG").as_deref() != Some(std::ffi::OsStr::new("1")) { return Ok(()); }
+        let stamp = crate::utils::local_clock().map_or_else(String::new, |c| c.hms());
+        writeln!(std::io::stderr().lock(), "{} {}", stamp, line)
+            .map_err(|error| format!("запись журнала автопатча: {error}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    { log(line); Ok(()) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn stamp(size: u64) -> FileStamp {
+        FileStamp { size, modified: SystemTime::UNIX_EPOCH,
+            #[cfg(target_os = "macos")]
+            identity: (0, 0),
+            #[cfg(target_os = "macos")]
+            mode: u32::from(libc::S_IFREG),
+            #[cfg(target_os = "macos")]
+            uid: 0,
+            #[cfg(target_os = "macos")]
+            gid: 0,
+            #[cfg(target_os = "macos")]
+            links: 1,
+            #[cfg(target_os = "macos")]
+            changed: (0, 0),
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn vendor_archive_observation_requires_settled_shape_and_retries_holds() {
         let mut state = VendorWatchState::default();
         let now = Instant::now();
-        let first = (10, SystemTime::UNIX_EPOCH);
-        let changed = (11, SystemTime::UNIX_EPOCH);
+        let first = stamp(10);
+        let changed = stamp(11);
         assert!(!vendor_observation_ready(&mut state, first, now));
         assert!(!vendor_observation_ready(&mut state, changed, now));
         assert!(vendor_observation_ready(&mut state, changed, now));
@@ -588,7 +697,7 @@ mod tests {
     #[test]
     fn a_change_is_not_acted_on_until_it_holds_still() {
         let mut st = FileState::default();
-        let a = (100u64, SystemTime::UNIX_EPOCH);
+        let a = stamp(100);
 
         // First sighting: recorded as pending, not yet handled.
         assert!(st.handled.is_none());
@@ -609,7 +718,7 @@ mod tests {
     fn a_file_mid_write_never_settles() {
         let mut st = FileState::default();
         for len in [10u64, 250, 9000] {
-            let cur = (len, SystemTime::UNIX_EPOCH);
+            let cur = stamp(len);
             let would_act = st.pending == Some(cur);
             assert!(!would_act, "a growing file must not be acted on");
             st.pending = Some(cur);
@@ -621,10 +730,140 @@ mod tests {
     #[test]
     fn a_handled_version_is_left_alone() {
         let mut st = FileState::default();
-        let cur = (150, SystemTime::UNIX_EPOCH);
+        let cur = stamp(150);
         st.handled = Some(cur);
         assert_eq!(st.handled, Some(cur));
         // handled == cur → inspect returns before doing anything.
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn replacement_inode_is_a_new_observation_even_with_the_same_time_and_size() {
+        let first = stamp(150);
+        let mut replacement = first;
+        replacement.identity.1 += 1;
+        assert_ne!(first, replacement);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn replacement_after_both_success_outcomes_is_inspected_on_later_polls() {
+        use std::fs::FileTimes;
+        let root = fs::canonicalize(std::env::temp_dir()).unwrap()
+            .join(format!("ag-mac-handled-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        for repatched in [false, true] {
+            let target = root.join(if repatched { "repatched" } else { "already" });
+            let update = root.join(if repatched { "repatched-update" } else { "already-update" });
+            fs::write(&target, if repatched { b"ineligible" } else { b"inexigible" }).unwrap();
+            fs::write(&update, b"ineligible").unwrap();
+            let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+            for path in [&target, &update] {
+                fs::OpenOptions::new().write(true).open(path).unwrap()
+                    .set_times(FileTimes::new().set_modified(modified)).unwrap();
+            }
+            let prior = stat(&target).unwrap();
+            let mut state = FileState::default();
+            inspect_with(&target, &mut state, |_| panic!("first poll must only settle")).unwrap();
+            inspect_with(&target, &mut state, |_| {
+                fs::rename(&update, &target).unwrap();
+                if repatched { RepatchOutcome::Repatched(1) } else { RepatchOutcome::AlreadyPatched }
+            }).unwrap();
+            let replacement = stat(&target).unwrap();
+            assert_eq!((prior.size, prior.modified), (replacement.size, replacement.modified));
+            assert_ne!(prior.identity, replacement.identity);
+            assert_eq!(state.handled, Some(prior));
+            inspect_with(&target, &mut state, |_| panic!("replacement must first settle")).unwrap();
+            let mut inspected = false;
+            inspect_with(&target, &mut state, |_| { inspected = true; RepatchOutcome::AlreadyPatched }).unwrap();
+            assert!(inspected, "replacement must be inspected");
+            fs::remove_file(target).unwrap();
+        }
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires private AG_R3_FIXTURE_ROOT containing the owned compiled agy fixture"]
+    fn mac_native_permission_hold_survives_replacement_and_other_targets_continue() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        struct Restore(Vec<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for dir in &self.0 {
+                    if let Err(error) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
+                        eprintln!("owned fixture permission restoration failed: {}: {error}", dir.display());
+                    }
+                }
+            }
+        }
+        assert_ne!(unsafe { libc::geteuid() }, 0, "fixture requires an unprivileged user");
+        assert_eq!(std::env::var_os("AG_MAC_PERMISSION_TEST_LOG").as_deref(), Some(std::ffi::OsStr::new("1")),
+            "capture native test stderr to receive the actual hold diagnostics");
+        let root = fs::canonicalize(PathBuf::from(std::env::var_os("AG_R3_FIXTURE_ROOT").expect("fixture root"))).unwrap();
+        let fixture = root.join("agy");
+        let owned = root.join("r3-permission-owned");
+        fs::create_dir(&owned).expect("vacant owned fixture directory");
+        let mut restore = Restore(Vec::new());
+        for additional in [false, true] {
+            let dir = owned.join(if additional { "additional" } else { "ordinary" });
+            fs::create_dir(&dir).unwrap();
+            restore.0.push(dir.clone());
+            let target = dir.join("agy");
+            let replacement = owned.join(if additional { "additional-replacement" } else { "ordinary-replacement" });
+            fs::copy(&fixture, &target).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+            if additional {
+                let mut bytes = fs::read(&target).unwrap();
+                let (stock, patched) = patch_binary::field_signatures();
+                assert!(patch_binary::replace_all(&mut bytes, &stock, &patched) > 0);
+                assert!(patch_binary::count_occurrences(&bytes, &patch_binary::proxy_var_original()) > 0);
+                fs::write(&target, bytes).unwrap();
+            }
+            fs::copy(&target, &replacement).unwrap();
+            let original_inode = fs::metadata(&target).unwrap().ino();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+            let mut state = FileState::default(); let mut calls = 0usize;
+            inspect_with(&target, &mut state, |_| panic!("first poll only settles")).unwrap();
+            inspect_with(&target, &mut state, |path| {
+                calls += 1;
+                patch_binary::repatch_for_install(&dir, path)
+            }).unwrap();
+            let held = state.permission_hold.as_ref().expect("actual native mkdir permission denial");
+            assert_eq!(held.operation, "создание staging");
+            assert!(matches!(held.raw_os_error, Some(libc::EPERM | libc::EACCES)));
+            assert_eq!(held.kind, std::io::Error::from_raw_os_error(held.raw_os_error.unwrap()).kind());
+            assert_eq!(calls, 1);
+            assert!(!patch_binary::temp_path(&target).exists(), "denial must occur before staging");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::rename(&replacement, &target).unwrap();
+            assert_ne!(original_inode, fs::metadata(&target).unwrap().ino());
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+            for _ in 0..3 {
+                inspect_with(&target, &mut state, |_| { calls += 1; RepatchOutcome::AlreadyPatched }).unwrap();
+            }
+            assert_eq!(calls, 1, "inode replacement must not release the permission hold");
+            assert!(state.permission_hold.is_some());
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let independent = owned.join("independent"); fs::write(&independent, b"fixture").unwrap();
+        let mut independent_state = FileState::default(); let mut independent_calls = 0;
+        inspect_with(&independent, &mut independent_state, |_| panic!("first poll only settles")).unwrap();
+        inspect_with(&independent, &mut independent_state, |_| { independent_calls += 1; RepatchOutcome::SignatureMissing }).unwrap();
+        assert_eq!(independent_calls, 1);
+        assert!(independent_state.permission_hold.is_none());
+        assert!(independent_state.handled.is_some(), "unsupported remains distinct");
+        let transient = owned.join("transient"); fs::write(&transient, b"fixture").unwrap();
+        let mut transient_state = FileState::default(); let mut attempts = 0;
+        for _ in 0..4 {
+            inspect_with(&transient, &mut transient_state, |_| {
+                attempts += 1;
+                RepatchOutcome::Failed(if attempts == 1 { "Permission denied".into() } else { "busy".into() })
+            }).unwrap();
+        }
+        assert_eq!(attempts, 2, "generic strings and transient errors must remain retryable");
+        assert!(transient_state.permission_hold.is_none());
+        drop(restore);
     }
 
     /// The whole wiring on a real install layout: a reverted CLI binary is
@@ -650,7 +889,7 @@ mod tests {
         let mut st = FileState::default();
 
         // First poll: only notes the change, never touches the file.
-        inspect(&agy, &mut st);
+        inspect(&agy, &mut st, #[cfg(target_os = "macos")] &inst).unwrap();
         assert_eq!(
             fs::read(&agy).unwrap(),
             b"header..ineligible..tail",
@@ -658,14 +897,14 @@ mod tests {
         );
 
         // Second poll, same bytes: now it settles and re-patches.
-        inspect(&agy, &mut st);
+        inspect(&agy, &mut st, #[cfg(target_os = "macos")] &inst).unwrap();
         assert_eq!(fs::read(&agy).unwrap(), b"header..inexigible..tail");
         assert!(st.handled.is_some(), "the patched version is recorded");
 
         // Third poll: already patched, nothing changes and nothing is recorded
         // anew.
         let before = st.handled;
-        inspect(&agy, &mut st);
+        inspect(&agy, &mut st, #[cfg(target_os = "macos")] &inst).unwrap();
         assert_eq!(fs::read(&agy).unwrap(), b"header..inexigible..tail");
         assert_eq!(st.handled, before);
 
@@ -683,8 +922,8 @@ mod tests {
         fs::write(&agy, contents).unwrap();
 
         let mut st = FileState::default();
-        inspect(&agy, &mut st); // settle
-        inspect(&agy, &mut st); // act
+        inspect(&agy, &mut st, #[cfg(target_os = "macos")] &inst).unwrap(); // settle
+        inspect(&agy, &mut st, #[cfg(target_os = "macos")] &inst).unwrap(); // act
         assert_eq!(fs::read(&agy).unwrap(), contents, "must be left untouched");
         assert!(st.handled.is_some(), "and not re-attempted every poll");
 

@@ -6,8 +6,8 @@
 //! on because the user asked for it", which is what lets the app put a switch
 //! back where the user left it and re-apply after a reboot wiped something.
 //!
-//! Deliberately best-effort: a missing or corrupt file is a fresh `Settings`,
-//! never an error the user has to deal with.
+//! General consumers use the existing best-effort settings behavior. The
+//! persistent macOS watchdog separately requires readable, parsed intent.
 //!
 //! Lives in `dns_forwarder::log_dir()`, next to `upstream.txt`, and for the same
 //! reason: the relay task runs **as this user** under an S4U principal, not as
@@ -38,8 +38,8 @@ pub struct Settings {
     /// wiped (D27).
     ///
     /// Read by the *watchdog process*, not just the window, which is why it goes
-    /// through `auto_patch_wanted()` and its cache rather than being consulted
-    /// from an in-memory `Settings` the watchdog never sees.
+    /// through the settings reader rather than being consulted from an
+    /// in-memory `Settings` the watchdog never sees.
     pub auto_patch: bool,
 
     #[serde(default)]
@@ -265,6 +265,19 @@ fn read() -> Read {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Read::Missing,
         Err(_) => Read::Broken,
     }
+}
+
+/// The macOS worker must not turn unreadable saved intent into permission.
+#[cfg(target_os = "macos")]
+pub(crate) fn watchdog_snapshot() -> Result<Settings, String> {
+    let path = path().ok_or("путь настроек автопатча недоступен")?;
+    watchdog_snapshot_at(&path)
+}
+
+#[cfg(target_os = "macos")]
+fn watchdog_snapshot_at(path: &std::path::Path) -> Result<Settings, String> {
+    let text = std::fs::read_to_string(&path).map_err(|error| format!("чтение настроек автопатча: {error}"))?;
+    parse(&text).ok_or_else(|| "настройки автопатча повреждены".into())
 }
 
 /// The file's text as settings, a leading byte-order mark allowed.
@@ -502,6 +515,26 @@ pub fn builtin_exits_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_worker_requires_current_parsed_intent() {
+        let dir = std::env::temp_dir().join(format!("ag-mac-intent-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.json");
+        assert!(watchdog_snapshot_at(&path).is_err());
+        std::fs::write(&path, "{").unwrap();
+        assert!(watchdog_snapshot_at(&path).is_err());
+        let on = Settings { auto_patch: true, patch_declined: false, ..Settings::default() };
+        std::fs::write(&path, serde_json::to_vec(&on).unwrap()).unwrap();
+        assert!(watchdog_snapshot_at(&path).unwrap().auto_patch_wanted());
+        let off = Settings { auto_patch: false, ..on };
+        std::fs::write(&path, serde_json::to_vec(&off).unwrap()).unwrap();
+        assert!(!watchdog_snapshot_at(&path).unwrap().auto_patch_wanted());
+        std::fs::remove_file(&path).unwrap();
+        assert!(watchdog_snapshot_at(&path).is_err());
+        std::fs::remove_dir(&dir).unwrap();
+    }
 
     #[test]
     fn handoff_binds_saved_bytes_and_rejects_invalid_data() {

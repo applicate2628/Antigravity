@@ -1863,11 +1863,30 @@ mod macos_impl {
     use std::process::Command;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    use super::PROXY_FLAG;
+    use super::{PROXY_FLAG, WATCHDOG_FLAG};
 
     const LABEL: &str = "com.antigravity.unlocker.proxy";
     const SOURCE_DIGEST: &str = "AG_UNLOCKER_SOURCE_SHA256";
     const HELPER_DIGEST: &str = "AG_UNLOCKER_HELPER_SHA256";
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Role { Proxy, Watchdog }
+    impl Role {
+        fn label(self) -> &'static str { match self { Self::Proxy => LABEL, Self::Watchdog => "com.antigravity.unlocker.watchdog" } }
+        fn flag(self) -> &'static str { match self { Self::Proxy => PROXY_FLAG, Self::Watchdog => WATCHDOG_FLAG } }
+        fn helper(self) -> &'static str { match self { Self::Proxy => "ag_proxy", Self::Watchdog => "ag_watchdog" } }
+        fn helper_stage(self) -> &'static str { match self { Self::Proxy => "ag_proxy.stage", Self::Watchdog => "ag_watchdog.stage" } }
+        fn plist(self) -> &'static str { match self { Self::Proxy => "com.antigravity.unlocker.proxy.plist", Self::Watchdog => "com.antigravity.unlocker.watchdog.plist" } }
+        fn plist_stage(self) -> &'static str { match self { Self::Proxy => "com.antigravity.unlocker.proxy.plist.stage", Self::Watchdog => "com.antigravity.unlocker.watchdog.plist.stage" } }
+        fn log(self) -> &'static str { match self { Self::Proxy => "proxy.log", Self::Watchdog => "watchdog.log" } }
+    }
+
+    fn role_log_path(role: Role) -> PathBuf {
+        match role {
+            Role::Proxy => install_dir().join(role.log()),
+            Role::Watchdog => crate::dns_forwarder::log_dir().join(role.log()),
+        }
+    }
 
     fn recheck_directory(path: &Path, file: &fs::File, uid: u32) -> Result<(), String> {
         let held = file.metadata().map_err(|error| format!("проверка каталога службы: {error}"))?;
@@ -2081,16 +2100,37 @@ mod macos_impl {
         }
     }
 
-    fn plist_value(helper: &Path, log: &Path, source_digest: &str, helper_digest: &str)
+    fn plist_value(role: Role, helper: &Path, log: &Path, source_digest: &str, helper_digest: &str)
         -> Result<serde_json::Value, String> {
         let helper = helper.to_str().ok_or("путь службы не поддерживается в plist")?;
         let log = log.to_str().ok_or("путь журнала не поддерживается в plist")?;
-        Ok(serde_json::json!({
-            "Label": LABEL, "ProgramArguments": [helper, PROXY_FLAG],
+        let mut value = serde_json::json!({
+            "Label": role.label(), "ProgramArguments": [helper, role.flag()],
             "RunAtLoad": true, "KeepAlive": true,
             "StandardOutPath": log, "StandardErrorPath": log,
             "EnvironmentVariables": { (SOURCE_DIGEST): source_digest, (HELPER_DIGEST): helper_digest }
-        }))
+        });
+        if role == Role::Watchdog {
+            value.as_object_mut().ok_or("неверный plist")?.remove("StandardOutPath");
+            value.as_object_mut().ok_or("неверный plist")?.remove("StandardErrorPath");
+            let (home, xdg) = watchdog_environment()?;
+            let environment = value["EnvironmentVariables"].as_object_mut().ok_or("нет окружения службы")?;
+            environment.insert("HOME".into(), home.into());
+            if let Some(xdg) = xdg { environment.insert("XDG_DATA_HOME".into(), xdg.into()); }
+        }
+        Ok(value)
+    }
+
+    fn watchdog_environment() -> Result<(String, Option<String>), String> {
+        let home = std::env::var("HOME").map_err(|error| format!("HOME: {error}"))?;
+        if !Path::new(&home).is_absolute() { return Err("HOME должен быть абсолютным путём".into()); }
+        let xdg = match std::env::var("XDG_DATA_HOME") {
+            Ok(value) if !value.is_empty() && Path::new(&value).is_absolute() => Some(value),
+            Ok(_) => return Err("XDG_DATA_HOME должен быть непустым абсолютным путём".into()),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(format!("XDG_DATA_HOME: {error}")),
+        };
+        Ok((home, xdg))
     }
 
     fn encode_plist(value: &serde_json::Value) -> Result<Vec<u8>, String> {
@@ -2129,25 +2169,33 @@ mod macos_impl {
         value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
-    fn plist_generation(value: &serde_json::Value, helper: &Path, log: &Path)
+    fn plist_generation(role: Role, value: &serde_json::Value, helper: &Path, log: &Path)
         -> Result<Option<(String, String)>, String> {
         let helper = helper.to_str().ok_or("путь службы не поддерживается в plist")?;
         let log = log.to_str().ok_or("путь журнала не поддерживается в plist")?;
         let object = value.as_object().ok_or("plist службы не является словарём")?;
         if object.keys().any(|key| !["Label", "ProgramArguments", "RunAtLoad", "KeepAlive",
             "StandardOutPath", "StandardErrorPath", "EnvironmentVariables"].contains(&key.as_str()))
-            || value.get("Label").and_then(|entry| entry.as_str()) != Some(LABEL)
-            || value.get("ProgramArguments") != Some(&serde_json::json!([helper, PROXY_FLAG]))
+            || value.get("Label").and_then(|entry| entry.as_str()) != Some(role.label())
+            || value.get("ProgramArguments") != Some(&serde_json::json!([helper, role.flag()]))
             || value.get("RunAtLoad").and_then(|entry| entry.as_bool()) != Some(true)
             || value.get("KeepAlive").and_then(|entry| entry.as_bool()) != Some(true)
-            || value.get("StandardOutPath").and_then(|entry| entry.as_str()) != Some(log)
-            || value.get("StandardErrorPath").and_then(|entry| entry.as_str()) != Some(log) {
+            || (role == Role::Proxy && (value.get("StandardOutPath").and_then(|entry| entry.as_str()) != Some(log)
+                || value.get("StandardErrorPath").and_then(|entry| entry.as_str()) != Some(log)))
+            || (role == Role::Watchdog && (value.get("StandardOutPath").is_some() || value.get("StandardErrorPath").is_some())) {
             return Err("plist службы не совпадает с известной конфигурацией".into());
         }
         let Some(environment) = value.get("EnvironmentVariables") else { return Ok(None); };
         let environment = environment.as_object().ok_or("неверное окружение службы")?;
         if environment.is_empty() { return Ok(None); }
-        if environment.len() != 2 { return Err("окружение службы содержит неизвестные значения".into()); }
+        if role == Role::Watchdog {
+            let (home, xdg) = watchdog_environment()?;
+            if environment.get("HOME").and_then(|v| v.as_str()) != Some(home.as_str())
+                || environment.get("XDG_DATA_HOME").and_then(|v| v.as_str()) != xdg.as_deref()
+                || environment.len() != 3 + usize::from(xdg.is_some()) {
+                return Err("окружение службы не совпадает с каталогом настроек".into());
+            }
+        } else if environment.len() != 2 { return Err("окружение службы содержит неизвестные значения".into()); }
         let source = environment.get(SOURCE_DIGEST).and_then(|entry| entry.as_str()).ok_or("нет исходного отпечатка службы")?;
         let helper = environment.get(HELPER_DIGEST).and_then(|entry| entry.as_str()).ok_or("нет отпечатка файла службы")?;
         if !valid_digest(source) || !valid_digest(helper) { return Err("неверные отпечатки службы".into()); }
@@ -2262,7 +2310,7 @@ mod macos_impl {
     }
 
     pub fn is_watchdog_enabled() -> bool {
-        false
+        watchdog_running_checked().unwrap_or(false)
     }
 
     pub fn is_running() -> bool {
@@ -2282,26 +2330,74 @@ mod macos_impl {
     }
 
     pub fn enable_watchdog() -> Result<(), String> {
-        Ok(())
+        ensure_role_running(Role::Watchdog, 0)
     }
 
     pub fn ensure_installed() -> Result<(), String> {
         Ok(())
     }
 
-    pub fn disable_watchdog() {}
+    pub fn disable_watchdog() { if let Err(error) = disable_watchdog_checked() { eprintln!("{error}"); } }
 
-    fn ensure_owned_running(port: u16) -> Result<(), String> {
+    pub fn disable_watchdog_checked() -> Result<(), String> { disable_role(Role::Watchdog) }
+
+    pub fn watchdog_directory() -> Result<fs::File, String> {
+        owned_directory(&install_dir(), unsafe { libc::geteuid() })
+    }
+
+    pub fn recheck_watchdog_directory(directory: &fs::File) -> Result<(), String> {
+        recheck_directory(&install_dir(), directory, unsafe { libc::geteuid() })
+    }
+
+    pub fn open_watchdog_log() -> Result<fs::File, String> {
+        open_watchdog_log_at(&crate::dns_forwarder::log_dir())
+    }
+
+    fn open_watchdog_log_at(directory_path: &Path) -> Result<fs::File, String> {
+        let uid = unsafe { libc::geteuid() };
+        let directory = owned_directory(directory_path, uid)?;
+        let path = directory_path.join(Role::Watchdog.log());
+        let file = fs::OpenOptions::new().read(true).append(true).create(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path).map_err(|error| format!("открытие журнала автопатча: {error}"))?;
+        recheck_directory(directory_path, &directory, uid)?;
+        recheck_file(&path, &file, uid)?;
+        if file.metadata().map_err(|error| error.to_string())?.mode() & 0o077 != 0 {
+            return Err("журнал автопатча доступен другим пользователям".into());
+        }
+        Ok(file)
+    }
+
+    pub fn watchdog_running_checked() -> Result<bool, String> {
+        let role = Role::Watchdog;
+        let uid = unsafe { libc::geteuid() };
+        watchdog_environment()?;
+        let plist = home().join("Library").join("LaunchAgents").join(role.plist());
+        let helper = install_dir().join(role.helper());
+        if disabled_override(role, uid)? { return Err("служба отключена в launchd".into()); }
+        if received_job(role, uid, &plist, &helper)?.is_none() {
+            if optional_owned_file(&plist, uid)?.is_some() || optional_owned_file(&helper, uid)?.is_some() {
+                return Err("служба отсутствует, но её файлы сохранены".into());
+            }
+            return Ok(false);
+        }
+        if role_running(role, 0, None)? { Ok(true) }
+        else { Err("готовность журнала автопатча не подтверждена".into()) }
+    }
+
+    fn ensure_owned_running(port: u16) -> Result<(), String> { ensure_role_running(Role::Proxy, port) }
+
+    fn ensure_role_running(role: Role, port: u16) -> Result<(), String> {
         let uid = unsafe { libc::geteuid() };
         let home = home();
         if !home.is_absolute() { return Err("домашний каталог не задан абсолютным путём".into()); }
         let source_path = std::env::current_exe().map_err(|error| format!("нет пути к приложению: {error}"))?;
         let source = source_file(&source_path)?;
         let source_digest = file_digest(&source)?;
-        let helper = installed_exe(); let plist = plist_path(); let log = install_dir().join("proxy.log");
+        let helper = install_dir().join(role.helper()); let plist = home.join("Library").join("LaunchAgents").join(role.plist()); let log = role_log_path(role);
         if source_path == helper { return Err("служба не может обновлять собственный исполняемый файл".into()); }
-        if disabled_override(uid)? { return Err("служба явно отключена в launchd; настройка сохранена".into()); }
-        let old_job = received_job(uid, &plist, &helper)?;
+        if disabled_override(role, uid)? { return Err("служба явно отключена в launchd; настройка сохранена".into()); }
+        let old_job = received_job(role, uid, &plist, &helper)?;
         let old_helper = optional_owned_file(&helper, uid)?;
         let old_plist = optional_owned_file(&plist, uid)?;
         if old_helper.is_some() != old_plist.is_some() || (old_job.is_some() && old_helper.is_none())
@@ -2319,12 +2415,12 @@ mod macos_impl {
         let agents = owned_child_directory(&library, &library_path, "LaunchAgents", uid)?;
         let old_pair = match (&old_plist, &old_helper, &old_job) {
             (Some(plist_file), Some(helper_file), Some(job)) => {
-                let pair = plist_generation(&read_plist(&plist, plist_file, uid)?, &helper, &log)?;
+                let pair = plist_generation(role, &read_plist(&plist, plist_file, uid)?, &helper, &log)?;
                 if pair.as_ref() != job.generation.as_ref() { return Err("окружение службы не совпадает с plist".into()); }
                 let helper_digest = file_digest(helper_file)?;
                 if pair.as_ref().is_some_and(|(_, digest)| *digest != helper_digest) { return Err("файл службы не совпадает с plist".into()); }
                 if generation_is_current(pair.as_ref(), job.generation.as_ref(), true, &source_digest, &helper_digest)? {
-                    receive_ready(uid, &plist, &helper, pair.as_ref(), port, None)?;
+                    receive_ready(role, uid, &plist, &helper, pair.as_ref(), port, None)?;
                     recheck_source(&source_path, &source)?; recheck_file(&plist, plist_file, uid)?; recheck_file(&helper, helper_file, uid)?;
                     return Ok(());
                 }
@@ -2338,8 +2434,8 @@ mod macos_impl {
             (None, None) => None,
             _ => return Err("неполные прежние файлы службы".into()),
         };
-        let mut helper_stage = StagedFile::create(&install, &install_path, "ag_proxy", "ag_proxy.stage", old_helper, uid, 0o700)?;
-        let mut plist_stage = match StagedFile::create(&agents, &agents_path, "com.antigravity.unlocker.proxy.plist", "com.antigravity.unlocker.proxy.plist.stage", old_plist, uid, 0o600) {
+        let mut helper_stage = StagedFile::create(&install, &install_path, role.helper(), role.helper_stage(), old_helper, uid, 0o700)?;
+        let mut plist_stage = match StagedFile::create(&agents, &agents_path, role.plist(), role.plist_stage(), old_plist, uid, 0o600) {
             Ok(stage) => stage,
             Err(primary) => return match helper_stage.rollback() { Ok(()) => Err(primary), Err(error) => Err(format!("{primary}; очистка копии: {error}")) },
         };
@@ -2347,16 +2443,16 @@ mod macos_impl {
         let attempt = (|| -> Result<(), String> {
             let helper_digest = prepare_helper(&mut helper_stage, &source_path, &source, &source_digest)?;
             let pair = (source_digest.clone(), helper_digest);
-            prepare_plist(&mut plist_stage, &plist_value(&helper, &log, &pair.0, &pair.1)?)?;
+            prepare_plist(&mut plist_stage, &plist_value(role, &helper, &log, &pair.0, &pair.1)?)?;
             new_pair = Some(pair.clone());
             recheck_source(&source_path, &source)?;
-            if file_digest(&source)? != source_digest || disabled_override(uid)? { return Err("исходное приложение или настройка службы изменились".into()); }
+            if file_digest(&source)? != source_digest || disabled_override(role, uid)? { return Err("исходное приложение или настройка службы изменились".into()); }
             if let Some(job) = &old_job {
-                stop_owned_job(uid, &plist, &helper, job, plist_stage.prior.as_ref().ok_or("нет старого plist")?, helper_stage.prior.as_ref().ok_or("нет старой службы")?)?;
-            } else if received_job(uid, &plist, &helper)?.is_some() { return Err("служба появилась во время подготовки".into()); }
+                stop_owned_job(role, uid, &plist, &helper, job, plist_stage.prior.as_ref().ok_or("нет старого plist")?, helper_stage.prior.as_ref().ok_or("нет старой службы")?)?;
+            } else if received_job(role, uid, &plist, &helper)?.is_some() { return Err("служба появилась во время подготовки".into()); }
             helper_stage.publish()?; plist_stage.publish()?;
             bootstrap(uid, &plist)?;
-            receive_ready(uid, &plist, &helper, Some(&pair), port, None)?;
+            receive_ready(role, uid, &plist, &helper, Some(&pair), port, None)?;
             recheck_file(&helper, &helper_stage.staged, uid)?; recheck_file(&plist, &plist_stage.staged, uid)?;
             if file_digest(&helper_stage.staged)? != pair.1 { return Err("новый файл службы изменился".into()); }
             Ok(())
@@ -2364,9 +2460,9 @@ mod macos_impl {
         if let Err(primary) = attempt {
             let mut errors = Vec::new();
             let mut may_restore = true;
-            match received_job(uid, &plist, &helper) {
+            match received_job(role, uid, &plist, &helper) {
                 Ok(Some(job)) if new_pair.as_ref().is_some_and(|pair| job.generation.as_ref() == Some(pair)) => {
-                    if let Err(error) = stop_owned_job(uid, &plist, &helper, &job, &plist_stage.staged, &helper_stage.staged) {
+                    if let Err(error) = stop_owned_job(role, uid, &plist, &helper, &job, &plist_stage.staged, &helper_stage.staged) {
                         errors.push(format!("остановка нового поколения: {error}")); may_restore = false;
                     }
                 },
@@ -2380,15 +2476,15 @@ mod macos_impl {
                 if let Err(error) = helper_stage.rollback() { errors.push(format!("восстановление файла службы: {error}")); }
                 if errors.is_empty() && old_job.is_some() {
                     let recovery = (|| -> Result<(), String> {
-                        if disabled_override(uid)? { return Err("служба отключена; настройка сохранена".into()); }
-                        if received_job(uid, &plist, &helper)?.is_none() { bootstrap(uid, &plist)?; }
+                        if disabled_override(role, uid)? { return Err("служба отключена; настройка сохранена".into()); }
+                        if received_job(role, uid, &plist, &helper)?.is_none() { bootstrap(uid, &plist)?; }
                         let digests = old_digests.as_ref().ok_or("нет отпечатков прежней службы")?;
                         let prior = PriorWitness {
                             plist: plist_stage.prior.as_ref().ok_or("нет прежнего plist")?,
                             helper: helper_stage.prior.as_ref().ok_or("нет прежнего файла службы")?,
                             plist_digest: &digests.0, helper_digest: &digests.1, pair: old_pair.as_ref(),
                         };
-                        receive_ready(uid, &plist, &helper, old_pair.as_ref(), port, Some(&prior))
+                        receive_ready(role, uid, &plist, &helper, old_pair.as_ref(), port, Some(&prior))
                     })();
                     if let Err(error) = recovery { errors.push(format!("возобновление прежней службы: {error}")); }
                 }
@@ -2401,7 +2497,7 @@ mod macos_impl {
         if cleanup.is_empty() { Ok(()) } else { Err(format!("служба запущена, прежние файлы требуют проверки: {}", cleanup.join("; "))) }
     }
 
-    fn listener_output(status: Option<i32>, stdout: &[u8], stderr: &[u8], pid: u32, port: u16) -> Result<bool, String> {
+    fn check_lsof_warnings(stderr: &[u8]) -> Result<(), String> {
         let warnings = std::str::from_utf8(stderr).map_err(|_| "неверная диагностика lsof")?;
         if !warnings.is_empty() {
             if !warnings.ends_with('\n') { return Err(format!("неполная диагностика lsof: {warnings}")); }
@@ -2416,6 +2512,12 @@ mod macos_impl {
             }
             eprint!("{warnings}");
         }
+        Ok(())
+    }
+
+    fn listener_output(status: Option<i32>, stdout: &[u8], stderr: &[u8], pid: u32, port: u16) -> Result<bool, String> {
+        check_lsof_warnings(stderr)?;
+        let warnings = std::str::from_utf8(stderr).map_err(|_| "неверная диагностика lsof")?;
         if status == Some(1) && stdout.is_empty() { return Ok(false); }
         if status != Some(0) { return Err(format!("проверка сокета lsof не завершена: {status:?}; {warnings}")); }
         let text = std::str::from_utf8(stdout).map_err(|_| "неверный ответ lsof")?;
@@ -2431,6 +2533,51 @@ mod macos_impl {
         Ok(true)
     }
 
+    fn watchdog_log_output(status: Option<i32>, stdout: &[u8], stderr: &[u8], pid: u32,
+        dev: u64, ino: u64) -> Result<bool, String> {
+        check_lsof_warnings(stderr)?;
+        if status != Some(0) { return Err(format!("проверка журнала lsof не завершена: {status:?}")); }
+        let text = std::str::from_utf8(stdout).map_err(|_| "неверный ответ lsof")?;
+        if !text.ends_with('\n') { return Err("неполный ответ lsof".into()); }
+        let mut lines = text.lines();
+        if lines.next() != Some(format!("p{pid}").as_str()) { return Err("неверный процесс в ответе lsof".into()); }
+        let mut fd: Option<&str> = None;
+        let mut access: Option<&str> = None;
+        let mut device: Option<&str> = None;
+        let mut inode: Option<&str> = None;
+        let mut found = std::collections::HashSet::new();
+        let mut receive = |fd: Option<&str>, access: Option<&str>, device: Option<&str>, inode: Option<&str>| -> Result<(), String> {
+            let Some(fd) = fd else { return Ok(()); };
+            let Ok(number) = fd.parse::<u32>() else { return Ok(()); };
+            if number <= 2 || !matches!(access, Some("w" | "u")) { return Ok(()); }
+            let Some((device, inode)) = device.zip(inode) else { return Ok(()); };
+            let device = device.strip_prefix("0x").and_then(|s| u64::from_str_radix(s, 16).ok()).ok_or("неверное устройство lsof")?;
+            let inode = inode.parse::<u64>().map_err(|_| "неверный inode lsof")?;
+            if device == dev && inode == ino && !found.insert(number) { return Err("повторный дескриптор журнала".into()); }
+            Ok(())
+        };
+        for line in lines {
+            if line.is_empty() || !line.as_bytes()[0].is_ascii() { return Err("неверное поле lsof".into()); }
+            let (key, value) = line.split_at(1);
+            match key {
+                "f" => { receive(fd, access, device, inode)?; fd = Some(value); access = None; device = None; inode = None; },
+                "a" => if access.replace(value).is_some() { return Err("повторный доступ lsof".into()); },
+                "D" => if device.replace(value).is_some() { return Err("повторное устройство lsof".into()); },
+                "i" => if inode.replace(value).is_some() { return Err("повторный inode lsof".into()); },
+                _ => return Err("неизвестное поле lsof".into()),
+            }
+        }
+        receive(fd, access, device, inode)?;
+        Ok(found.len() >= 2)
+    }
+
+    fn observe_watchdog_log(pid: u32, log: &fs::File) -> Result<bool, String> {
+        let info = log.metadata().map_err(|error| format!("проверка журнала: {error}"))?;
+        let output = Command::new("/usr/sbin/lsof").args(["-a", "-p", &pid.to_string(), "-FpfaDi"])
+            .output().map_err(|error| format!("проверка журнала не запущена: {error}"))?;
+        watchdog_log_output(output.status.code(), &output.stdout, &output.stderr, pid, info.dev(), info.ino())
+    }
+
     fn observe_listener(pid: u32, port: u16) -> Result<bool, String> {
         let output = Command::new("/usr/sbin/lsof").args(["-a", "-p", &pid.to_string(), &format!("-iTCP:{port}"),
             "-sTCP:LISTEN", "-nP", "-Fpfn"]).output().map_err(|error| format!("проверка сокета не запущена: {error}"))?;
@@ -2438,7 +2585,7 @@ mod macos_impl {
     }
 
     pub fn owned_proxy_listener_at(port: u16) -> Result<bool, String> {
-        listener_for(port, None)
+        role_running(Role::Proxy, port, None)
     }
 
     struct PriorWitness<'a> {
@@ -2446,16 +2593,17 @@ mod macos_impl {
         plist_digest: &'a str, helper_digest: &'a str, pair: Option<&'a (String, String)>,
     }
 
-    fn listener_for(port: u16, prior: Option<&PriorWitness<'_>>) -> Result<bool, String> {
+    fn role_running(role: Role, port: u16, prior: Option<&PriorWitness<'_>>) -> Result<bool, String> {
         let uid = unsafe { libc::geteuid() };
-        let plist = plist_path(); let helper = installed_exe();
-        let Some(job) = received_job(uid, &plist, &helper)? else { return Ok(false); };
+        let plist = home().join("Library").join("LaunchAgents").join(role.plist());
+        let helper = install_dir().join(role.helper());
+        let Some(job) = received_job(role, uid, &plist, &helper)? else { return Ok(false); };
         let pid = job.pid.ok_or("нет PID зарегистрированной службы")?;
         if job.state != "running" { return Err("состояние зарегистрированной службы не подтверждено".into()); }
         let plist_file = checked_file(&plist, uid)?;
         let helper_file = checked_file(&helper, uid)?;
         let plist_digest = file_digest(&plist_file)?;
-        let pair = plist_generation(&read_plist(&plist, &plist_file, uid)?, &helper, &install_dir().join("proxy.log"))?;
+        let pair = plist_generation(role, &read_plist(&plist, &plist_file, uid)?, &helper, &role_log_path(role))?;
         if job.generation.as_ref() != pair.as_ref() {
             return Err("поколение службы изменилось".into());
         }
@@ -2476,15 +2624,24 @@ mod macos_impl {
         };
         let identity = generation(pid, uid)?.ok_or("процесс службы завершился")?;
         check_process_image(pid, &helper)?;
-        let observation = observe_listener(pid, port);
+        let log_path = role_log_path(role);
+        let log = if role == Role::Watchdog {
+            let file = checked_file(&log_path, uid)?;
+            if file.metadata().map_err(|error| error.to_string())?.mode() & 0o077 != 0 {
+                return Err("журнал автопатча доступен другим пользователям".into());
+            }
+            Some(file)
+        } else { None };
+        let observation = if let Some(log) = &log { observe_watchdog_log(pid, log) } else { observe_listener(pid, port) };
         let recheck = (|| -> Result<(), String> {
             if let Some((path, file, digest)) = &source {
                 recheck_source(path, file)?;
                 if file_digest(file)? != *digest { return Err("исходное приложение изменилось".into()); }
             }
             recheck_file(&plist, &plist_file, uid)?; recheck_file(&helper, &helper_file, uid)?;
+            if let Some(log) = &log { recheck_file(&log_path, log, uid)?; }
             if file_digest(&plist_file)? != plist_digest || file_digest(&helper_file)? != helper_digest
-                || generation(pid, uid)? != Some(identity) || received_job(uid, &plist, &helper)?.as_ref() != Some(&job) {
+                || generation(pid, uid)? != Some(identity) || received_job(role, uid, &plist, &helper)?.as_ref() != Some(&job) {
                 return Err("поколение службы изменилось при проверке сокета".into());
             }
             check_process_image(pid, &helper)
@@ -2506,11 +2663,41 @@ mod macos_impl {
         Ok(())
     }
 
-    fn receive_ready(uid: u32, plist: &Path, helper: &Path, pair: Option<&(String, String)>, port: u16, prior: Option<&PriorWitness<'_>>) -> Result<(), String> {
-        let mut job = received_job(uid, plist, helper)?.ok_or("служба не зарегистрирована")?;
+    fn receive_ready(role: Role, uid: u32, plist: &Path, helper: &Path, pair: Option<&(String, String)>, port: u16, prior: Option<&PriorWitness<'_>>) -> Result<(), String> {
+        let mut job = received_job(role, uid, plist, helper)?.ok_or("служба не зарегистрирована")?;
         if job.generation.as_ref() != pair { return Err("поколение зарегистрированной службы не совпадает".into()); }
-        if job.state != "running" || !listener_for(port, prior)? {
-            let target = format!("gui/{uid}/{LABEL}");
+        if role == Role::Watchdog {
+            let expected_pid = if job.state != "running" {
+                let target = format!("gui/{uid}/{}", role.label());
+                let output = Command::new("/bin/launchctl").args(["kickstart", "-p", &target]).output()
+                    .map_err(|error| format!("запуск службы не выполнен: {error}"))?;
+                if !output.status.success() || !output.stderr.is_empty() { return Err(format!("запуск службы не подтверждён: {}", output.status)); }
+                Some(std::str::from_utf8(&output.stdout).map_err(|_| "неверный PID службы")?.trim()
+                    .parse::<u32>().ok().filter(|pid| *pid != 0).ok_or("нет PID службы")?)
+            } else { None };
+            let deadline = std::time::Instant::now() + crate::dns_forwarder::PROXY_START_BUDGET;
+            loop {
+                let observed = (|| -> Result<(), String> {
+                    let current = received_job(role, uid, plist, helper)?.ok_or("служба не зарегистрирована")?;
+                    if current.generation.as_ref() != pair || current.state != "running"
+                        || expected_pid.is_some_and(|pid| current.pid != Some(pid)) {
+                        return Err("поколение запуска службы не подтверждено".into());
+                    }
+                    if !role_running(role, port, prior)? { return Err("готовность журнала не подтверждена".into()); }
+                    if received_job(role, uid, plist, helper)?.as_ref() != Some(&current) {
+                        return Err("процесс службы изменился при проверке готовности".into());
+                    }
+                    Ok(())
+                })();
+                match observed {
+                    Ok(()) => return Ok(()),
+                    Err(error) if std::time::Instant::now() >= deadline => return Err(format!("готовность службы не подтверждена: {error}")),
+                    Err(_) => std::thread::sleep(crate::proxy::POLL_FOR_LISTENER),
+                }
+            }
+        }
+        if job.state != "running" || !role_running(role, port, prior)? {
+            let target = format!("gui/{uid}/{}", role.label());
             let output = Command::new("/bin/launchctl").args(["kickstart", "-p", &target]).output()
                 .map_err(|error| format!("запуск службы не выполнен: {error}"))?;
             if !output.status.success() || !output.stderr.is_empty() { return Err(format!("запуск службы не подтверждён: {}", output.status)); }
@@ -2518,18 +2705,18 @@ mod macos_impl {
                 .parse::<u32>().ok().filter(|pid| *pid != 0).ok_or("нет PID службы")?;
             let deadline = std::time::Instant::now() + crate::dns_forwarder::PROXY_START_BUDGET;
             loop {
-                if listener_for(port, prior)? { break; }
+                if role_running(role, port, prior)? { break; }
                 if std::time::Instant::now() >= deadline { return Err("готовность службы не подтверждена".into()); }
                 std::thread::sleep(crate::proxy::POLL_FOR_LISTENER);
             }
-            job = received_job(uid, plist, helper)?.ok_or("служба исчезла после запуска")?;
+            job = received_job(role, uid, plist, helper)?.ok_or("служба исчезла после запуска")?;
             if job.pid != Some(pid) { return Err("PID запущенной службы изменился".into()); }
         }
         if job.state != "running" || job.generation.as_ref() != pair { return Err("состояние службы изменилось".into()); }
         let pid = job.pid.ok_or("нет PID службы")?;
         let identity = generation(pid, uid)?.ok_or("процесс службы завершился")?;
         check_process_image(pid, helper)?;
-        if generation(pid, uid)? != Some(identity) || received_job(uid, plist, helper)?.as_ref() != Some(&job) {
+        if generation(pid, uid)? != Some(identity) || received_job(role, uid, plist, helper)?.as_ref() != Some(&job) {
             return Err("процесс службы изменился при проверке".into());
         }
         Ok(())
@@ -2538,18 +2725,21 @@ mod macos_impl {
     #[derive(Debug, PartialEq, Eq)]
     struct OwnedJob { pid: Option<u32>, state: String, generation: Option<(String, String)> }
 
-    fn parse_owned_job(text: &str, uid: u32, plist: &Path, helper: &Path) -> Result<OwnedJob, String> {
+    fn parse_owned_job(role: Role, text: &str, uid: u32, plist: &Path, helper: &Path) -> Result<OwnedJob, String> {
         let mut path = None; let mut program = None; let mut domain = None;
         let mut state = None; let mut pid = None; let mut arguments: Option<Vec<&str>> = None;
         let mut in_arguments = false;
         let mut in_environment = false; let mut environment_seen = false;
         let mut source_digest = None; let mut helper_digest = None;
+        let mut job_home = None; let mut job_xdg = None;
         for line in text.lines() {
             if in_environment {
                 if line == "\t}" { in_environment = false; continue; }
                 let entry = line.strip_prefix("\t\t").ok_or("неверное окружение launchd")?;
                 let (key, value) = entry.split_once(" => ").ok_or("неверное окружение launchd")?;
-                let slot = match key { SOURCE_DIGEST => Some(&mut source_digest), HELPER_DIGEST => Some(&mut helper_digest), _ => None };
+                let slot = match key { SOURCE_DIGEST => Some(&mut source_digest), HELPER_DIGEST => Some(&mut helper_digest),
+                    "HOME" if role == Role::Watchdog => Some(&mut job_home),
+                    "XDG_DATA_HOME" if role == Role::Watchdog => Some(&mut job_xdg), _ => None };
                 if let Some(slot) = slot {
                     if slot.replace(value).is_some() { return Err("повторный отпечаток launchd".into()); }
                 }
@@ -2589,8 +2779,14 @@ mod macos_impl {
             .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()));
         let arguments = arguments.ok_or("нет аргументов launchd")?;
         if in_arguments || in_environment || !environment_seen || !valid_domain || path.map(Path::new) != Some(plist) || program.map(Path::new) != Some(helper)
-            || arguments.len() != 2 || Path::new(arguments[0]) != helper || arguments[1] != PROXY_FLAG {
+            || arguments.len() != 2 || Path::new(arguments[0]) != helper || arguments[1] != role.flag() {
             return Err("служба launchd не совпадает с ожидаемой".into());
+        }
+        if role == Role::Watchdog {
+            let (home, xdg) = watchdog_environment()?;
+            if job_home != Some(home.as_str()) || job_xdg != xdg.as_deref() {
+                return Err("окружение launchd не совпадает с каталогом настроек".into());
+            }
         }
         let state = state.ok_or("нет состояния launchd")?.to_owned();
         let pid = pid.map(|value| value.parse::<u32>().ok().filter(|pid| *pid != 0).ok_or("неверный PID launchd"))
@@ -2604,10 +2800,10 @@ mod macos_impl {
         Ok(OwnedJob { pid, state, generation })
     }
 
-    fn parse_disabled_override(text: &str) -> Result<bool, String> {
+    fn parse_disabled_override(role: Role, text: &str) -> Result<bool, String> {
         let mut lines = text.lines().filter(|line| !line.is_empty());
         if lines.next() != Some("\tdisabled services = {") { return Err("неверный ответ launchd об отключённых службах".into()); }
-        let target = format!("\t\t\"{LABEL}\" => ");
+        let target = format!("\t\t\"{}\" => ", role.label());
         let mut disabled = false;
         let mut closed = false;
         for line in lines {
@@ -2623,22 +2819,22 @@ mod macos_impl {
         Ok(disabled)
     }
 
-    fn disabled_override(uid: u32) -> Result<bool, String> {
+    fn disabled_override(role: Role, uid: u32) -> Result<bool, String> {
         let output = Command::new("/bin/launchctl").args(["print-disabled", &format!("gui/{uid}")]).output()
             .map_err(|error| format!("проверка отключения службы: {error}"))?;
         if !output.status.success() || !output.stderr.is_empty() { return Err(format!("состояние отключения не получено: {}", output.status)); }
-        parse_disabled_override(std::str::from_utf8(&output.stdout).map_err(|_| "неверный ответ об отключении службы")?)
+        parse_disabled_override(role, std::str::from_utf8(&output.stdout).map_err(|_| "неверный ответ об отключении службы")?)
     }
 
-    fn received_job(uid: u32, plist: &Path, helper: &Path) -> Result<Option<OwnedJob>, String> {
-        let target = format!("gui/{uid}/{LABEL}");
+    fn received_job(role: Role, uid: u32, plist: &Path, helper: &Path) -> Result<Option<OwnedJob>, String> {
+        let target = format!("gui/{uid}/{}", role.label());
         let output = Command::new("/bin/launchctl").args(["print", &target]).output()
             .map_err(|error| format!("проверка launchd: {error}"))?;
         if output.status.success() {
             if !output.stderr.is_empty() { return Err("проверка launchd вернула предупреждение".into()); }
-            return parse_owned_job(std::str::from_utf8(&output.stdout).map_err(|_| "неверный ответ launchd")?, uid, plist, helper).map(Some);
+            return parse_owned_job(role, std::str::from_utf8(&output.stdout).map_err(|_| "неверный ответ launchd")?, uid, plist, helper).map(Some);
         }
-        let absent = format!("Bad request.\nCould not find service \"{LABEL}\" in domain for user gui: {uid}\n");
+        let absent = format!("Bad request.\nCould not find service \"{}\" in domain for user gui: {uid}\n", role.label());
         if output.status.code() == Some(113) && output.stdout.is_empty() && output.stderr == absent.as_bytes() { return Ok(None); }
         Err(format!("состояние launchd не получено: {}", output.status))
     }
@@ -2691,13 +2887,15 @@ mod macos_impl {
         Ok(())
     }
 
-    pub fn disable() -> Result<(), String> {
+    pub fn disable() -> Result<(), String> { disable_role(Role::Proxy) }
+
+    fn disable_role(role: Role) -> Result<(), String> {
         let home = home();
         if !home.is_absolute() { return Err("домашний каталог не задан абсолютным путём".into()); }
         let uid = unsafe { libc::geteuid() };
-        let plist = plist_path();
-        let helper = installed_exe();
-        let Some(job) = received_job(uid, &plist, &helper)? else {
+        let plist = home.join("Library").join("LaunchAgents").join(role.plist());
+        let helper = install_dir().join(role.helper());
+        let Some(job) = received_job(role, uid, &plist, &helper)? else {
             if fs::symlink_metadata(&plist).is_ok() || fs::symlink_metadata(&helper).is_ok() {
                 return Err("служба отсутствует, но её файлы требуют проверки владельца".into());
             }
@@ -2710,7 +2908,14 @@ mod macos_impl {
         };
         let plist_file = checked_file(&plist, uid)?;
         let helper_file = checked_file(&helper, uid)?;
-        stop_owned_job(uid, &plist, &helper, &job, &plist_file, &helper_file)?;
+        if role == Role::Watchdog {
+            let pair = plist_generation(role, &read_plist(&plist, &plist_file, uid)?, &helper,
+                &role_log_path(role))?.ok_or("нет поколения службы")?;
+            if job.generation.as_ref() != Some(&pair) || file_digest(&helper_file)? != pair.1 {
+                return Err("поколение отключаемой службы не совпадает".into());
+            }
+        }
+        stop_owned_job(role, uid, &plist, &helper, &job, &plist_file, &helper_file)?;
         recheck_file(&plist, &plist_file, uid)?;
         recheck_file(&helper, &helper_file, uid)?;
         fs::remove_file(&plist).map_err(|error| format!("служба остановлена, plist сохранён: {error}"))?;
@@ -2719,7 +2924,7 @@ mod macos_impl {
         Ok(())
     }
 
-    fn stop_owned_job(uid: u32, plist: &Path, helper: &Path, job: &OwnedJob,
+    fn stop_owned_job(role: Role, uid: u32, plist: &Path, helper: &Path, job: &OwnedJob,
         plist_file: &fs::File, helper_file: &fs::File) -> Result<(), String> {
         let plist_output = Command::new("/usr/bin/plutil").args(["-convert", "json", "-o", "-", "--"]).arg(&plist).output()
             .map_err(|error| format!("проверка plist: {error}"))?;
@@ -2728,8 +2933,8 @@ mod macos_impl {
         if !plist_output.status.success() || !plist_output.stderr.is_empty() { return Err("plist службы не прочитан".into()); }
         let value: serde_json::Value = serde_json::from_slice(&plist_output.stdout).map_err(|error| format!("неверный plist службы: {error}"))?;
         let helper_text = helper.to_str().ok_or("путь службы не поддерживается в plist")?;
-        if value.get("Label").and_then(|value| value.as_str()) != Some(LABEL)
-            || value.get("ProgramArguments") != Some(&serde_json::json!([helper_text, PROXY_FLAG])) {
+        if value.get("Label").and_then(|value| value.as_str()) != Some(role.label())
+            || value.get("ProgramArguments") != Some(&serde_json::json!([helper_text, role.flag()])) {
             return Err("plist службы не совпадает с ожидаемым".into());
         }
         let original = match job.pid { Some(pid) => {
@@ -2738,16 +2943,16 @@ mod macos_impl {
             if generation(pid, uid)? != Some(first) { return Err("процесс службы изменился при проверке".into()); }
             Some((pid, first))
         }, None => None };
-        if received_job(uid, &plist, &helper)?.as_ref() != Some(job) { return Err("служба изменилась до остановки".into()); }
+        if received_job(role, uid, &plist, &helper)?.as_ref() != Some(job) { return Err("служба изменилась до остановки".into()); }
         recheck_file(&plist, &plist_file, uid)?;
         recheck_file(&helper, &helper_file, uid)?;
-        let target = format!("gui/{uid}/{LABEL}");
+        let target = format!("gui/{uid}/{}", role.label());
         let status = Command::new("/bin/launchctl").args(["bootout", &target]).status()
             .map_err(|error| format!("остановка службы не запущена: {error}"))?;
         if !status.success() { return Err(format!("остановка службы не завершена: {status}")); }
         let deadline = std::time::Instant::now() + crate::dns_forwarder::PROXY_START_BUDGET;
         loop {
-            let absent = received_job(uid, &plist, &helper)?.is_none();
+            let absent = received_job(role, uid, &plist, &helper)?.is_none();
             let exited = match original {
                 Some((pid, initial)) => generation(pid, uid)?.is_none_or(|now| now != initial),
                 None => true,
@@ -2775,6 +2980,18 @@ mod macos_impl {
         }
 
         #[test]
+        fn watchdog_witness_requires_two_distinct_writable_nonstandard_descriptors() {
+            let sample = b"p42\nfcwd\na \nD0x10\ni11\nf2\naw\nD0x10\ni11\nf3\naw\nD0x10\ni11\nf4\nau\nD0x10\ni11\n";
+            let warning = b"lsof: WARNING: can't stat() synthetic file system /test-fixtures\n      Output information may be incomplete.\n      assuming \"dev=123\" from mount table\n";
+            assert!(watchdog_log_output(Some(0), sample, warning, 42, 16, 11).unwrap());
+            assert!(!watchdog_log_output(Some(0), sample, b"", 42, 16, 12).unwrap());
+            assert!(!watchdog_log_output(Some(0), b"p42\nf2\naw\nD0x10\ni11\nf3\naw\nD0x10\ni11\n", b"", 42, 16, 11).unwrap());
+            assert!(watchdog_log_output(Some(0), sample, b"permission denied\n", 42, 16, 11).is_err());
+            assert!(watchdog_log_output(Some(0), sample, b"", 43, 16, 11).is_err());
+            assert!(watchdog_log_output(Some(1), sample, b"", 42, 16, 11).is_err());
+        }
+
+        #[test]
         fn staged_publication_requires_the_exact_prior_and_new_entries() {
             let fresh = (7, 11);
             let old = (7, 12);
@@ -2793,14 +3010,101 @@ mod macos_impl {
             let log = Path::new("/test-fixtures/proxy.log");
             let source = "a".repeat(64);
             let binary = "b".repeat(64);
-            let mut value = plist_value(helper, log, &source, &binary).unwrap();
-            assert_eq!(plist_generation(&value, helper, log).unwrap(), Some((source, binary)));
+            let mut value = plist_value(Role::Proxy, helper, log, &source, &binary).unwrap();
+            assert_eq!(plist_generation(Role::Proxy, &value, helper, log).unwrap(), Some((source, binary)));
             value["EnvironmentVariables"].as_object_mut().unwrap().remove(SOURCE_DIGEST);
-            assert!(plist_generation(&value, helper, log).is_err());
+            assert!(plist_generation(Role::Proxy, &value, helper, log).is_err());
             value.as_object_mut().unwrap().remove("EnvironmentVariables");
-            assert_eq!(plist_generation(&value, helper, log).unwrap(), None);
+            assert_eq!(plist_generation(Role::Proxy, &value, helper, log).unwrap(), None);
             value["ProgramArguments"] = serde_json::json!(["/test-fixtures/foreign", PROXY_FLAG]);
-            assert!(plist_generation(&value, helper, log).is_err());
+            assert!(plist_generation(Role::Proxy, &value, helper, log).is_err());
+        }
+
+        #[test]
+        fn watchdog_plist_binds_role_and_actual_state_root() {
+            let helper = Path::new("/test-fixtures/ag_watchdog");
+            let log = Path::new("/test-fixtures/watchdog.log");
+            let mut value = plist_value(Role::Watchdog, helper, log, &"a".repeat(64), &"b".repeat(64)).unwrap();
+            assert!(value.get("StandardOutPath").is_none());
+            assert!(value.get("StandardErrorPath").is_none());
+            assert!(plist_generation(Role::Watchdog, &value, helper, log).unwrap().is_some());
+            value["StandardErrorPath"] = "/test-fixtures/foreign".into();
+            assert!(plist_generation(Role::Watchdog, &value, helper, log).is_err());
+            value.as_object_mut().unwrap().remove("StandardErrorPath");
+            value["ProgramArguments"][1] = PROXY_FLAG.into();
+            assert!(plist_generation(Role::Watchdog, &value, helper, log).is_err());
+            value["ProgramArguments"][1] = WATCHDOG_FLAG.into();
+            value["EnvironmentVariables"]["HOME"] = "/wrong-store".into();
+            assert!(plist_generation(Role::Watchdog, &value, helper, log).is_err());
+        }
+
+        #[test]
+        fn watchdog_log_rejects_links_and_keeps_the_open_inode() {
+            use std::os::unix::fs::symlink;
+            let temp = fs::canonicalize(std::env::temp_dir()).unwrap();
+            let dir = temp.join(format!("ag-mac-log-{}", std::process::id()));
+            fs::create_dir(&dir).unwrap();
+            let log = dir.join("watchdog.log");
+            let sentinel = dir.join("sentinel");
+            fs::write(&sentinel, b"sentinel").unwrap();
+            symlink(&sentinel, &log).unwrap();
+            assert!(open_watchdog_log_at(&dir).is_err());
+            fs::remove_file(&log).unwrap();
+            fs::hard_link(&sentinel, &log).unwrap();
+            assert!(open_watchdog_log_at(&dir).is_err());
+            fs::remove_file(&log).unwrap();
+            let mut file = open_watchdog_log_at(&dir).unwrap();
+            let moved = dir.join("admitted.log");
+            fs::rename(&log, &moved).unwrap();
+            symlink(&sentinel, &log).unwrap();
+            file.write_all(b"worker").unwrap();
+            assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
+            assert_eq!(fs::read(&moved).unwrap(), b"worker");
+            drop(file);
+            fs::remove_file(&log).unwrap(); fs::remove_file(&moved).unwrap();
+            fs::remove_file(&sentinel).unwrap(); fs::remove_dir(&dir).unwrap();
+        }
+
+        #[test]
+        fn watchdog_log_uses_selected_state_root() {
+            const CHILD: &str = "AG_WATCHDOG_LOG_TEST_EXPECTED";
+            if let Some(expected) = std::env::var_os(CHILD) {
+                let expected = PathBuf::from(expected);
+                assert_eq!(role_log_path(Role::Watchdog), expected);
+                assert!(open_watchdog_log().unwrap_err().contains("открытие журнала автопатча"), "selected sentinel link must be rejected at open");
+                assert_eq!(fs::read(expected.parent().unwrap().join("sentinel")).unwrap(), b"sentinel");
+                return;
+            }
+            use std::os::unix::fs::symlink;
+            let temp = fs::canonicalize(std::env::temp_dir()).unwrap();
+            let root = temp.join(format!("ag-mac-log-root-{}", std::process::id()));
+            fs::create_dir(&root).unwrap();
+            let home = root.join("home");
+            let data = root.join("custom space & data");
+            let default = home.join(".local").join("share").join("agunlocker");
+            let custom = data.join("agunlocker");
+            for dir in [&default, &custom] {
+                fs::create_dir_all(dir).unwrap();
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+                let sentinel = dir.join("sentinel");
+                fs::write(&sentinel, b"sentinel").unwrap();
+                symlink(&sentinel, dir.join("watchdog.log")).unwrap();
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child.args(["--exact", "background::macos_impl::tests::watchdog_log_uses_selected_state_root", "--nocapture"])
+                    .env("HOME", &home).env(CHILD, dir.join("watchdog.log"));
+                if dir == &default { child.env_remove("XDG_DATA_HOME"); }
+                else { child.env("XDG_DATA_HOME", &data); }
+                let result = child.output().unwrap();
+                assert!(result.status.success(), "child failed: {}", String::from_utf8_lossy(&result.stderr));
+                assert!(String::from_utf8_lossy(&result.stdout).contains("running 1 test"), "child did not execute the fixture");
+                assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
+                fs::remove_file(dir.join("watchdog.log")).unwrap();
+                fs::remove_file(sentinel).unwrap();
+                fs::remove_dir(dir).unwrap();
+            }
+            fs::remove_dir(home.join(".local").join("share")).unwrap();
+            fs::remove_dir(home.join(".local")).unwrap();
+            fs::remove_dir(home).unwrap(); fs::remove_dir(data).unwrap(); fs::remove_dir(root).unwrap();
         }
 
         #[test]
@@ -2819,12 +3123,12 @@ mod macos_impl {
 
         #[test]
         fn disabled_override_requires_complete_framing_and_exact_label() {
-            assert!(parse_disabled_override("").is_err());
-            assert!(parse_disabled_override("\n\tdisabled services = {\n").is_err());
-            assert!(!parse_disabled_override("\n\tdisabled services = {\n\t\t\"other\" => disabled\n\t}\n").unwrap());
+            assert!(parse_disabled_override(Role::Proxy, "").is_err());
+            assert!(parse_disabled_override(Role::Proxy, "\n\tdisabled services = {\n").is_err());
+            assert!(!parse_disabled_override(Role::Proxy, "\n\tdisabled services = {\n\t\t\"other\" => disabled\n\t}\n").unwrap());
             let selected = format!("\n\tdisabled services = {{\n\t\t\"{LABEL}\" => disabled\n\t}}\n");
-            assert!(parse_disabled_override(&selected).unwrap());
-            assert!(parse_disabled_override(&selected.replace("disabled\n", "unknown\n")).is_err());
+            assert!(parse_disabled_override(Role::Proxy, &selected).unwrap());
+            assert!(parse_disabled_override(Role::Proxy, &selected.replace("disabled\n", "unknown\n")).is_err());
         }
 
         #[test]
@@ -2832,18 +3136,18 @@ mod macos_impl {
             let plist = Path::new("/Users/example/Library/LaunchAgents/owned.plist");
             let helper = Path::new("/Users/example/Library/Application Support/AGUnlocker/ag_proxy");
             let text = "service = {\n\tpath = /Users/example/Library/LaunchAgents/owned.plist\n\tprogram = /Users/example/Library/Application Support/AGUnlocker/ag_proxy\n\tdomain = gui/501 [100001]\n\tstate = running\n\tpid = 123\n\targuments = {\n\t\t/Users/example/Library/Application Support/AGUnlocker/ag_proxy\n\t\t--proxy\n\t}\n\tenvironment = {\n\t\tXPC_SERVICE_NAME => fixture\n\t}\n}\n";
-            assert_eq!(parse_owned_job(text, 501, plist, helper).unwrap().pid, Some(123));
-            assert!(parse_owned_job(text, 502, plist, helper).is_err());
-            assert!(parse_owned_job(&text.replace("--proxy", "--watchdog"), 501, plist, helper).is_err());
-            assert!(parse_owned_job(&text.replace("\tpid = 123\n", "\tpid = 123\n\tpid = 456\n"), 501, plist, helper).is_err());
-            assert!(parse_owned_job(&text.replace("\tpid = 123\n", ""), 501, plist, helper).is_err());
+            assert_eq!(parse_owned_job(Role::Proxy, text, 501, plist, helper).unwrap().pid, Some(123));
+            assert!(parse_owned_job(Role::Proxy, text, 502, plist, helper).is_err());
+            assert!(parse_owned_job(Role::Proxy, &text.replace("--proxy", "--watchdog"), 501, plist, helper).is_err());
+            assert!(parse_owned_job(Role::Proxy, &text.replace("\tpid = 123\n", "\tpid = 123\n\tpid = 456\n"), 501, plist, helper).is_err());
+            assert!(parse_owned_job(Role::Proxy, &text.replace("\tpid = 123\n", ""), 501, plist, helper).is_err());
             let source = "a".repeat(64); let binary = "b".repeat(64);
             let entries = format!("\t\t{SOURCE_DIGEST} => {source}\n\t\t{HELPER_DIGEST} => {binary}\n");
             let current = text.replace("\t\tXPC_SERVICE_NAME => fixture\n", &entries);
-            assert_eq!(parse_owned_job(&current, 501, plist, helper).unwrap().generation, Some((source, binary)));
-            assert!(parse_owned_job(&current.replace(&format!("\t\t{HELPER_DIGEST} => {}\n", "b".repeat(64)), ""), 501, plist, helper).is_err());
-            assert!(parse_owned_job(&current.replace(&entries, &format!("{entries}{entries}")), 501, plist, helper).is_err());
-            assert!(parse_owned_job(&text.replace("\tenvironment = {\n\t\tXPC_SERVICE_NAME => fixture\n\t}\n", ""), 501, plist, helper).is_err());
+            assert_eq!(parse_owned_job(Role::Proxy, &current, 501, plist, helper).unwrap().generation, Some((source, binary)));
+            assert!(parse_owned_job(Role::Proxy, &current.replace(&format!("\t\t{HELPER_DIGEST} => {}\n", "b".repeat(64)), ""), 501, plist, helper).is_err());
+            assert!(parse_owned_job(Role::Proxy, &current.replace(&entries, &format!("{entries}{entries}")), 501, plist, helper).is_err());
+            assert!(parse_owned_job(Role::Proxy, &text.replace("\tenvironment = {\n\t\tXPC_SERVICE_NAME => fixture\n\t}\n", ""), 501, plist, helper).is_err());
         }
     }
 }

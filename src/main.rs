@@ -858,6 +858,7 @@ fn main() {
 
     if env::args().any(|a| a == background::FORWARDER_FLAG) {
         dns_forwarder::detach_console();
+        #[cfg(not(target_os = "macos"))]
         watchdog::start();
         if let Err(e) = dns_forwarder::run() {
             dns_forwarder::log_fatal(&e);
@@ -868,7 +869,42 @@ fn main() {
 
     if env::args().any(|a| a == background::WATCHDOG_FLAG) {
         dns_forwarder::detach_console();
-        watchdog::run_forever();
+        #[cfg(target_os = "macos")]
+        let _worker_lease = match instances::acquire_watchdog_worker() {
+            Ok(lease) => lease,
+            Err(error) => { eprintln!("watchdog: {error}"); std::process::exit(1); }
+        };
+        #[cfg(target_os = "macos")]
+        let (_worker_log, worker_log_alias) = {
+            use std::io::Write;
+            use std::os::fd::AsRawFd;
+            let mut log = match background::open_watchdog_log() {
+                Ok(log) => log,
+                Err(error) => { eprintln!("watchdog: {error}"); std::process::exit(1); }
+            };
+            if log.as_raw_fd() <= 2 {
+                eprintln!("watchdog: журнал не получил отдельный дескриптор"); std::process::exit(1);
+            }
+            if unsafe { libc::dup2(log.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+                eprintln!("watchdog: {}", std::io::Error::last_os_error());
+                std::process::exit(1);
+            }
+            let stamp = utils::local_clock().map_or_else(String::new, |clock| clock.hms());
+            if writeln!(log, "{stamp} watchdog: startup").is_err() { std::process::exit(1); }
+            let alias = match log.try_clone() {
+                Ok(alias) if alias.as_raw_fd() > 2 && alias.as_raw_fd() != log.as_raw_fd() => alias,
+                Ok(_) => { eprintln!("watchdog: неверный дескриптор журнала"); std::process::exit(1); }
+                Err(error) => { eprintln!("watchdog: {error}"); std::process::exit(1); }
+            };
+            (log, alias)
+        };
+        let result = watchdog::run_forever();
+        #[cfg(target_os = "macos")]
+        drop(worker_log_alias);
+        if let Err(error) = result {
+            eprintln!("watchdog: {error}");
+            std::process::exit(1);
+        }
         return;
     }
 
