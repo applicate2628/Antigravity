@@ -986,7 +986,7 @@ fn run_worker(
                     let lifetime = lifetime.clone();
                     native_job = match std::thread::Builder::new().name("gui-elevation".into()).spawn(move || {
                         if let crate::instances::GuiReplacementAction::ResumeApply(intent) = &action {
-                            if let Err(error) = receive_apply_continuation(intent, &cancellation) {
+                            if let Err(error) = receive_apply_continuation(intent, &cancellation, lifetime.retained_image()) {
                                 return Ok(NativeCompletion::Held(format!("Данные применения изменились; передача остановлена: {error}")));
                             }
                         }
@@ -1514,7 +1514,7 @@ fn worker_boot(rx: &Receiver<Cmd>, events: &Sender<Event>, wake: &Arc<Mutex<Box<
                     return held_boot(rx, events, wake, lifetime, format!("Не удалось получить входные данные продолжения: {error}"));
                 }
             }
-            match receive_apply_continuation(&intent, &lifetime.abort_requested) {
+            match receive_apply_continuation(&intent, &lifetime.abort_requested, lifetime.retained_image()) {
                 Ok(plan) => return Some((plan.wanted.clone(), Startup::Resume(intent), Some(Cmd::ApplySettings))),
                 Err(error) => {
                     let reason = format!("Данные изменились во время передачи окна; применение не выполнялось: {error}");
@@ -2277,7 +2277,7 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) -> Result<(), String> {
 /// still receive cancellation and close requests.
 #[cfg(windows)]
 #[derive(Debug)]
-pub(crate) enum ApplyPlanError { Cancelled, Receiving(String), GatewayRecoveryRequired(GatewayApplyRecovery) }
+pub(crate) enum ApplyPlanError { Cancelled, Receiving(String), GatewayRecoveryRequired(GatewayApplyRecovery), VendorMetadataRecoveryRequired(VendorApplyRecovery) }
 #[cfg(windows)]
 pub(crate) struct GatewayApplyRecovery {
     pub(crate) observation: crate::windows_coordinator::windows_installation::GatewayPendingObservation,
@@ -2291,12 +2291,26 @@ impl std::fmt::Debug for GatewayApplyRecovery {
     }
 }
 #[cfg(windows)]
+pub(crate) struct VendorApplyRecovery {
+    pub(crate) observation: crate::windows_coordinator::windows_installation::VendorPendingObservation,
+    pub(crate) target: crate::instances::GuiReplacementTarget,
+    pub(crate) bound: crate::windows_coordinator::windows_installation::BoundInstallation,
+    pub(crate) saved_sha256: [u8; 32],
+}
+#[cfg(windows)]
+impl std::fmt::Debug for VendorApplyRecovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VendorApplyRecovery").field("observation", &self.observation).finish_non_exhaustive()
+    }
+}
+#[cfg(windows)]
 impl From<String> for ApplyPlanError { fn from(value: String) -> Self { Self::Receiving(value) } }
 #[cfg(windows)]
 impl std::fmt::Display for ApplyPlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self { Self::Cancelled => f.write_str("Применение отменено."), Self::Receiving(error) => f.write_str(error),
-            Self::GatewayRecoveryRequired(_) => f.write_str("RecoveryRequired: selected Desktop has an exact Pending gateway prerequisite") }
+            Self::GatewayRecoveryRequired(_) => f.write_str("RecoveryRequired: selected Desktop has an exact Pending gateway prerequisite"),
+            Self::VendorMetadataRecoveryRequired(_) => f.write_str("RecoveryRequired: selected Desktop has an exact Pending vendor metadata prerequisite") }
     }
 }
 
@@ -2437,13 +2451,33 @@ fn gui_current_expectation(observation: crate::windows_coordinator::windows_inst
     Ok(match observation {
         Current::Absent => Gui::Absent {},
         Current::Settled { slot_id, current_sha256 } => Gui::Present { slot_id, current_sha256 },
-        Current::GatewayPending(_) => return Err("RecoveryRequired: continuation target has unresolved Current".into()),
+        Current::GatewayPending(_) | Current::VendorPending(_) => return Err("RecoveryRequired: continuation target has unresolved Current".into()),
         Current::VendorReplacement(value) => Gui::VendorUpdate { slot_id: value.slot_id,
             prior_current_sha256: value.prior_current_sha256, new_parent_id: value.new_parent_id,
             new_resources_id: value.new_resources_id, new_archive_id: value.new_archive_id,
             new_executable_sha256: value.new_executable_sha256, new_archive_sha256: value.new_archive_sha256,
             new_binding_sha256: value.new_binding_sha256 },
     })
+}
+
+// Read-only prerequisite receiving precedes every selected-image/native plan.
+// It takes no package capability; the adapter later revalidates this exact data.
+#[cfg(windows)]
+pub(crate) fn receive_desktop_apply_current(bound: crate::windows_coordinator::windows_installation::BoundInstallation,
+    target: &crate::instances::GuiReplacementTarget, saved_sha256: [u8; 32])
+    -> Result<crate::instances::GuiCurrentExpectation, ApplyPlanError> {
+    use crate::windows_coordinator::windows_installation as owner;
+    if target.kind != crate::instances::GuiTargetKind::Desktop || bound.native_root_id() != target.native_root_id
+        || bound.native_executable_id() != target.anchor_native_id || !owner::same_windows_path(bound.executable().as_path(), &target.anchor_path)? {
+        return Err("RecoveryRequired: Apply target anchor changed before prerequisite receiving".to_owned().into());
+    }
+    match owner::observe_apply_current(&bound)? {
+        owner::ApplyCurrentObservation::GatewayPending(observation) => Err(ApplyPlanError::GatewayRecoveryRequired(
+            GatewayApplyRecovery { observation, target: target.clone(), bound })),
+        owner::ApplyCurrentObservation::VendorPending(observation) => Err(ApplyPlanError::VendorMetadataRecoveryRequired(
+            VendorApplyRecovery { observation, target: target.clone(), bound, saved_sha256 })),
+        observation => gui_current_expectation(observation).map_err(ApplyPlanError::from),
+    }
 }
 
 #[cfg(windows)]
@@ -2456,7 +2490,8 @@ fn apply_target_key(target: &crate::instances::GuiTargetExpectation) -> (u8, u64
 
 #[cfg(windows)]
 pub(crate) fn receive_all_target_apply_plan(wanted: Settings, cancel: &AtomicBool,
-    descriptor: Option<crate::instances::GuiRetirementInputRef>) -> Result<AllTargetApplyPlan, ApplyPlanError> {
+    descriptor: Option<crate::instances::GuiRetirementInputRef>,
+    image: Result<Arc<crate::windows_coordinator::process_identity::CurrentImage>, String>) -> Result<AllTargetApplyPlan, ApplyPlanError> {
     use crate::{instances::{GuiCurrentExpectation, GuiReplacementTarget, GuiTargetExpectation, GuiTargetKind},
         windows_coordinator::{self as coordinator, windows_installation as owner}};
     let saved_sha256 = crate::settings::saved_intent_sha256(&wanted)?;
@@ -2484,11 +2519,7 @@ pub(crate) fn receive_all_target_apply_plan(wanted: Settings, cancel: &AtomicBoo
         let current = if layout.kind == crate::InstallationKind::Desktop {
             let mut bound = owner::BoundInstallation::open(anchor.as_path())?;
             if let Some(context) = coordinator::receive_saved_context(&bound)? { bound.attach_ancestor_context(context)?; }
-            match owner::observe_apply_current(&bound)? {
-                owner::ApplyCurrentObservation::GatewayPending(observation) => return Err(ApplyPlanError::GatewayRecoveryRequired(
-                    GatewayApplyRecovery { observation, target, bound })),
-                observation => gui_current_expectation(observation)?,
-            }
+            receive_desktop_apply_current(bound, &target, saved_sha256)?
         } else { GuiCurrentExpectation::NotApplicable {} };
         let expectation = GuiTargetExpectation { target, current };
         if let Some(prior) = targets.iter().find(|prior| prior.root.native_id() == root.native_id()) {
@@ -2508,7 +2539,7 @@ pub(crate) fn receive_all_target_apply_plan(wanted: Settings, cancel: &AtomicBoo
             return Err("retirement input does not bind exactly one selected vendor update".to_owned().into());
         }
     }
-    let Some(mut native) = inspect_native_apply(&wanted, cancel)? else { return Err(ApplyPlanError::Cancelled); };
+    let Some(mut native) = inspect_native_apply(&wanted, cancel, image)? else { return Err(ApplyPlanError::Cancelled); };
     let client_patch = if wanted.client_patch && !all_patched { Some(true) }
         else if !wanted.client_patch && any_patched { Some(false) } else { None };
     native.revert_services = client_patch == Some(false) && native.services_present;
@@ -2522,12 +2553,13 @@ pub(crate) fn receive_all_target_apply_plan(wanted: Settings, cancel: &AtomicBoo
 }
 
 #[cfg(windows)]
-fn receive_apply_continuation(intent: &crate::instances::GuiApplyContinuation, cancel: &AtomicBool)
+fn receive_apply_continuation(intent: &crate::instances::GuiApplyContinuation, cancel: &AtomicBool,
+    image: Result<Arc<crate::windows_coordinator::process_identity::CurrentImage>, String>)
     -> Result<AllTargetApplyPlan, String> {
     use crate::{instances::{GuiCurrentExpectation, GuiTargetKind}, windows_coordinator::windows_installation as owner};
     owner::validate_request_id(&intent.request_id)?;
     let wanted = crate::settings::receive_saved_intent(&intent.saved_settings_sha256)?;
-    let plan = receive_all_target_apply_plan(wanted, cancel, intent.retirement_input.clone()).map_err(|error| error.to_string())?;
+    let plan = receive_all_target_apply_plan(wanted, cancel, intent.retirement_input.clone(), image).map_err(|error| error.to_string())?;
     let mut expected = intent.targets.clone();
     expected.sort_by_key(apply_target_key);
     if expected.windows(2).any(|pair| apply_target_key(&pair[0]) == apply_target_key(&pair[1])) {
@@ -2655,14 +2687,15 @@ impl NativeApplyPlan {
 }
 
 #[cfg(windows)]
-fn inspect_native_apply(wanted: &Settings, cancellation: &AtomicBool) -> Result<Option<NativeApplyPlan>, String> {
+fn inspect_native_apply(wanted: &Settings, cancellation: &AtomicBool,
+    image: Result<Arc<crate::windows_coordinator::process_identity::CurrentImage>, String>) -> Result<Option<NativeApplyPlan>, String> {
     if cancellation.load(Ordering::SeqCst) { return Ok(None); }
     let rules = dns::checked_nrpt_state()?;
     if cancellation.load(Ordering::SeqCst) { return Ok(None); }
     let tasks = background::checked_task_state_with_cancel(cancellation)?;
     if cancellation.load(Ordering::SeqCst) { return Ok(None); }
     let program_outdated = if wanted.dns || routes_want_relay(wanted) || wanted.auto_patch_wanted() {
-        Some(background::checked_relay_outdated_with_cancel(cancellation)?)
+        Some(background::selected_delivery_required(cancellation, image?)?)
     } else { None };
     if cancellation.load(Ordering::SeqCst) { return Ok(None); }
     let relay = if wanted.dns || routes_want_relay(wanted) {
@@ -2691,13 +2724,13 @@ fn apply_acknowledged(ctx: &mut Ctx, wanted: Settings, cancellation: &AtomicBool
         #[cfg(windows)]
         {
             let received = match resume.as_ref() {
-                Some(intent) => receive_apply_continuation(intent, cancellation),
+                Some(intent) => receive_apply_continuation(intent, cancellation, ctx.lifetime.retained_image()),
                 None => {
                     let mut attempted = std::collections::BTreeSet::new();
                     loop {
                         if cancellation.load(Ordering::SeqCst) { break Err("Применение отменено до следующих действий.".into()); }
                         let descriptor = ctx.lifetime.retirement_input.lock().map_err(|_| "retirement input lock poisoned")?.as_ref().map(|input| input.descriptor.clone());
-                        match receive_all_target_apply_plan(wanted.clone(), cancellation, descriptor) {
+                        match receive_all_target_apply_plan(wanted.clone(), cancellation, descriptor, ctx.lifetime.retained_image()) {
                             Ok(plan) => break Ok(plan),
                             Err(ApplyPlanError::GatewayRecoveryRequired(prerequisite)) => {
                                 if let Err(error) = receive_gateway_prerequisite_once(&mut attempted, &prerequisite.observation, cancellation) { break Err(error); }
@@ -2712,6 +2745,21 @@ fn apply_acknowledged(ctx: &mut Ctx, wanted: Settings, cancellation: &AtomicBool
                                 }
                                 // Same acknowledged intent and discovery owner;
                                 // no native/profile effect before a full new plan.
+                            }
+                            Err(ApplyPlanError::VendorMetadataRecoveryRequired(prerequisite)) => {
+                                if let Err(error) = receive_pending_prerequisite_once(&mut attempted, &prerequisite.observation.slot_id,
+                                    &prerequisite.observation.operation_id, prerequisite.observation.current_sha256, cancellation) { break Err(error); }
+                                match crate::wsl_runtime::recover_apply_vendor_metadata(prerequisite.bound, &prerequisite.target,
+                                    &prerequisite.observation, &wanted, prerequisite.saved_sha256, cancellation) {
+                                    Ok(outcome) => { ctx.log(Level::Ok, outcome.clone()); recovery_results.push(outcome); }
+                                    Err(error) => {
+                                        let received = format!("vendor metadata prerequisite {:?}; {error}", prerequisite.observation);
+                                        ctx.log(Level::Err, received.clone()); recovery_results.push(received);
+                                        break Err(error);
+                                    }
+                                }
+                                // Only this recorded operation settled. A new
+                                // whole plan still owns package/readers/UAC.
                             }
                             Err(error) => break Err(error.to_string()),
                         }
@@ -2733,7 +2781,7 @@ fn apply_acknowledged(ctx: &mut Ctx, wanted: Settings, cancellation: &AtomicBool
                 plan.recheck()?;
                 let vendor_results = crate::wsl_runtime::apply_vendor_prerequisites(&plan, cancellation)?;
                 *ctx.lifetime.retirement_input.lock().map_err(|_| "retirement input lock poisoned")? = None;
-                let next = receive_all_target_apply_plan(wanted.clone(), cancellation, None).map_err(|error| error.to_string())?;
+                let next = receive_all_target_apply_plan(wanted.clone(), cancellation, None, ctx.lifetime.retained_image()).map_err(|error| error.to_string())?;
                 receive_settled_vendor_plan(&plan, &next, &vendor_results)?;
                 if (next.native.requires_elevation() && !is_admin()) || next.wsl()?.requires_elevation() {
                     return Err("UpdatePending: Apply requirements changed after vendor update".into());
@@ -2766,9 +2814,14 @@ fn receive_gateway_prerequisite_once(
     observation: &crate::windows_coordinator::windows_installation::GatewayPendingObservation,
     cancellation: &AtomicBool,
 ) -> Result<(), String> {
-    if cancellation.load(Ordering::SeqCst) { return Err("Cancelled: gateway prerequisite not started".into()); }
-    if !attempted.insert((observation.slot_id.clone(), observation.operation_id.clone(), observation.current_sha256)) {
-        return Err("RecoveryRequired: the same Pending gateway prerequisite remains unresolved; no automatic retry".into());
+    receive_pending_prerequisite_once(attempted, &observation.slot_id, &observation.operation_id, observation.current_sha256, cancellation)
+}
+#[cfg(windows)]
+fn receive_pending_prerequisite_once(attempted: &mut std::collections::BTreeSet<(String, String, [u8; 32])>,
+    slot_id: &str, operation_id: &str, current_sha256: [u8; 32], cancellation: &AtomicBool) -> Result<(), String> {
+    if cancellation.load(Ordering::SeqCst) { return Err("Cancelled: Pending prerequisite not started".into()); }
+    if !attempted.insert((slot_id.to_owned(), operation_id.to_owned(), current_sha256)) {
+        return Err("RecoveryRequired: the same Pending prerequisite remains unresolved; no automatic retry".into());
     }
     Ok(())
 }
@@ -2784,7 +2837,7 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
     #[cfg(target_os = "macos")]
     let mac_relay = crate::proxy::checked_listener_answers()?;
     #[cfg(windows)]
-    let Some(mut native) = inspect_native_apply(wanted, cancellation)? else { return Ok(()); };
+    let Some(mut native) = inspect_native_apply(wanted, cancellation, ctx.lifetime.retained_image())? else { return Ok(()); };
     #[cfg(windows)]
     { plan.recheck()?; native.revert_services = plan.client_patch == Some(false) && native.services_present; }
     #[cfg(windows)]
@@ -2831,7 +2884,7 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
         if native.disable_dns { disable_dns_effect(ctx)?; }
         else if native.enable_dns { enable_dns_effect(ctx)?; }
         else if native.update_shared_program || native.ensure_relay || native.stop_relay || native.watchdog.is_some() {
-            background_roles_effect(ctx, wanted.dns || routes_want_relay(wanted), wanted.auto_patch_wanted())?;
+            background_roles_effect(ctx, wanted.dns || routes_want_relay(wanted), wanted.auto_patch_wanted(), background::ImageDemand::DeliverSelectedImage)?;
         }
         if cancellation.load(Ordering::SeqCst) { return Ok(()); }
         let local_applied = endpoint::proxy_env_is_ours();
@@ -2917,6 +2970,20 @@ fn enable_all(ctx: &mut Ctx) -> Result<(), String> {
     if watchdog_allowed(admin) && !watchdog_checked()? {
         apply(ctx, Cap::Watchdog, true)?;
     }
+    #[cfg(windows)]
+    {
+        let relay = ctx.settings.dns || routes_want_relay(&ctx.settings);
+        let watchdog = ctx.settings.auto_patch_wanted();
+        if relay || watchdog {
+            let required = background::selected_delivery_required(&ctx.native_cancel, ctx.lifetime.retained_image()?)?;
+            if required {
+                if !admin {
+                    return Err("Служба обхода не подготовлена: нужны права администратора. Нажмите «Перезапустить от имени администратора».".into());
+                }
+                background_roles_effect(ctx, relay, watchdog, background::ImageDemand::DeliverSelectedImage)?;
+            }
+        }
+    }
     ctx.log(
         Level::Ok,
         "Готово. Откройте Antigravity и напишите что-нибудь в чат — здесь появится подтверждение, что модель ответила.",
@@ -2946,7 +3013,7 @@ fn repair(ctx: &mut Ctx) -> Result<(), String> {
     }
     #[cfg(windows)]
     let reconciled = background_roles_effect(ctx,
-        ctx.settings.dns || routes_want_relay(&ctx.settings), ctx.settings.auto_patch_wanted());
+        ctx.settings.dns || routes_want_relay(&ctx.settings), ctx.settings.auto_patch_wanted(), background::ImageDemand::DeliverSelectedImage);
     #[cfg(not(windows))]
     let reconciled = background::enable();
     reconciled.map_err(|error| format!("Служба обхода не подготовлена: {error}"))?;
@@ -3389,10 +3456,10 @@ fn revert_client_primary(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&AllTargetA
 // --- watchdog --------------------------------------------------------------
 
 #[cfg(windows)]
-fn background_roles_effect(ctx: &mut Ctx, relay: bool, watchdog: bool) -> Result<(), String> {
+fn background_roles_effect(ctx: &mut Ctx, relay: bool, watchdog: bool, demand: background::ImageDemand) -> Result<(), String> {
     let cancellation = ctx.native_cancel.clone();
     let image = ctx.lifetime.retained_image();
-    let receiving = background::reconcile_with_receiving(background::BackgroundDesired { relay, watchdog }, &cancellation, image);
+    let receiving = background::reconcile_with_receiving(background::BackgroundDesired { relay, watchdog }, demand, &cancellation, image);
     let result = receiving.result.clone();
     // The existing background owner finishes its full private diagnostic before
     // returning. Retain the complete typed packet before interpreting result.
@@ -3402,7 +3469,8 @@ fn background_roles_effect(ctx: &mut Ctx, relay: bool, watchdog: bool) -> Result
 
 fn set_watchdog_effect(ctx: &mut Ctx, on: bool) -> Result<(), String> {
     #[cfg(windows)]
-    return background_roles_effect(ctx, ctx.settings.dns || routes_want_relay(&ctx.settings), ctx.settings.auto_patch_wanted());
+    return background_roles_effect(ctx, ctx.settings.dns || routes_want_relay(&ctx.settings), ctx.settings.auto_patch_wanted(),
+        if on { background::ImageDemand::DeliverSelectedImage } else { background::ImageDemand::KeepCompatible });
     #[cfg(not(windows))]
     {
     #[cfg(target_os = "macos")]
@@ -3430,7 +3498,7 @@ fn enable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
     // I5: the rules name the relay as their first nameserver, so it has to be
     // answering before they are written.
     #[cfg(windows)]
-    background_roles_effect(ctx, true, ctx.settings.auto_patch_wanted()).map_err(|error| format!("Служба DNS не запустилась: {error}"))?;
+    background_roles_effect(ctx, true, ctx.settings.auto_patch_wanted(), background::ImageDemand::DeliverSelectedImage).map_err(|error| format!("Служба DNS не запустилась: {error}"))?;
     #[cfg(not(windows))]
     background::ensure_running().map_err(|error| format!("Служба DNS не запустилась: {error}"))?;
     ctx.log(Level::Ok, "Локальная служба DNS запущена.");
@@ -3522,7 +3590,7 @@ fn remove_dns_rules_effect(ctx: &mut Ctx) -> Result<(), String> {
 /// and switching the bypass off must not switch it off too.
 fn stop_relay_effect(ctx: &mut Ctx) -> Result<(), String> {
     #[cfg(windows)]
-    return background_roles_effect(ctx, false, ctx.settings.auto_patch_wanted());
+    return background_roles_effect(ctx, false, ctx.settings.auto_patch_wanted(), background::ImageDemand::KeepCompatible);
     #[cfg(not(windows))]
     {
     let watchdog_enabled = watchdog_checked()?;
@@ -3564,7 +3632,7 @@ fn ensure_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
     }
     #[cfg(windows)]
     let reconciled = background_roles_effect(ctx,
-        ctx.settings.dns || routes_want_relay(&ctx.settings), ctx.settings.auto_patch_wanted());
+        ctx.settings.dns || routes_want_relay(&ctx.settings), ctx.settings.auto_patch_wanted(), background::ImageDemand::DeliverSelectedImage);
     #[cfg(not(windows))]
     let reconciled = background::ensure_running();
     reconciled.map_err(|error| format!("Служба обхода не запустилась: {error}"))?;
@@ -3880,6 +3948,12 @@ mod tests {
         let mut fresh_positive_apply = std::collections::BTreeSet::new();
         cancel.store(false, Ordering::SeqCst);
         receive_gateway_prerequisite_once(&mut fresh_positive_apply, &pending, &cancel).unwrap();
+        let vendor = crate::windows_coordinator::windows_installation::VendorPendingObservation {
+            slot_id: "d".repeat(32), operation_id: "e".repeat(32), current_sha256: [9; 32],
+        };
+        receive_pending_prerequisite_once(&mut attempted, &vendor.slot_id, &vendor.operation_id, vendor.current_sha256, &cancel).unwrap();
+        assert!(receive_pending_prerequisite_once(&mut attempted, &vendor.slot_id, &vendor.operation_id, vendor.current_sha256, &cancel).unwrap_err().contains("same Pending"));
+        assert!(gui_current_expectation(crate::windows_coordinator::windows_installation::ApplyCurrentObservation::VendorPending(vendor)).is_err());
     }
     #[test]
     fn refresh_waits_for_owned_native_settlement_and_coalesces() {
@@ -4254,6 +4328,11 @@ mod tests {
             relay: Some(NativeRelayFacts { relay_compatible: true,
                 relay_outdated: false, relay_reporting: true }), watchdog_task: true, program_outdated: Some(false) };
         assert!(!NativeApplyPlan::receive(&wanted, &facts).unwrap().requires_elevation());
+        facts.program_outdated = Some(true);
+        let delivery = NativeApplyPlan::receive(&wanted, &facts).unwrap();
+        assert!(delivery.update_shared_program && delivery.requires_elevation());
+        assert!(!delivery.ensure_relay && delivery.watchdog.is_none());
+        facts.program_outdated = Some(false);
         facts.relay.as_mut().unwrap().relay_reporting = false;
         assert!(NativeApplyPlan::receive(&wanted, &facts).unwrap().ensure_relay);
         facts.relay.as_mut().unwrap().relay_reporting = true;

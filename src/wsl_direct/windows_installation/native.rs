@@ -257,6 +257,153 @@ pub(super) fn restore_received_dacl(file: &File, expected: &[u8]) -> Result<()> 
     }
     Ok(())
 }
+
+// Only the vendor Recover receiver supplies this helper's admitted snapshots.
+// Parse bounded self-relative components before comparing or passing a SID to FFI.
+fn group_security_parts(sd: &[u8]) -> Result<(&[u8], &[u8], &[u8])> {
+    validate_captured_identity_descriptor(sd)?;
+    let sid = |field: usize| -> Result<&[u8]> {
+        let start = u32::from_le_bytes(sd[field..field + 4].try_into().unwrap()) as usize;
+        let length = 8 + 4 * usize::from(sd[start + 1]);
+        sd.get(start..start + length).ok_or_else(|| "group metadata SID bounds invalid".into())
+    };
+    let control = u16::from_le_bytes([sd[2], sd[3]]);
+    let start = u32::from_le_bytes(sd[16..20].try_into().unwrap()) as usize;
+    let header = sd.get(start..).filter(|_| start >= 20).ok_or("group metadata DACL absent")?;
+    if control & 4 == 0 || header.len() < 8 || sd[12..16] != [0; 4] {
+        return Err("group metadata requires the captured non-null DACL and no SACL component".into());
+    }
+    let length = usize::from(u16::from_le_bytes([header[2], header[3]]));
+    let acl = header.get(..length).filter(|_| length >= 8).ok_or("group metadata ACL bounds invalid")?;
+    Ok((sid(4)?, sid(8)?, acl))
+}
+
+pub(super) fn current_token_user_sid() -> Result<Vec<u8>> {
+    let mut token = token_user()?;
+    let pointer = user_sid(&mut token)? as usize;
+    let start = pointer.checked_sub(token.as_ptr() as usize).ok_or("token SID outside buffer")?;
+    let sid = token.get(start..).ok_or("token SID outside buffer")?;
+    if sid.len() < 8 || sid[0] != 1 || sid[1] > 15 {
+        return Err("token SID invalid".into());
+    }
+    Ok(sid.get(..8 + 4 * usize::from(sid[1])).ok_or("token SID truncated")?.to_vec())
+}
+
+/// Pure receiving shared by admission, persisted proof and final receiving.
+/// True means the complete raw desired descriptor is already present.
+pub(super) fn receive_group_metadata(actual: &[u8], recorded: &[u8], desired: &[u8], actor: &[u8]) -> Result<bool> {
+    let (owner, group, dacl) = group_security_parts(actual)?;
+    let (old_owner, old_group, old_dacl) = group_security_parts(recorded)?;
+    let (wanted_owner, wanted_group, wanted_dacl) = group_security_parts(desired)?;
+    if wanted_owner != wanted_group || wanted_owner != actor
+        || owner != wanted_owner || old_owner != wanted_owner
+        || actual[..4] != desired[..4] || recorded[..4] != desired[..4]
+        || dacl != wanted_dacl || old_dacl != wanted_dacl
+        || (group != old_group && group != wanted_group) {
+        return Err("RecoveryRequired: vendor metadata is outside the exact group-only class".into());
+    }
+    if group == wanted_group && actual != desired {
+        return Err("RecoveryRequired: desired group lacks exact full descriptor receiving".into());
+    }
+    Ok(actual == desired)
+}
+
+/// Keeps the exact no-follow object, data and ancestor guards until after return
+/// and independent readback. It never adjusts token privileges or DACL/OWNER.
+pub(super) struct GroupMetadataHandle {
+    file: File,
+    _parents: Vec<File>,
+    expected: SourceSnapshot,
+    object: ObjectId,
+    recorded: Vec<u8>,
+    desired: Vec<u8>,
+    actor: Vec<u8>,
+}
+impl GroupMetadataHandle {
+    pub(super) fn open(expected: &SourceSnapshot, object: &ObjectId, recorded: &[u8], desired: &[u8], actor: &[u8]) -> Result<Self> {
+        let parents = parents(&expected.target)?;
+        // FILE_READ_DATA/ATTRIBUTES for existing snapshot receiving, plus only
+        // READ_CONTROL | WRITE_OWNER for security. No WRITE_DAC or SACL access.
+        let file = OpenOptions::new().access_mode(0x000A_0081).share_mode(READ)
+            .custom_flags(OPEN_REPARSE).open(NativeFsPath::from_path(&expected.target)?.as_path())
+            .map_err(|e| io("vendor group READ_CONTROL/WRITE_OWNER (not called)", e))?;
+        let mut received = Self { file, _parents: parents, expected: expected.clone(), object: object.clone(),
+            recorded: recorded.to_vec(), desired: desired.to_vec(), actor: actor.to_vec() };
+        received.recheck()?;
+        Ok(received)
+    }
+    pub(super) fn recheck(&mut self) -> Result<()> {
+        if current_token_user_sid()? != self.actor || object_id(&self.file)? != self.object
+            || !same_snapshot(&read_checked(&mut self.file, &self.expected.target)?, &self.expected) {
+            return Err("RecoveryRequired: group call actor/postimage changed before call".into());
+        }
+        receive_group_metadata(&self.expected.identity.security_descriptor, &self.recorded, &self.desired, &self.actor)?;
+        Ok(())
+    }
+    /// The returned WinError is the acquired native outcome. Nothing fallible
+    /// runs between the API and returning it to the durable result writer.
+    pub(super) fn set_group(&mut self) -> u32 {
+        let start = u32::from_le_bytes(self.desired[8..12].try_into().unwrap()) as usize;
+        #[cfg(test)]
+        TEST_GROUP_CALLS.with(|value| value.set(value.get() + 1));
+        unsafe { SetSecurityInfo(self.file.as_raw_handle(), 1, 2, std::ptr::null_mut(),
+            self.desired.as_mut_ptr().add(start).cast(), std::ptr::null_mut(), std::ptr::null_mut()) }
+    }
+    pub(super) fn readback(&mut self) -> Result<(SourceSnapshot, ObjectId)> {
+        let snapshot = read_checked(&mut self.file, &self.expected.target)?;
+        Ok((snapshot, object_id(&self.file)?))
+    }
+}
+#[cfg(test)]
+thread_local! { pub(super) static TEST_GROUP_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+pub(super) fn fixture_wrong_group_metadata(source: &FileIdentity) -> Result<FileIdentity> {
+    #[link(name = "advapi32")]
+    unsafe extern "system" { fn CheckTokenMembership(token: *mut c_void, sid: *mut c_void, member: *mut i32) -> i32; }
+    let actor = current_token_user_sid()?;
+    receive_group_metadata(&source.security_descriptor, &source.security_descriptor, &source.security_descriptor, &actor)?;
+    let user = sid_text(actor.as_ptr() as *mut c_void)?;
+    let text: Vec<_> = format!("O:{user}G:BU").encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = std::ptr::null_mut();
+    let mut length = 0;
+    if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(text.as_ptr(), 1, &mut descriptor, &mut length) } == 0 {
+        return Err(io("fixture differing group descriptor", std::io::Error::last_os_error()));
+    }
+    let descriptor = LocalMemory(descriptor);
+    let mut group = std::ptr::null_mut();
+    let mut defaulted = 0;
+    let mut enabled = 0;
+    if unsafe { GetSecurityDescriptorGroup(descriptor.0, &mut group, &mut defaulted) } == 0 || group.is_null()
+        || unsafe { CheckTokenMembership(std::ptr::null_mut(), group, &mut enabled) } == 0 || enabled == 0
+        || unsafe { EqualSid(group, actor.as_ptr() as *mut c_void) } != 0 {
+        return Err("owned fixture requires an enabled differing Builtin Users group".into());
+    }
+    let mut metadata = source.clone();
+    metadata.security_descriptor = unsafe { std::slice::from_raw_parts(descriptor.0.cast::<u8>(), length as usize) }.to_vec();
+    Ok(metadata)
+}
+#[cfg(test)]
+pub(super) fn initialize_token_group_fixture(path: &Path) -> Result<()> {
+    let _parents = parents(path)?;
+    let actor = current_token_user_sid()?;
+    let before = read_path(path, READ | DELETE)?;
+    let file = OpenOptions::new().access_mode(0x000A_0081).share_mode(READ | DELETE).custom_flags(OPEN_REPARSE)
+        .open(NativeFsPath::from_path(path)?.as_path()).map_err(|e| io("owned fixture group initialization", e))?;
+    let status = unsafe { SetSecurityInfo(file.as_raw_handle(), 1, 2, std::ptr::null_mut(), actor.as_ptr() as *mut c_void,
+        std::ptr::null_mut(), std::ptr::null_mut()) };
+    if status != 0 { return Err(format!("owned fixture group initialization WinError={status}")); }
+    let after = read_path(path, READ | DELETE)?;
+    let (owner, group, dacl) = group_security_parts(&after.identity.security_descriptor)?;
+    let (old_owner, _, old_dacl) = group_security_parts(&before.identity.security_descriptor)?;
+    if owner != actor || group != actor || owner != old_owner || dacl != old_dacl
+        || before.bytes != after.bytes || before.identity.index != after.identity.index || before.identity.size != after.identity.size
+        || before.identity.volume != after.identity.volume || before.identity.attributes != after.identity.attributes
+        || before.identity.creation != after.identity.creation || before.identity.write != after.identity.write {
+        return Err("owned fixture group initialization changed another field".into());
+    }
+    Ok(())
+}
 #[cfg(test)]
 pub(super) fn initialize_inherited_fixture(path: &Path) -> Result<()> {
     set_fixture_protection(path, false)
@@ -706,10 +853,29 @@ fn sid_text(sid: *mut c_void) -> Result<String> {
     String::from_utf16(unsafe { std::slice::from_raw_parts(text, n) })
         .map_err(|_| "SID text encoding".into())
 }
+fn validate_captured_identity_descriptor(descriptor: &[u8]) -> Result<()> {
+    // GetSecurityDescriptorOwner/Group expect a complete self-relative header
+    // and SID components. Check their bounds before passing captured bytes to FFI.
+    if descriptor.len() < 20 || descriptor[0] != 1 ||
+        u16::from_le_bytes([descriptor[2], descriptor[3]]) & 0x8000 == 0 {
+        return Err("captured security descriptor is absent or invalid".into());
+    }
+    for field in [4, 8] {
+        let offset = u32::from_le_bytes(descriptor[field..field + 4].try_into().unwrap()) as usize;
+        let sid = descriptor.get(offset..).filter(|_| offset >= 20)
+            .ok_or("captured owner/group is absent or invalid")?;
+        // SID revision 1 permits at most 15 subauthorities (Windows SID format).
+        if sid.len() < 8 || sid[0] != 1 || sid[1] > 15 || sid.len() < 8 + 4 * usize::from(sid[1]) {
+            return Err("captured owner/group is absent or invalid".into());
+        }
+    }
+    Ok(())
+}
 fn private_descriptor_with_identity(captured: Option<&[u8]>) -> Result<(LocalMemory, u32)> {
     let mut token = token_user()?;
     let user = sid_text(user_sid(&mut token)?)?;
     let identity = if let Some(captured) = captured {
+        validate_captured_identity_descriptor(captured)?;
         let mut captured = captured.to_vec();
         let mut owner = std::ptr::null_mut();
         let mut group = std::ptr::null_mut();
@@ -1425,6 +1591,53 @@ mod filesystem_path_tests {
         assert_ne!(unsafe { GetSecurityDescriptorGroup(normal_sd.as_mut_ptr().cast(), &mut normal_group, &mut defaulted) }, 0);
         assert_eq!(unsafe { EqualSid(group, normal_group) }, 0, "fixture group must differ from normal private creation");
         drop(normal);
+        // Exercise the actual shared replacement-file constructor with the
+        // received non-default group, including both backup and stage callers.
+        let backup_path = root.join("replacement-backup");
+        let stage_path = root.join("replacement-stage");
+        let target_path = root.join("replacement-target");
+        let displaced_path = root.join("replacement-displaced");
+        let backup = create_replacement_file(&backup_path, &before.bytes, &before.identity)?;
+        let stage = create_replacement_file(&stage_path, b"candidate", &before.identity)?;
+        create_replacement_file(&target_path, &before.bytes, &before.identity)?;
+        let identity_matches = |left: &[u8], right: &[u8]| -> Result<bool> {
+            let mut left = left.to_vec();
+            let mut right = right.to_vec();
+            for get in [GetSecurityDescriptorOwner, GetSecurityDescriptorGroup] {
+                let mut l = std::ptr::null_mut();
+                let mut r = std::ptr::null_mut();
+                let mut defaulted = 0;
+                if unsafe { get(left.as_mut_ptr().cast(), &mut l, &mut defaulted) } == 0 ||
+                    unsafe { get(right.as_mut_ptr().cast(), &mut r, &mut defaulted) } == 0 ||
+                    l.is_null() || r.is_null() || unsafe { EqualSid(l, r) } == 0 { return Ok(false); }
+            }
+            Ok(true)
+        };
+        assert!(identity_matches(&backup.identity.security_descriptor, &before.identity.security_descriptor)?);
+        assert!(identity_matches(&stage.identity.security_descriptor, &before.identity.security_descriptor)?);
+        let mut missing = before.identity.clone();
+        missing.security_descriptor.clear();
+        let missing_path = root.join("replacement-missing-identity");
+        assert!(create_replacement_file(&missing_path, b"no write", &missing).is_err());
+        assert!(matches!(fs::symlink_metadata(&missing_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound));
+        let mut malformed = before.identity.clone();
+        malformed.security_descriptor[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let malformed_path = root.join("replacement-malformed-identity");
+        assert!(create_replacement_file(&malformed_path, b"no write", &malformed).is_err());
+        assert!(matches!(fs::symlink_metadata(&malformed_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound));
+        let mut called = None;
+        replace_native_file(&target_path, &stage_path, &displaced_path, &mut called)?;
+        assert_eq!(called, Some(true));
+        let replaced = read_path(&target_path, READ | DELETE)?;
+        assert!(identity_matches(&replaced.identity.security_descriptor, &before.identity.security_descriptor)?);
+        let access = OpenOptions::new().access_mode(0x0006_0000).share_mode(READ | DELETE)
+            .custom_flags(OPEN_REPARSE).open(NativeFsPath::from_path(&target_path)?.as_path())
+            .map_err(|error| io("replacement fixture DACL handle", error))?;
+        restore_received_dacl(&access, &before.identity.security_descriptor)?;
+        drop(access);
+        let replaced = read_path(&target_path, READ | DELETE)?;
+        assert_eq!(replaced.bytes, b"candidate");
+        assert_eq!(replaced.identity.security_descriptor, before.identity.security_descriptor);
         let result = write_nonsecret_metadata_checked(&target, b"45", Some(&context));
         write_private(&root.join("actual-write-result.json"), &json(&result)?)?;
         let evidence = result.map_err(|error|error.to_string())?;
@@ -2079,7 +2292,7 @@ pub(super) fn create_replacement_file(
     metadata: &FileIdentity,
 ) -> Result<SourceSnapshot, String> {
     {
-        let mut file = create_owned_file(path)?;
+        let mut file = create_owned_file_with_identity(path, Some(&metadata.security_descriptor))?;
         identity(&file)?;
         file.write_all(bytes).map_err(|e| io("stage write", e))?;
         let basic = BasicInformation {
