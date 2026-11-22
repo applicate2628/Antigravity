@@ -1139,12 +1139,19 @@ fn binary_failure_message(summary: &patch_binary::BinarySummary) -> String {
     }
 }
 
+/// Legacy CA cleanup is inapplicable without a macOS trust-store owner.
+#[cfg(target_os = "macos")]
+pub fn remove_legacy_ca_quiet(_owner: &mut utils::CommandOutcome) -> Result<bool, String> {
+    Ok(false)
+}
+
 /// The same removal without a word of output, for the window.
 ///
 /// Both guards are load-bearing and neither is cosmetic (I39): nothing to remove
 /// is the common case, and pulling the root from under a relay that is still an
 /// older build makes every gate request die as `BadCertificate`. Returns whether
 /// anything was actually taken out.
+#[cfg(not(target_os = "macos"))]
 pub fn remove_legacy_ca_quiet(owner: &mut utils::CommandOutcome) -> Result<bool, String> {
     let cert = proxy::ca_cert_path();
     if !cert.exists() {
