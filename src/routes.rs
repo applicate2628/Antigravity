@@ -91,15 +91,12 @@ impl Kind {
     }
 }
 
-/// The order before anything has been measured. Own first; the owner's
-/// dedicated group server (Group) next; then the authenticated CONNECT relay
-/// (relay.xbox-dns.ru) which has dedicated permitted-region egress and zero
-/// region-400s; then built-in foreign exits; the user's VPN next; and direct
-/// DNS substitution last as fallback when proxy routes are not usable.
-///
-/// A build without a DNS layer (Linux) has no substituted address for the direct
-/// tunnel to reach, so there it goes to the back regardless; see `order_with`.
+/// The default order within a tier for routes without latency evidence.
 const DEFAULT_ORDER: [Kind; N] = [Kind::Group, Kind::Own, Kind::Relay, Kind::Exits, Kind::Direct, Kind::Vpn];
+
+/// Direct participates in the normal tiers on Windows and macOS. Linux,
+/// including WSL, keeps Direct in the fallback tier.
+const DIRECT_USES_NORMAL_TIERS: bool = cfg!(any(target_os = "windows", target_os = "macos"));
 
 /// Routes taken first whenever usable and not benched, ahead of anything
 /// measured (owner, 2026-10-05: «если активен прокси от моей группы - то все
@@ -662,7 +659,7 @@ pub fn order(usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
         return if usable(k) { vec![k] } else { Vec::new() };
     }
     let s = snapshot();
-    order_with(&s, cfg!(target_os = "windows"), usable)
+    order_with(&s, DIRECT_USES_NORMAL_TIERS, usable)
 }
 
 /// Orders current health evidence using the caller's already captured settings.
@@ -684,7 +681,7 @@ pub(crate) fn order_for_profile(
         [Kind::Group, Kind::Own]
     };
     let s = snapshot_with_pinned(pinned);
-    order_with(&s, cfg!(target_os = "windows"), usable)
+    order_with(&s, DIRECT_USES_NORMAL_TIERS, usable)
 }
 
 /// The route a diagnostic run pinned in `settings.json` (`debug_route`).
@@ -762,7 +759,7 @@ pub fn leader() -> Option<Kind> {
 /// in the log when it changed. Run once per warm pass, after the probes.
 pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
     let s = snapshot();
-    let order = order_with(&s, cfg!(target_os = "windows"), usable);
+    let order = order_with(&s, DIRECT_USES_NORMAL_TIERS, usable);
     let Some(&best) = order.first() else {
         return;
     };
@@ -791,9 +788,8 @@ pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
 ///
 /// Group, then Own, first when usable and not benched (`PINNED`). Then four tiers, each in the default
 /// order inside itself unless measured: proven (fastest first, the sitting
-/// leader kept unless clearly beaten), measured, unmeasured, penalised. Without
-/// a DNS layer the direct tunnel has nothing substituted to reach, so it counts
-/// as penalised.
+/// leader kept unless clearly beaten), measured, unmeasured, penalised.
+/// Platforms where Direct is fallback-only place it in the penalised tier.
 ///
 /// A benched Own joins the benched tier like any other route. Putting it first
 /// regardless meant a region 400 through the user's proxy was answered by
@@ -801,7 +797,7 @@ pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
 /// said «следующее соединение пойдёт другим» and the next one went the same
 /// way, refusal after refusal. The bench ends, or an answer lifts it, and Own
 /// is first again.
-fn order_with(s: &Snapshot, has_dns_layer: bool, usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
+fn order_with(s: &Snapshot, direct_uses_normal_tiers: bool, usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
     let benched = |k: Kind| {
         penalised(&s.penalised, k) || penalised(&s.stumbled, k) || penalised(&s.silent, k)
     };
@@ -830,7 +826,7 @@ fn order_with(s: &Snapshot, has_dns_layer: bool, usable: impl Fn(Kind) -> bool) 
         .collect();
 
     let tier = |k: Kind| -> u8 {
-        if benched(k) || (k == Kind::Direct && !has_dns_layer) {
+        if benched(k) || (k == Kind::Direct && !direct_uses_normal_tiers) {
             3
         } else if proven(&s.ok_at, &s.bad_at, k) {
             0
@@ -2213,7 +2209,7 @@ pub struct Row {
 pub fn rows(usable: impl Fn(Kind) -> bool) -> Vec<Row> {
     let s = snapshot();
     let open = open_counts();
-    let order = order_with(&s, cfg!(target_os = "windows"), &usable);
+    let order = order_with(&s, DIRECT_USES_NORMAL_TIERS, &usable);
     let mut kinds: Vec<Kind> = order.clone();
     kinds.extend(ALL.iter().copied().filter(|k| !order.contains(k)));
     // A build without the relay has no such route at all - not an unusable one.
@@ -2914,12 +2910,32 @@ mod tests {
     }
 
     #[test]
-    fn without_a_dns_layer_direct_goes_last_whatever_it_measured() {
+    fn fallback_only_direct_goes_last_whatever_it_measured() {
         let mut s = blank();
         s.samples[Kind::Direct.index()] = sample(50);
         s.samples[Kind::Exits.index()] = sample(400);
         let order = order_with(&s, false, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
         assert_eq!(order, vec![Kind::Exits, Kind::Relay, Kind::Direct]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_direct_ranks_by_proof_and_still_respects_the_bench() {
+        let mut s = blank();
+        s.samples[Kind::Direct.index()] = sample(500);
+        s.samples[Kind::Exits.index()] = sample(50);
+        s.ok_at[Kind::Direct.index()] = Some(Instant::now());
+        let usable = |k| matches!(k, Kind::Direct | Kind::Exits);
+        assert_eq!(
+            order_with(&s, DIRECT_USES_NORMAL_TIERS, usable),
+            vec![Kind::Direct, Kind::Exits],
+        );
+
+        s.penalised[Kind::Direct.index()] = Some(Instant::now() + ms(60_000));
+        assert_eq!(
+            order_with(&s, DIRECT_USES_NORMAL_TIERS, usable),
+            vec![Kind::Exits, Kind::Direct],
+        );
     }
 
     #[test]
@@ -3291,8 +3307,8 @@ mod tests {
         record(Kind::Direct, ms(300));
         record_failure(Kind::Direct);
         assert_eq!(latency(Kind::Direct), None);
-        // With the DNS layer, as on Windows: without it (Linux) Direct is last
-        // whatever happened to it, and the test could not tell the two apart.
+        // Use the normal tiers so the test can distinguish a benched Direct
+        // route from an unmeasured one.
         let after_loss = order_with(&snapshot(), true, |_| true);
         probe_failed(Kind::Direct);
         let after_probe = order_with(&snapshot(), true, |_| true);
