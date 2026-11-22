@@ -178,7 +178,12 @@ pub(crate) fn commit<'a>(
     let result = write_response(&mut client, RESP_ESTABLISHED, &mut count,
         |client| {
             let left = remaining(deadline, cancelled).map_err(CommitCause::Boundary)?;
-            client.set_write_timeout(Some(left)).map_err(CommitCause::Io)
+            client.set_write_timeout(Some(left)).map_err(CommitCause::Io)?;
+            #[cfg(target_os = "macos")]
+            if matches!(&opened, OpenedRoute::Tcp { kind: Some(routes::Kind::Direct), .. }) {
+                routes::validate_mac_serving_generation().map_err(|error| CommitCause::Io(io::Error::other(error)))?;
+            }
+            Ok(())
         },
         |client| {
             remaining(deadline, cancelled).map_err(CommitCause::Boundary)?;

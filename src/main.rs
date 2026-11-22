@@ -41,6 +41,8 @@ mod group_key;
 mod loopback;
 mod ls_log;
 mod net;
+#[cfg(any(target_os = "macos", test))]
+mod netif;
 mod ops;
 mod patch_binary;
 mod patch_ide;

@@ -710,7 +710,7 @@ fn open_qualified_dns(host: &str, deadline: Instant, cancelled: &std::sync::atom
                 }
                 let addresses = valid.iter().map(|(admission, _)| std::net::SocketAddr::from((admission.ip, 443))).collect();
                 let open_budget = deadline.checked_duration_since(Instant::now()).filter(|left| !left.is_zero()).ok_or("DNS candidate deadline expired")?.min(maximum);
-                let connection = connect_addrs_checked(addresses, open_budget, crate::net::pin_interface(),
+                let connection = connect_addrs_checked(addresses, open_budget, valid[0].0.pin_interface(),
                     |address| {
                         if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline || !checks.is_none_or(|checks| (checks.address)(address)) { return false; }
                         let Some((admission, candidate)) = valid.iter().find(|(admission, _)| address == std::net::SocketAddr::from((admission.ip, 443))) else { return false; };

@@ -256,6 +256,10 @@ struct DnsEndpoint {
 
 struct DnsState {
     generation: u64,
+    #[cfg(target_os = "macos")]
+    mac_generation: Option<u64>,
+    #[cfg(target_os = "macos")]
+    mac_last_confirmed: Option<crate::netif::MacRelayEgress>,
     witness: Option<crate::resolvers::DnsSourceWitness>,
     allow_missing_defaults: bool,
     network: Option<u64>,
@@ -272,7 +276,18 @@ struct DnsSourceCursor { source: crate::ls_log::LogSourceId, end: u64, boundary:
 impl DnsState {
     const fn new() -> Self {
         Self { generation: 0, witness: None, allow_missing_defaults: false, network: None,
+            #[cfg(target_os = "macos")]
+            mac_generation: None,
+            #[cfg(target_os = "macos")]
+            mac_last_confirmed: None,
             pending: Vec::new(), entries: Vec::new(), hosts: Vec::new(), next_host: 0, maintenance_thread: None, consumed: Vec::new() }
+    }
+
+    fn advance_generation(&mut self) -> Result<(), String> {
+        self.generation = self.generation.checked_add(1).ok_or("DNS generation exhausted")?;
+        self.pending.clear();
+        self.hosts.clear();
+        Ok(())
     }
 }
 
@@ -614,6 +629,10 @@ pub fn set_context(fingerprint: u64) -> bool {
     let Ok(mut t) = TABLE.lock() else {
         return false;
     };
+    set_context_locked(&mut t, fingerprint)
+}
+
+fn set_context_locked(t: &mut Table, fingerprint: u64) -> bool {
     if t.context == fingerprint {
         return false;
     }
@@ -645,6 +664,57 @@ pub fn set_context(fingerprint: u64) -> bool {
         (t.penalised[g], t.streak[g], t.bad_at[g], t.refused_at[g], t.bad_count[g]) = kept;
     }
     !first
+}
+
+fn current_dns_context(table: &Table) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    if table.dns.mac_last_confirmed.is_some() && table.dns.mac_generation.is_none() {
+        return None;
+    }
+    (table.context != 0).then_some(table.context)
+}
+
+/// Change the Mac socket policy and the DNS proof owner under the same lock.
+/// Keep shared route history during an unmeasured period; a new confirmed
+/// network resets it through the same owner used by the other platforms.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_mac_egress(observation: Option<crate::netif::MacRelayEgress>) -> Result<bool, String> {
+    let mut table = TABLE.lock().map_err(|_| "route state unavailable")?;
+    let last_confirmed = table.dns.mac_last_confirmed.as_ref();
+    let current = if table.dns.mac_generation.is_some() { last_confirmed } else { None };
+    if current == observation.as_ref() { return Ok(false); }
+    let confirmed_change = observation.is_some() && observation.as_ref() != last_confirmed;
+    let pin = observation.as_ref().map_or(0, crate::netif::MacRelayEgress::pin);
+    table.dns.advance_generation()?;
+    let generation = table.dns.generation;
+    table.dns.mac_generation = observation.as_ref().map(|_| generation);
+    if confirmed_change {
+        set_context_locked(&mut table, generation);
+        table.dns.mac_last_confirmed = observation;
+    }
+    table.dns.network = current_dns_context(&table);
+    // A refusal in the superseded generation cannot veto a new qualification.
+    for entry in &mut table.dns.entries { entry.refusal_blocking = false; }
+    crate::proxy::set_vpn_exit(None);
+    crate::net::set_pin_interface(pin);
+    DNS_CHANGED.notify_all();
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn mac_vpn_generation() -> Option<u64> {
+    let table = TABLE.lock().ok()?;
+    if crate::net::tunnel_up() { table.dns.mac_generation } else { None }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn receive_mac_vpn_exit(generation: u64, publish: impl FnOnce()) -> bool {
+    let Ok(table) = TABLE.lock() else { return false; };
+    if table.dns.mac_generation != Some(generation) || !crate::net::tunnel_up() {
+        return false;
+    }
+    publish();
+    true
 }
 
 /// The order to try routes in for the next connection, best first, among those
@@ -985,7 +1055,31 @@ struct Tunnel {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DnsAdmission { pub(crate) ip: std::net::Ipv4Addr, pub(crate) generation: u64 }
+pub(crate) struct DnsAdmission {
+    pub(crate) ip: std::net::Ipv4Addr,
+    pub(crate) generation: u64,
+    #[cfg(target_os = "macos")]
+    interface: u32,
+}
+
+impl DnsAdmission {
+    // The production caller holds TABLE across the generation and Mac pin read.
+    fn new(ip: std::net::Ipv4Addr, generation: u64) -> Self {
+        Self {
+            ip,
+            generation,
+            #[cfg(target_os = "macos")]
+            interface: crate::net::pin_interface(),
+        }
+    }
+
+    pub(crate) fn pin_interface(self) -> u32 {
+        #[cfg(target_os = "macos")]
+        { self.interface }
+        #[cfg(not(target_os = "macos"))]
+        { crate::net::pin_interface() }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DnsPeerIdentity { pub(crate) host: String, pub(crate) ip: std::net::Ipv4Addr, pub(crate) generation: u64 }
@@ -1010,14 +1104,12 @@ pub(crate) fn begin_dns_maintenance(host: &str, witness: &crate::resolvers::DnsS
         || entry.refusal_at.is_some_and(|at| at.elapsed() < PROOF_TTL)
         || entry.model_seen.is_some_and(|at| at.elapsed() < PROOF_TTL)
         || live.iter().any(|peer| peer.host == entry.host && peer.ip == entry.candidate.ip && peer.generation == entry.generation));
-    let network = (table.context != 0).then_some(table.context);
+    let network = current_dns_context(&table);
     if table.dns.witness.as_ref() != Some(witness) || table.dns.network != network || table.dns.allow_missing_defaults != allow_missing_defaults {
-        table.dns.generation = table.dns.generation.checked_add(1).ok_or("DNS generation exhausted")?;
+        table.dns.advance_generation()?;
         table.dns.witness = Some(witness.clone());
         table.dns.allow_missing_defaults = allow_missing_defaults;
         table.dns.network = network;
-        table.dns.pending.clear();
-        table.dns.hosts.clear();
     }
     if !table.dns.hosts.iter().any(|work| work.host == host) {
         table.dns.hosts.push(DnsHostWork { host: host.clone(), cursor: Some(Default::default()),
@@ -1103,7 +1195,7 @@ pub(crate) fn publish_dns_candidate(host: &str, generation: u64, candidate: crat
     let peer = DnsPeerIdentity { host: host.clone(), ip: candidate.ip, generation };
     let protected = live_dns_answer(&peer);
     let mut table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    if table.dns.generation != generation || table.dns.network != (table.context != 0).then_some(table.context) { return Ok(false); }
+    if table.dns.generation != generation || table.dns.network != current_dns_context(&table) { return Ok(false); }
     if protected && !matches!(&result, Ok(crate::proxy::CandidateProbe::Reachable(_))) { return Ok(true); }
     let pos = table.dns.entries.iter().position(|entry| entry.host == host && entry.candidate.ip == candidate.ip);
     let entry = match pos {
@@ -1208,7 +1300,7 @@ pub(crate) fn wait_dns_change(budget: Duration) -> Result<(), String> {
 pub(crate) fn dns_selection(host: &str, witness: &crate::resolvers::DnsSourceWitness) -> Result<DnsSelection, String> {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    let network = (table.context != 0).then_some(table.context);
+    let network = current_dns_context(&table);
     if table.dns.witness.as_ref() != Some(witness) || table.dns.network != network { return Ok(DnsSelection::Pending); }
     let generation = table.dns.generation;
     let mut ready: Vec<_> = table.dns.entries.iter().filter(|entry| entry.host == host && entry.generation == generation
@@ -1219,7 +1311,7 @@ pub(crate) fn dns_selection(host: &str, witness: &crate::resolvers::DnsSourceWit
     ready.sort_by_key(|(proven, latency, _)| (!*proven, *latency));
     if !ready.is_empty() {
         return Ok(DnsSelection::Ready(ready.into_iter().map(|(_, _, candidate)|
-            (DnsAdmission { ip: candidate.ip, generation }, candidate)).collect()));
+            (DnsAdmission::new(candidate.ip, generation), candidate)).collect()));
     }
     if table.dns.pending.contains(&host) { Ok(DnsSelection::Pending) } else { Ok(DnsSelection::NoEligible) }
 }
@@ -1227,7 +1319,9 @@ pub(crate) fn dns_selection(host: &str, witness: &crate::resolvers::DnsSourceWit
 pub(crate) fn dns_admission_current(host: &str, admission: DnsAdmission, witness: &crate::resolvers::DnsSourceWitness) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let Ok(table) = TABLE.lock() else { return false; };
-    let network = (table.context != 0).then_some(table.context);
+    let network = current_dns_context(&table);
+    #[cfg(target_os = "macos")]
+    if admission.interface != crate::net::pin_interface() { return false; }
     table.dns.generation == admission.generation && table.dns.network == network && table.dns.witness.as_ref() == Some(witness)
         && table.dns.entries.iter().any(|entry| entry.host == host && entry.generation == admission.generation
             && entry.candidate.ip == admission.ip && entry.reachable && entry.checked.is_some_and(|at| at.elapsed() < SAMPLE_TTL)
@@ -1238,7 +1332,7 @@ pub(crate) fn dns_admission_current(host: &str, admission: DnsAdmission, witness
 pub(crate) fn dns_maintenance_pending(host: &str, witness: &crate::resolvers::DnsSourceWitness) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     TABLE.lock().ok().is_some_and(|table| table.dns.witness.as_ref() == Some(witness)
-        && table.dns.network == (table.context != 0).then_some(table.context) && table.dns.pending.contains(&host))
+        && table.dns.network == current_dns_context(&table) && table.dns.pending.contains(&host))
 }
 
 #[cfg(test)]
@@ -1311,7 +1405,7 @@ fn dns_silence(peer: &DnsPeerIdentity, binding: &DnsBinding) -> Option<Duration>
     let fresh = crate::resolvers::current_witness(policy).ok()?;
     if fresh != binding.witness || !crate::resolvers::source_is_current(&binding.candidate, &fresh).ok()? { return None; }
     let mut table = TABLE.lock().ok()?;
-    let network = (table.context != 0).then_some(table.context);
+    let network = current_dns_context(&table);
     if table.dns.generation != peer.generation || table.dns.network != network || table.dns.witness.as_ref() != Some(&fresh) { return None; }
     if !crate::resolvers::source_is_current(&binding.candidate, &fresh).ok()? { return None; }
     let current = table.dns.entries.iter().find(|entry| entry.generation == peer.generation && entry.host == peer.host && entry.candidate.ip == peer.ip)?;
@@ -1400,6 +1494,23 @@ pub(crate) fn validate_serving_dns(socket: &TcpStream) -> Result<(), String> {
     let expected = std::net::SocketAddr::from((binding.admission.ip, 443));
     if socket.peer_addr().ok() != Some(expected) { return Err("DNS candidate peer changed".into()); }
     Ok(())
+}
+
+/// The last check at the Mac write boundary uses only current route state.
+/// Source settings and the peer socket were checked before preparing transfer.
+#[cfg(target_os = "macos")]
+pub(crate) fn validate_mac_serving_generation() -> Result<(), String> {
+    SERVING.with(|state| {
+        let serving = state.borrow();
+        if let Some(serving) = serving.as_ref() {
+            if let Some(binding) = serving.dns_binding.as_ref() {
+                if !dns_admission_current(&serving.host, binding.admission, &binding.witness) {
+                    return Err("DNS candidate generation or interface changed before CONNECT write".into());
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Ends the current thread's gate-connection record when dropped.
@@ -1877,7 +1988,7 @@ pub(crate) fn receive_direct_batch(signals: &[crate::ls_log::DirectSignal]) -> V
                 || (prepared.needs_legacy && !matches!(current_legacy.as_ref(), Some(Ok(witness)) if witness == &prepared.witness)) {
                 results.push(DirectBatchEffect::NoAction("settings changed before batch")); continue;
             }
-            let network = (table.context != 0).then_some(table.context);
+            let network = current_dns_context(&table);
             if table.dns.generation != prepared.peer.generation || table.dns.network != network || table.dns.witness.as_ref() != Some(&prepared.witness)
                 {
                 results.push(DirectBatchEffect::NoAction("source or context changed")); continue;
@@ -1980,7 +2091,7 @@ pub(crate) fn receive_direct_batch(signals: &[crate::ls_log::DirectSignal]) -> V
                 let Some(tunnel) = tunnels.iter_mut().find(|tunnel| tunnel.id == id && tunnel.dns_peer.as_ref() == Some(&plan.peer)) else {
                     results.push(DirectBatchEffect::NoAction("original tunnel missing")); continue;
                 };
-                let network = (table.context != 0).then_some(table.context);
+                let network = current_dns_context(&table);
                 if table.dns.generation != plan.peer.generation || table.dns.network != network || table.dns.witness.as_ref() != Some(&plan.witness)
                     || tunnel.dns_binding.as_ref().is_none_or(|binding| binding.witness != plan.witness
                         || !matches!(crate::resolvers::source_is_current(&binding.candidate, &plan.witness), Ok(true)))
@@ -2511,7 +2622,7 @@ mod tests {
         let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
         let mut cleanup = Cleanup(vec![id]);
         let peer = DnsPeerIdentity { host: HOST.into(), ip: candidate.ip, generation };
-        let binding = DnsBinding { admission: DnsAdmission { ip: candidate.ip, generation }, candidate: candidate.clone(),
+        let binding = DnsBinding { admission: DnsAdmission::new(candidate.ip, generation), candidate: candidate.clone(),
             witness: witness.clone(), allow_missing_defaults: true };
         let opened = Instant::now();
         TUNNELS.lock().unwrap().push(Tunnel { id, kind: Kind::Direct, own: None, host: HOST.into(), opened,
@@ -2536,7 +2647,7 @@ mod tests {
             let other_id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
             cleanup.0.push(other_id);
             let other_peer = DnsPeerIdentity { host: OTHER.into(), ip: candidate.ip, generation };
-            let other_binding = DnsBinding { admission: DnsAdmission { ip: candidate.ip, generation }, candidate: candidate.clone(),
+            let other_binding = DnsBinding { admission: DnsAdmission::new(candidate.ip, generation), candidate: candidate.clone(),
                 witness: witness.clone(), allow_missing_defaults: true };
             TUNNELS.lock().unwrap().push(Tunnel { id: other_id, kind: Kind::Direct, own: None, host: OTHER.into(), opened,
                 closed: None, answered_at: None, activity: Arc::new(Activity::default()), client: None, upstream: None,
@@ -2709,7 +2820,7 @@ mod tests {
                 let other_id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
                 cleanup.0.push(other_id);
                 let other_candidate = crate::resolvers::test_source_candidate(std::net::Ipv4Addr::new(1, 1, 1, 1), &witness);
-                let other_binding = DnsBinding { admission: DnsAdmission { ip: other_candidate.ip, generation }, candidate: other_candidate.clone(),
+                let other_binding = DnsBinding { admission: DnsAdmission::new(other_candidate.ip, generation), candidate: other_candidate.clone(),
                     witness: witness.clone(), allow_missing_defaults: true };
                 let other_peer = DnsPeerIdentity { host: HOST.into(), ip: other_candidate.ip, generation };
                 TUNNELS.lock().unwrap().push(Tunnel { id: other_id, kind: Kind::Direct, own: None, host: HOST.into(), opened: Instant::now(),

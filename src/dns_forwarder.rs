@@ -557,6 +557,9 @@ fn invalidate_interface() {
 enum IspObservation { Cached(u32), Unsupported, Command(crate::command_lifetime::PendingCommand), Unavailable(String) }
 
 fn prepare_isp_interface(root: &std::sync::Arc<crate::command_lifetime::CommandLifetime>) -> IspObservation {
+    if cfg!(target_os = "macos") {
+        return IspObservation::Cached(net::pin_interface());
+    }
     if egress::observation_support() == egress::ObservationSupport::Unsupported {
         return IspObservation::Unsupported;
     }
@@ -665,24 +668,30 @@ static MEASURING_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// budgets of its own.
 fn measure_vpn_exit() {
     use std::sync::atomic::Ordering;
+    #[cfg(target_os = "macos")]
+    let Some(generation) = routes::mac_vpn_generation() else { return; };
     if MEASURING_EXIT.swap(true, Ordering::SeqCst) {
         return;
     }
     let spawned = thread::Builder::new()
         .name("vpn-exit".to_string())
-        .spawn(|| {
+        .spawn(move || {
             let exit = upstream::machine_exit();
             let (country, permitted) = match &exit {
                 Some((_, loc)) => (loc.clone(), Some(!upstream::region_is_blocked(loc))),
                 None => (String::new(), None),
             };
-            // Only while a tunnel is still up: a measurement that raced the VPN
-            // going down would otherwise offer a route that no longer exists.
-            if net::tunnel_up() {
+            let publish = || {
                 proxy::set_vpn_exit(permitted);
                 if let Ok(mut c) = VPN_EXIT_COUNTRY.lock() {
                     *c = country.clone();
                 }
+            };
+            #[cfg(target_os = "macos")]
+            let received = routes::receive_mac_vpn_exit(generation, publish);
+            #[cfg(not(target_os = "macos"))]
+            let received = if net::tunnel_up() { publish(); true } else { false };
+            if received {
                 log(&match permitted {
                     Some(true) => format!(
                         "VPN выходит в {} — его можно использовать как маршрут",
@@ -731,6 +740,22 @@ fn candidate_probe_outcome(result: &Result<proxy::CandidateProbe, String>) -> St
         Ok(proxy::CandidateProbe::Refused) => "refused".to_string(),
         Err(error) => format!("failed: {error}"),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn observe_mac_egress(
+    root: &std::sync::Arc<crate::command_lifetime::CommandLifetime>,
+    previous: &mut Option<crate::command_lifetime::PendingCommand>,
+) -> Result<Option<crate::netif::MacRelayEgress>, String> {
+    if previous.as_ref().is_some_and(crate::command_lifetime::PendingCommand::pending) {
+        return Ok(None);
+    }
+    let (observation, command) = root.call_with_outcome("Mac relay egress observation", |owner| {
+        egress::detect_mac_relay(owner, ROUTE_PROBE_DEST)
+    })?;
+    root.receive();
+    *previous = command.pending().then_some(command);
+    observation
 }
 
 fn maintain_dns_candidate_step_with<W, K, D, P, L>(if_index: u32, allow_missing_defaults: bool, work: Option<&resolvers::ResolverWork>,
@@ -829,6 +854,8 @@ fn warm_forever(root: std::sync::Arc<crate::command_lifetime::CommandLifetime>) 
     let mut tunnel_observed = None;
     let mut command_result = Ok(());
     let mut next_regular = Instant::now() + WARM_EVERY;
+    #[cfg(target_os = "macos")]
+    let (mut next_mac_observation, mut mac_probe) = (Instant::now(), None);
     loop {
         if root.receive_role_result(&mut command_result) {
             if let Err(error) = &command_result { log_proxy(&format!("результат команды службы: {error}")); }
@@ -851,6 +878,36 @@ fn warm_forever(root: std::sync::Arc<crate::command_lifetime::CommandLifetime>) 
             vpn_exit: if tunnel_observed == Some(true) { &exit_country } else { "" },
             routes: routes::rows(|k| proxy::route_usable(k, ROUTE_PROBE_HOST)),
         });
+        #[cfg(target_os = "macos")]
+        if Instant::now() >= next_mac_observation {
+            let observation = match observe_mac_egress(&root, &mut mac_probe) {
+                Ok(observation) => observation,
+                Err(error) => { log(&format!("наблюдение интерфейса macOS недоступно: {error}")); None },
+            };
+            let observed_tunnel = observation.as_ref().map(crate::netif::MacRelayEgress::tunnel);
+            match routes::set_mac_egress(observation) {
+                Ok(changed) => {
+                    tunnel_observed = observed_tunnel;
+                    if changed {
+                        resolvers::invalidate_witnessed_candidates();
+                        if let Ok(mut country) = VPN_EXIT_COUNTRY.lock() { country.clear(); }
+                        log_proxy("сеть изменилась — что работает, выясняется заново");
+                    }
+                    if tunnel_observed == Some(true) && proxy::vpn_exit().is_none() {
+                        measure_vpn_exit();
+                        since_exit_check = Duration::ZERO;
+                    }
+                }
+                Err(error) => {
+                    routes::suspend_dns_maintenance();
+                    tunnel_observed = None;
+                    log_proxy(&format!("состояние интерфейса macOS недоступно: {error}"));
+                }
+            }
+            // Bounded candidate maintenance can make multiple passes without
+            // sleeping. Observe on the regular warm cadence, never per candidate.
+            next_mac_observation = Instant::now() + WARM_EVERY;
+        }
         // One syscall, every pass: where the default route goes now. A change
         // is a VPN coming up or going down, or a different network - worth the
         // full scan right away rather than on the four-minute clock.
@@ -933,7 +990,7 @@ fn warm_forever(root: std::sync::Arc<crate::command_lifetime::CommandLifetime>) 
         // half a minute after a failed detection, and taking that for a new
         // network wiped every bench - and put back first the route the gate had
         // just refused - twice per hiccup.
-        if egress != 0 && routes::set_context(network_fingerprint(egress, best, net::tunnel_up())) {
+        if !cfg!(target_os = "macos") && egress != 0 && routes::set_context(network_fingerprint(egress, best, net::tunnel_up())) {
             log_proxy("сеть изменилась — что работает, выясняется заново");
         }
         let candidate_pending = match maintain_dns_candidate_step(egress, true, None) {

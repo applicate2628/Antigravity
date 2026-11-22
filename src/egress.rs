@@ -9,6 +9,21 @@ pub fn observation_support() -> ObservationSupport {
     if cfg!(target_os = "macos") { ObservationSupport::Unsupported } else { ObservationSupport::Supported }
 }
 
+/// Relay route observation is separate from the client VPN verdict.
+#[cfg(target_os = "macos")]
+pub(crate) fn detect_mac_relay(outcome: &mut CommandOutcome, dest: std::net::Ipv4Addr)
+    -> Result<Option<crate::netif::MacRelayEgress>, String>
+{
+    crate::netif::observe(dest, || {
+        let command = crate::utils::PreparedExec::system(std::path::Path::new("/usr/sbin/netstat"))?
+            .args(["-rn", "-f", "inet"])
+            .env("LC_ALL", "C");
+        let observation = crate::utils::bounded_output(outcome, command, CLIENT_PROBE_LIMIT);
+        received_probe(outcome, observation)?;
+        std::str::from_utf8(outcome.stdout()).map(str::to_owned).map_err(|error| format!("netstat output: {error}"))
+    })
+}
+
 fn received_probe(outcome: &CommandOutcome, observation: CommandObservation) -> Result<(), String> {
     match observation {
         CommandObservation::Complete if outcome.complete() && outcome.releasable() && outcome.exit().is_some_and(|status| status.success()) => Ok(()),

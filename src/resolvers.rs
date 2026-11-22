@@ -745,6 +745,17 @@ pub(crate) fn current_candidates(witness: &DnsSourceWitness) -> Result<Vec<DnsCa
     Ok(candidates_from_sets(guard.as_ref(), witness))
 }
 
+/// The Mac relay's maintenance owner is the only producer of these witnessed
+/// discovery inputs. A changed egress needs fresh discovery and qualification.
+#[cfg(target_os = "macos")]
+pub(crate) fn invalidate_witnessed_candidates() {
+    if let Ok(mut guard) = PROXY_SET.lock() {
+        if let Some(sets) = guard.as_mut() {
+            for set in sets.values_mut() { set.witnessed.clear(); }
+        }
+    }
+}
+
 fn candidates_from_sets(map: Option<&HashMap<usize, ProxySet>>, witness: &DnsSourceWitness) -> Vec<DnsCandidate> {
     let mut out: Vec<DnsCandidate> = Vec::new();
     if let Some(map) = map {
@@ -1778,7 +1789,15 @@ fn ask_provider_with_inputs(provider: &Provider, query: &[u8], if_index: u32, ti
             let timeout = remaining();
             if timeout.is_zero() { return None; }
             if let Some(started) = started.as_deref_mut() { *started = true; }
-            let mut reply = crate::doh::query(endpoint, query, timeout).ok()?;
+            #[cfg(target_os = "macos")]
+            let answer = if deadline.is_some() {
+                crate::doh::query_on_interface(endpoint, query, timeout, if_index)
+            } else {
+                crate::doh::query(endpoint, query, timeout)
+            };
+            #[cfg(not(target_os = "macos"))]
+            let answer = crate::doh::query(endpoint, query, timeout);
+            let mut reply = answer.ok()?;
             // Re-stamp the transaction id. RFC 8484 tells a DoH client to send 0
             // and a server is free to answer with 0 whatever we asked with, but
             // the reply is handed to Windows over UDP:53, where an id that does
