@@ -5394,6 +5394,9 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
     if wanted.client_patch && observed.client_patch != State::On {
         enable_client_patch(ctx);
     } else if !wanted.client_patch && observed.client_patch.is_on() {
+        #[cfg(target_os = "macos")]
+        disable_client_patch_received(ctx)?;
+        #[cfg(not(target_os = "macos"))]
         disable_client_patch(ctx);
     }
     }
@@ -5945,7 +5948,7 @@ fn enable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&All
     Ok(true)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn disable_client_patch(ctx: &mut Ctx) {
     let result = disable_client_patch_received(ctx);
     if let Err(error) = result { ctx.log(Level::Err, error); }
@@ -5970,7 +5973,13 @@ fn disable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&Al
         }
         return receive_client_undo(Some(revert_client_primary(ctx, plan)), Ok(()));
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // The proxy is a separate launchd role with its own generation and intent.
+        stop_watchdog_checked()?;
+        receive_client_undo(Some(revert_client_primary(ctx)), Ok(()))
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         stop_watchdog_checked()?;
         background::disable()?;
@@ -6014,7 +6023,11 @@ fn revert_client_primary(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&AllTargetA
     // Independent file work stops on its first actual failure. I20 restoration
     // is received by the surrounding background owner on every granted exit.
     for inst in &targets {
-        if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Отмена файлов прервана пользователем; восстановление служб обязательно.".into()); }
+        if ctx.native_cancel.load(Ordering::SeqCst) {
+            let error = if cfg!(target_os = "macos") { "Отмена файлов прервана пользователем." }
+                else { "Отмена файлов прервана пользователем; восстановление служб обязательно." };
+            return Err(error.into());
+        }
         #[cfg(windows)]
         if let Some(plan) = plan {
             plan.targets.iter().find(|target| target.root() == inst).ok_or("planned target is missing")?.recheck()?;
@@ -6039,8 +6052,13 @@ fn revert_client_primary(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&AllTargetA
             match crate::elevate::unpatch_as_root(inst) {
                 Ok(d) => d,
                 Err(e) => {
-                    ctx.log(Level::Err, format!("{} — {}", where_, e));
-                    continue;
+                    #[cfg(target_os = "macos")]
+                    return Err(format!("{where_} — {e}"));
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        ctx.log(Level::Err, format!("{} — {}", where_, e));
+                        continue;
+                    }
                 }
             }
         } else {
@@ -6096,7 +6114,11 @@ fn revert_client_primary(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&AllTargetA
     if specified_wish(&ctx.settings.checked_transport_effects()?.local_proxy) == Some(false) {
         disable_local_proxy_effect(ctx)?;
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    if !ctx.settings.local_proxy {
+        disable_local_proxy_effect(ctx)?;
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     disable_local_proxy_effect(ctx)?;
     ctx.proxy_var_carried = Some(false);
     Ok(())
