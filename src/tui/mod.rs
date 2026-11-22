@@ -127,6 +127,7 @@ enum Row {
     Install(usize),
     #[cfg(windows)]
     InstallationRecovery(std::path::PathBuf),
+    VsCodeAntigravity,
     /// The fold over «Настройки для опытных».
     Advanced,
     Provider(usize),
@@ -619,6 +620,7 @@ impl App {
             Row::InstallationRecovery(path) => {
                 if !self.busy_refusal() { self.worker.send(Cmd::PrepareInstallationRecovery { path }); }
             }
+            Row::VsCodeAntigravity => {}
             Row::Advanced => self.advanced = !self.advanced,
             Row::Provider(i) => {
                 if self.busy_refusal() {
@@ -832,6 +834,7 @@ impl App {
                 #[cfg(not(windows))]
                 let _ = install;
             }
+            rows.push(Row::VsCodeAntigravity);
         }
         #[cfg(windows)]
         {
@@ -915,6 +918,7 @@ impl App {
             }
             #[cfg(windows)]
             Row::InstallationRecovery(path) => format!("Enter — проверить восстановление {}", path.display()),
+            Row::VsCodeAntigravity => String::new(),
             Row::Advanced => "Детали обхода: DNS-серверы, прокси, выходы.".into(),
             Row::Provider(_) => "Пробел — включить или выключить сервер, +/- — выше или ниже в списке.".into(),
             Row::GroupProxyText => "Код этого ПК и состояние ключа.".into(),
@@ -1005,6 +1009,15 @@ impl App {
             }
             #[cfg(windows)]
             Row::InstallationRecovery(_) => ListItem::new("  Проверить восстановление"),
+            Row::VsCodeAntigravity => {
+                let Some(snapshot) = &self.status else {
+                    return ListItem::new("");
+                };
+                ListItem::new(format!(
+                    "  {}",
+                    status::vscode_antigravity_text(&snapshot.vscode_antigravity)
+                ))
+            }
             Row::Advanced => ListItem::new(Line::styled(
                 format!(
                     "{} Настройки для опытных",
@@ -1649,6 +1662,7 @@ mod tests {
             wsl: crate::wsl_api::WslStatus { desktop_target: DesktopDiscovery::Present,
                 distributions: vec![crate::wsl_api::RegisteredDistro { name: "fixture".into(), registration: crate::wsl_api::RegistrationState::Present, selected: true, running: None }],
                 ..Default::default() }, admin: true, installs: Vec::new(),
+            vscode_antigravity: crate::ops::VsCodeAntigravityObservation::Incomplete,
             client_patch: State::Off, watchdog: State::Off, dns: State::Off, local_proxy: State::Off,
             own_proxy: State::Off, builtin_exits: State::Off, group_proxy: State::Off, dns_rotation: State::Off,
             transport_view: crate::ops::TransportView::LegacyOrMissing,

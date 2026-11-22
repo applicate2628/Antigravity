@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use crate::gate::View;
-use crate::ops::{Cap, Status};
+use crate::ops::{Cap, Status, VsCodeAntigravityObservation};
 
 /// How the card is coloured, and how loud it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +275,15 @@ pub const BYPASS_TEXT: (&str, &str) = (
     "Сам находит рабочий путь до серверов Google и переключается, если путь \
      перестал работать — с VPN и без.",
 );
+
+/// Package presence under VS Code, as shown in both front ends and the report.
+pub fn vscode_antigravity_text(observation: &VsCodeAntigravityObservation) -> &'static str {
+    match observation {
+        VsCodeAntigravityObservation::Found => "Antigravity для VS Code: пакет найден",
+        VsCodeAntigravityObservation::NotFound => "Antigravity для VS Code: пакет не найден",
+        VsCodeAntigravityObservation::Incomplete => "Antigravity для VS Code: не удалось проверить",
+    }
+}
 
 /// What a switch is called and what it does, in both front ends.
 pub fn switch_text(cap: Cap) -> (&'static str, &'static str) {
@@ -769,6 +778,22 @@ pub fn plural(n: u64, one: &'static str, few: &'static str, many: &'static str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vscode_antigravity_text_distinguishes_package_presence_and_incomplete_search() {
+        use VsCodeAntigravityObservation::{Found, Incomplete, NotFound};
+
+        for (observation, expected) in [
+            (Found, "пакет найден"),
+            (NotFound, "пакет не найден"),
+            (Incomplete, "не удалось проверить"),
+        ] {
+            assert_eq!(
+                vscode_antigravity_text(&observation).split_once(": "),
+                Some(("Antigravity для VS Code", expected))
+            );
+        }
+    }
 
     fn working() -> Facts {
         Facts {

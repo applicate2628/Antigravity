@@ -269,11 +269,20 @@ pub struct ProviderRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportView { LegacyOrMissing, SystemTcp, ExistingConfigured, Invalid }
 
+/// Package presence in the standard VS Code extension roots of this profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VsCodeAntigravityObservation {
+    Found,
+    NotFound,
+    Incomplete,
+}
+
 #[derive(Debug, Clone)]
 pub struct Status {
     pub wsl: crate::wsl_api::WslStatus,
     pub admin: bool,
     pub installs: Vec<InstallRow>,
+    pub(crate) vscode_antigravity: VsCodeAntigravityObservation,
     pub client_patch: State,
     pub watchdog: State,
     pub dns: State,
@@ -2133,6 +2142,7 @@ fn run_worker(
     let mut probe_refresh_requested = true;
     #[cfg(target_os = "macos")]
     let mut last_mac_observation = std::time::Instant::now();
+    let mut last_vscode_observation = std::time::Instant::now();
     #[cfg(windows)]
     let mut elevation_progress: Option<Receiver<crate::instances::ElevationProgress>> = None;
     loop {
@@ -2293,6 +2303,18 @@ fn run_worker(
             && !MEASURING_VPN.load(Ordering::SeqCst) && last_mac_observation.elapsed() >= crate::watchdog::POLL {
             last_mac_observation = std::time::Instant::now();
             if mac_idle_observation(&mut ctx) { push_mac_idle_status(&mut ctx); }
+        }
+        if !matches!(command, Some(Cmd::Shutdown | Cmd::Stop)) {
+            if let Some(status) = ctx.last.as_mut() {
+                if let Some(observation) = poll_vscode_antigravity(
+                    &mut last_vscode_observation, std::time::Instant::now(),
+                    status.vscode_antigravity, observe_current_vscode_antigravity,
+                ) {
+                    status.vscode_antigravity = observation;
+                    let snapshot = Box::new(status.clone());
+                    ctx.emit(Event::Status(snapshot));
+                }
+            }
         }
         let Some(cmd) = command else { continue; };
         #[cfg(windows)]
@@ -2758,15 +2780,17 @@ fn scan_after(cap: Cap) -> Scan {
 }
 
 fn push_status(ctx: &mut Ctx, scan: Scan) {
-    push_status_mode(ctx, scan, false)
+    push_status_mode(ctx, scan, None)
 }
 
 #[cfg(target_os = "macos")]
 fn push_mac_idle_status(ctx: &mut Ctx) {
-    push_status_mode(ctx, Scan::System, true)
+    let vscode_antigravity = ctx.last.as_ref().map_or(VsCodeAntigravityObservation::Incomplete, |previous|
+        previous.vscode_antigravity);
+    push_status_mode(ctx, Scan::System, Some(vscode_antigravity))
 }
 
-fn push_status_mode(ctx: &mut Ctx, scan: Scan, suppress_unchanged_installs: bool) {
+fn push_status_mode(ctx: &mut Ctx, scan: Scan, mac_idle_extension: Option<VsCodeAntigravityObservation>) {
     // The measurement answers "do the client's own sockets leave through a
     // tunnel", which no switch in this window changes — only what we then do
     // about it. So it is taken on the deep pass and when it has never been
@@ -2789,20 +2813,20 @@ fn push_status_mode(ctx: &mut Ctx, scan: Scan, suppress_unchanged_installs: bool
             Some(prev) => settings_only_status(ctx, prev),
             // Nothing to reuse yet (a flip before the first snapshot landed):
             // ask properly rather than invent a snapshot.
-            None => read_status(ctx, false),
+            None => read_status(ctx, false, None),
         },
         #[cfg(windows)]
         Scan::Installations => match ctx.last.clone() {
             Some(previous) => installations_only_status(ctx, previous),
             // The worker normally publishes initial status before receiving Refresh.
             // Without that cache, build the first whole snapshot as before.
-            None => read_status(ctx, false),
+            None => read_status(ctx, false, None),
         },
-        Scan::System => read_status(ctx, false),
-        Scan::Deep => read_status(ctx, true),
+        Scan::System => read_status(ctx, false, mac_idle_extension),
+        Scan::Deep => read_status(ctx, true, None),
     };
 
-    if suppress_unchanged_installs && ctx.last.as_ref().is_some_and(|previous| {
+    if mac_idle_extension.is_some() && ctx.last.as_ref().is_some_and(|previous| {
         previous.installs.len() == status.installs.len() && previous.installs.iter().zip(&status.installs)
             .all(|(a, b)| {
                 let same = a.path == b.path && a.label == b.label && a.manual == b.manual && a.patched == b.patched;
@@ -3366,11 +3390,13 @@ fn status_with_installation_observation(
     ctx: &Ctx,
     previous: Status,
     (installs, desktop_target): (Vec<InstallRow>, DesktopDiscovery),
+    vscode_antigravity: VsCodeAntigravityObservation,
 ) -> Status {
     Status {
         wsl: wsl_status_with_target(ctx, desktop_target),
         client_patch: summarize_client_patch(&installs, ctx.settings.client_patch),
         installs,
+        vscode_antigravity,
         ..previous
     }
 }
@@ -3383,15 +3409,18 @@ fn installations_only_status(ctx: &Ctx, previous: Status) -> Status {
     let receipt = owner.as_ref().ok().cloned();
     let cancel = &ctx.lifetime.abort_requested;
     let image = ctx.lifetime.retained_image().ok();
-    let observation = std::thread::scope(|scope| {
-        scope.spawn(move || collect_installs(settings, false, patched_seen, owner, cancel, image)).join()
-    }).unwrap_or_else(|_| interrupted_install_observation());
+    let (observation, vscode_antigravity) = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let installs = collect_installs(settings, false, patched_seen, owner, cancel, image);
+            (installs, observe_current_vscode_antigravity())
+        }).join()
+    }).unwrap_or_else(|_| (interrupted_install_observation(), VsCodeAntigravityObservation::Incomplete));
     drop(receipt);
     ctx.receive_command_results();
-    status_with_installation_observation(ctx, previous, observation)
+    status_with_installation_observation(ctx, previous, observation, vscode_antigravity)
 }
 
-fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
+fn read_status(ctx: &mut Ctx, deep: bool, mac_idle_extension: Option<VsCodeAntigravityObservation>) -> Status {
     let admin = is_admin();
 
     // Every probe below spawns a helper process — two scheduled-task queries, a
@@ -3441,6 +3470,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
                 let install_timing = startup_scan_timing::begin_install(startup_origin);
                 let observed = collect_installs(settings, deep, patched_seen, #[cfg(target_os = "macos")] previous,
                     #[cfg(windows)] install_owner, #[cfg(windows)] &install_cancel, #[cfg(windows)] install_image);
+                let observed = (observed, mac_idle_extension.unwrap_or_else(observe_current_vscode_antigravity));
                 #[cfg(all(windows, ag_private_startup_scan_timing))]
                 let observed = (observed, install_timing.and_then(startup_scan_timing::InstallScope::take));
                 observed
@@ -3477,7 +3507,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
                 observed
             });
             (
-                installs.unwrap_or_else(|_| interrupted_install_observation()),
+                installs.unwrap_or_else(|_| (interrupted_install_observation(), VsCodeAntigravityObservation::Incomplete)),
                 #[cfg(not(windows))]
                 watchdog.join().unwrap_or(State::Off),
                 #[cfg(windows)]
@@ -3507,7 +3537,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
     if let Some(detail) = &background_observation_error { ctx.log(Level::Warn, detail.clone()); }
     #[cfg(windows)]
     let background_observation_error = None;
-    let (installs, desktop_target) = install_observation;
+    let ((installs, desktop_target), vscode_antigravity) = install_observation;
     #[cfg(windows)]
     receive_system_observation(ctx, dns_probe);
     #[cfg(not(windows))]
@@ -3555,6 +3585,7 @@ fn read_status(ctx: &mut Ctx, deep: bool) -> Status {
         relay_egress: ctx.relay_egress,
         providers: Vec::new(),
         installs,
+        vscode_antigravity,
     }
     .with_settings_switches(&ctx.settings);
     #[cfg(windows)]
@@ -3951,6 +3982,122 @@ fn mac_idle_observation(ctx: &mut Ctx) -> bool {
     }
     ctx.patched_seen.retain(|path, _| rows.iter().any(|row| row.path.as_ref() == Some(path)));
     changed
+}
+
+// Presence is informational. Two manifest walks per minute bound idle staleness
+// to half a minute without putting JSON reads on the 2-second metadata poll.
+const VSCODE_OBSERVATION_INTERVAL: Duration = Duration::from_secs(30);
+
+fn poll_vscode_antigravity(
+    last_observation: &mut std::time::Instant,
+    now: std::time::Instant,
+    previous: VsCodeAntigravityObservation,
+    observe: impl FnOnce() -> VsCodeAntigravityObservation,
+) -> Option<VsCodeAntigravityObservation> {
+    if now.duration_since(*last_observation) < VSCODE_OBSERVATION_INTERVAL { return None; }
+    *last_observation = now;
+    let current = observe();
+    (current != previous).then_some(current)
+}
+
+fn observe_current_vscode_antigravity() -> VsCodeAntigravityObservation {
+    #[cfg(windows)]
+    let profile = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let profile = std::env::var_os("HOME");
+    observe_vscode_antigravity(profile.as_deref().map(Path::new))
+}
+
+fn observe_vscode_antigravity(profile: Option<&Path>) -> VsCodeAntigravityObservation {
+    use VsCodeAntigravityObservation::{Found, Incomplete, NotFound};
+
+    let Some(profile) = profile.filter(|path| path.is_absolute()) else { return Incomplete; };
+    match std::fs::symlink_metadata(profile) {
+        Ok(metadata) if metadata.is_dir() && !is_vscode_observation_link(&metadata) => {},
+        _ => return Incomplete,
+    }
+
+    let mut result = NotFound;
+    for editor in [".vscode", ".vscode-insiders"] {
+        match observe_vscode_extension_root(profile, editor) {
+            Found => return Found,
+            Incomplete => result = Incomplete,
+            NotFound => {},
+        }
+    }
+    result
+}
+
+fn observe_vscode_extension_root(profile: &Path, editor: &str) -> VsCodeAntigravityObservation {
+    use std::fs;
+    use std::io::ErrorKind;
+    use VsCodeAntigravityObservation::{Found, Incomplete, NotFound};
+
+    let mut root = profile.to_path_buf();
+    for component in [editor, "extensions"] {
+        root.push(component);
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.is_dir() && !is_vscode_observation_link(&metadata) => {},
+            Err(error) if error.kind() == ErrorKind::NotFound => return NotFound,
+            _ => return Incomplete,
+        }
+    }
+
+    let Ok(entries) = fs::read_dir(root) else { return Incomplete; };
+    let mut result = NotFound;
+    for entry in entries {
+        let candidate = entry.and_then(|entry| entry.metadata().map(|metadata| (entry.path(), metadata)));
+        match candidate {
+            Ok((path, metadata)) if !is_vscode_observation_link(&metadata) => {
+                if metadata.is_dir() {
+                    match read_vscode_extension_manifest(&path.join("package.json")) {
+                        Ok(true) => return Found,
+                        Ok(false) => {},
+                        Err(()) => result = Incomplete,
+                    }
+                } else if !metadata.is_file() {
+                    result = Incomplete;
+                }
+            },
+            _ => result = Incomplete,
+        }
+    }
+    result
+}
+
+fn is_vscode_observation_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    { crate::discovery_reparse_point(metadata) }
+    #[cfg(not(windows))]
+    { metadata.file_type().is_symlink() }
+}
+
+fn read_vscode_extension_manifest(path: &Path) -> Result<bool, ()> {
+    use std::io::{BufRead, BufReader};
+
+    #[derive(serde::Deserialize)]
+    struct ExtensionManifest {
+        publisher: String,
+        name: String,
+    }
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    if !metadata.is_file() || is_vscode_observation_link(&metadata) { return Err(()); }
+    let file = std::fs::File::open(path).map_err(|_| ())?;
+    let mut reader = BufReader::new(file);
+    // Serde structs can deserialize from sequences. A package manifest has named fields.
+    loop {
+        let buffer = reader.fill_buf().map_err(|_| ())?;
+        match buffer.iter().copied().find(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n')) {
+            Some(b'{') => break,
+            Some(_) => return Err(()),
+            None if buffer.is_empty() => return Err(()),
+            None => { let consumed = buffer.len(); reader.consume(consumed); },
+        }
+    }
+    let manifest: ExtensionManifest = serde_json::from_reader(reader).map_err(|_| ())?;
+    if manifest.publisher.trim().is_empty() || manifest.name.trim().is_empty() { return Err(()); }
+    Ok(manifest.publisher == "google" && manifest.name == "google-antigravity")
 }
 
 fn collect_installs(
@@ -5243,7 +5390,7 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
     }
     #[cfg(not(windows))]
     {
-    let observed = read_status(ctx, false);
+    let observed = read_status(ctx, false, None);
     if wanted.client_patch && observed.client_patch != State::On {
         enable_client_patch(ctx);
     } else if !wanted.client_patch && observed.client_patch.is_on() {
@@ -6780,7 +6927,9 @@ mod tests {
         let cli = root.join("cli");
         let desktop = root.join("desktop");
         let incomplete = root.join("incomplete");
+        let extension = root.join(".vscode/extensions/google.google-antigravity-1.13.0/package.json");
         crate::wsl_discovery_contract_cases::fixture_file(&cli.join("agy.exe"), b"fixture");
+        crate::wsl_discovery_contract_cases::fixture_file(&extension, VSCODE_ANTIGRAVITY_MANIFEST);
         crate::wsl_discovery_contract_cases::fixture_file(&desktop.join("resources/app/dist/main.js"), b"fixture");
         crate::wsl_discovery_contract_cases::fixture_file(&desktop.join("Antigravity.exe"), b"fixture");
         crate::wsl_discovery_contract_cases::fixture_file(&incomplete.join("resources/app/dist/main.js"), b"fixture");
@@ -6791,11 +6940,18 @@ mod tests {
         crate::wsl_controller::test_receive_observation(&mut ctx.wsl, DiscoveryObservation {
             registrations: vec![Registration { name: "fixture".into(), running: None }], error: None,
         });
-        let observation = project_install_discovery(&ctx.settings, Ok(vec![cli.clone()]), Vec::new);
         let mut previous = ctx.last.clone().unwrap();
         previous.background_observation_error = Some("retained background observation".into());
         previous.rules_observed = Some(true);
-        let observed = status_with_installation_observation(&ctx, previous.clone(), observation);
+        let vscode_antigravity = observe_vscode_antigravity(Some(&root));
+        assert_eq!(vscode_antigravity, VsCodeAntigravityObservation::Found);
+        let extension_only = status_with_installation_observation(&ctx, previous.clone(),
+            project_install_discovery(&ctx.settings, Ok(Vec::new()), Vec::new), vscode_antigravity);
+        assert!(extension_only.installs.iter().all(|row| row.path.is_none() && row.patched.is_none()));
+        assert!(!extension_only.wsl.show_configuration() && !extension_only.wsl.can_apply());
+        let observation = project_install_discovery(&ctx.settings, Ok(vec![cli.clone()]), Vec::new);
+        let observed = status_with_installation_observation(&ctx, previous.clone(), observation, vscode_antigravity);
+        assert_eq!(observed.vscode_antigravity, VsCodeAntigravityObservation::Found);
         assert_eq!(observed.wsl.desktop_target, DesktopDiscovery::Absent);
         assert!(observed.installs.iter().any(|row| row.path.as_ref() == Some(&cli)
             && row.observed_kind == Some(crate::InstallationKind::Cli)));
@@ -6806,8 +6962,9 @@ mod tests {
         let (rows, target) = project_install_discovery(&ctx.settings, Ok(vec![cli.clone()]), Vec::new);
         assert_eq!(target, DesktopDiscovery::Present);
         assert!(rows.iter().any(|row| row.recovery_path() == Some(desktop.as_path())));
-        let current = status_with_installation_observation(&ctx, previous, (rows, target));
+        let current = status_with_installation_observation(&ctx, previous, (rows, target), vscode_antigravity);
         assert!(current.wsl.can_apply());
+        assert_eq!(current.vscode_antigravity, VsCodeAntigravityObservation::Found);
         ctx.last = Some(current);
         assert!(wsl_status(&ctx).can_apply(), "settings-only status retains the received target");
         ctx.settings.client_patch = false;
@@ -6830,7 +6987,7 @@ mod tests {
         assert_eq!(target, DesktopDiscovery::Incomplete { desktop_found: true, error: error.clone() });
         assert!(rows.iter().any(|row| row.recovery_path() == Some(desktop.as_path())));
         let incomplete = status_with_installation_observation(
-            &ctx, ctx.last.clone().unwrap(), (rows, target),
+            &ctx, ctx.last.clone().unwrap(), (rows, target), vscode_antigravity,
         );
         assert!(incomplete.wsl.show_configuration() && !incomplete.wsl.can_apply());
         assert!(incomplete.wsl.apply_eligibility.as_ref().unwrap_err().contains(error.as_str()));
@@ -7000,6 +7157,117 @@ mod tests {
     }
 
     use super::*;
+
+    const VSCODE_ANTIGRAVITY_MANIFEST: &[u8] =
+        br#"{"publisher":"google","name":"google-antigravity","version":"1.13.0"}"#;
+
+    struct VsCodeProfileFixture(PathBuf);
+
+    impl VsCodeProfileFixture {
+        fn new(name: &str) -> Self {
+            let parent = std::env::temp_dir().canonicalize().unwrap();
+            let root = crate::patch_binary::temp_path(&parent.join(name));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+
+        fn write(&self, relative: &str, bytes: &[u8]) {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        fn observe(&self) -> VsCodeAntigravityObservation {
+            observe_vscode_antigravity(Some(&self.0))
+        }
+    }
+
+    impl Drop for VsCodeProfileFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).expect("remove owned VS Code profile fixture");
+        }
+    }
+
+    #[test]
+    fn vscode_antigravity_finds_exact_manifest_without_cli_or_directory_name_hint() {
+        let profile = VsCodeProfileFixture::new("ag-vscode-found");
+        profile.write(".vscode/extensions/renamed-directory/package.json", VSCODE_ANTIGRAVITY_MANIFEST);
+        assert!(!profile.0.join(".gemini/bin").exists());
+        assert_eq!(profile.observe(), VsCodeAntigravityObservation::Found);
+    }
+
+    #[test]
+    fn vscode_antigravity_reports_absent_roots_and_rejects_decoy_manifests() {
+        let profile = VsCodeProfileFixture::new("ag-vscode-absent");
+        assert_eq!(profile.observe(), VsCodeAntigravityObservation::NotFound);
+        profile.write(".vscode/extensions/extensions.json", b"[]");
+        profile.write(".vscode/extensions/google.google-antigravity-1.13.0/package.json",
+            br#"{"publisher":"Google","name":"google-antigravity"}"#);
+        profile.write(".vscode-insiders/extensions/other/package.json",
+            br#"{"publisher":"google","name":"antigravity"}"#);
+        assert_eq!(profile.observe(), VsCodeAntigravityObservation::NotFound);
+    }
+
+    #[test]
+    fn vscode_antigravity_leaves_unavailable_or_malformed_coverage_incomplete() {
+        let profile = VsCodeProfileFixture::new("ag-vscode-incomplete");
+        assert_eq!(observe_vscode_antigravity(None), VsCodeAntigravityObservation::Incomplete);
+        assert_eq!(observe_vscode_antigravity(Some(Path::new("relative"))), VsCodeAntigravityObservation::Incomplete);
+        assert_eq!(observe_vscode_antigravity(Some(&profile.0.join("missing-profile"))), VsCodeAntigravityObservation::Incomplete);
+        profile.write(".vscode/extensions", b"not a directory");
+        assert_eq!(profile.observe(), VsCodeAntigravityObservation::Incomplete);
+        std::fs::remove_file(profile.0.join(".vscode/extensions")).unwrap();
+        let manifest = ".vscode-insiders/extensions/google.google-antigravity-1.13.0/package.json";
+        for malformed in [b"{".as_slice(), br#"{"publisher":"google","name":5}"#,
+            br#"["google","google-antigravity"]"#,
+            br#"{"publisher":"decoy","publisher":"google","name":"google-antigravity"}"#]
+        {
+            profile.write(manifest, malformed);
+            assert_eq!(profile.observe(), VsCodeAntigravityObservation::Incomplete);
+        }
+        profile.write(".vscode/extensions", b"not a directory");
+        profile.write(manifest, VSCODE_ANTIGRAVITY_MANIFEST);
+        assert_eq!(profile.observe(), VsCodeAntigravityObservation::Found);
+    }
+
+    #[test]
+    fn vscode_idle_poll_receives_install_and_removal_with_bounded_reads() {
+        use VsCodeAntigravityObservation::{Found, NotFound};
+
+        let profile = VsCodeProfileFixture::new("ag-vscode-idle");
+        let manifest = ".vscode/extensions/extension/package.json";
+        let mut last = std::time::Instant::now();
+        let first_due = last + VSCODE_OBSERVATION_INTERVAL;
+        assert_eq!(profile.observe(), NotFound);
+        profile.write(manifest, VSCODE_ANTIGRAVITY_MANIFEST);
+        assert_eq!(poll_vscode_antigravity(&mut last, first_due - Duration::from_millis(1), NotFound,
+            || panic!("manifest read before the deadline")), None);
+        assert_eq!(poll_vscode_antigravity(&mut last, first_due, NotFound, || profile.observe()), Some(Found));
+        let next_due = first_due + VSCODE_OBSERVATION_INTERVAL;
+        assert_eq!(poll_vscode_antigravity(&mut last, next_due, Found, || profile.observe()), None);
+        assert_eq!(last, next_due, "an unchanged observation still advances the read cadence");
+        let installed = profile.0.join(manifest);
+        std::fs::remove_file(&installed).unwrap();
+        std::fs::remove_dir(installed.parent().unwrap()).unwrap();
+        assert_eq!(poll_vscode_antigravity(&mut last, next_due + VSCODE_OBSERVATION_INTERVAL, Found,
+            || profile.observe()), Some(NotFound));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vscode_antigravity_rejects_a_linked_root_or_manifest() {
+        use std::os::unix::fs::symlink;
+        let profile = VsCodeProfileFixture::new("ag-vscode-links");
+        profile.write("other-root/extensions/extension/package.json", VSCODE_ANTIGRAVITY_MANIFEST);
+        let linked_root = profile.0.join(".vscode");
+        symlink(profile.0.join("other-root"), linked_root).unwrap();
+        assert_eq!(profile.observe(), VsCodeAntigravityObservation::Incomplete);
+        std::fs::remove_file(profile.0.join(".vscode")).unwrap();
+        std::fs::create_dir_all(profile.0.join(".vscode-insiders/extensions/extension")).unwrap();
+        symlink(profile.0.join("other-root/extensions/extension/package.json"),
+            profile.0.join(".vscode-insiders/extensions/extension/package.json")).unwrap();
+        assert_eq!(profile.observe(), VsCodeAntigravityObservation::Incomplete);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -7180,7 +7448,7 @@ mod tests {
             }
         }
         assert_eq!(mac_observe_install(&root, true, ctx.patched_seen.entry(root.clone()).or_default()), Some(false));
-        ctx.last = Some(read_status(&mut ctx, false));
+        ctx.last = Some(read_status(&mut ctx, false, Some(VsCodeAntigravityObservation::Found)));
         let selected = |status: &Status| status.installs.iter().find(|row| row.path.as_ref() == Some(&root)).unwrap().patched;
         assert_eq!(selected(ctx.last.as_ref().unwrap()), Some(false));
         assert!(!mac_idle_observation(&mut ctx));
@@ -7188,7 +7456,13 @@ mod tests {
         fs::rename(&replacement, &target).unwrap();
         assert!(mac_idle_observation(&mut ctx));
         push_mac_idle_status(&mut ctx);
-        match received.recv().unwrap() { Event::Status(status) => assert_eq!(selected(&status), None), _ => panic!("unexpected event") }
+        match received.recv().unwrap() {
+            Event::Status(status) => {
+                assert_eq!(selected(&status), None);
+                assert_eq!(status.vscode_antigravity, VsCodeAntigravityObservation::Found);
+            },
+            _ => panic!("unexpected event"),
+        }
         assert!(mac_idle_observation(&mut ctx));
         push_mac_idle_status(&mut ctx);
         match received.recv().unwrap() { Event::Status(status) => assert_eq!(selected(&status), Some(true)), _ => panic!("unexpected event") }
@@ -7221,7 +7495,7 @@ mod tests {
         fn prime(ctx: &mut Ctx, lost: &Path, steady: &Path) {
             ctx.settings.manual_paths = vec![lost.to_path_buf(), steady.to_path_buf()];
             ctx.patched_seen.clear(); ctx.last = None;
-            let status = read_status(ctx, true);
+            let status = read_status(ctx, true, None);
             assert_eq!(status.client_patch, State::On);
             assert_eq!(status.installs.iter().find(|row| row.path.as_deref() == Some(lost)).unwrap().patched, Some(true));
             assert_eq!(status.installs.iter().find(|row| row.path.as_deref() == Some(steady)).unwrap().patched, Some(true));
@@ -7754,7 +8028,7 @@ mod tests {
         };
 
         let t = std::time::Instant::now();
-        let full = read_status(&mut ctx, false);
+        let full = read_status(&mut ctx, false, None);
         let system = t.elapsed();
         ctx.last = Some(full);
 
@@ -7777,6 +8051,7 @@ mod tests {
             wsl: crate::wsl_api::WslStatus::default(),
             admin: true,
             installs: Vec::new(),
+            vscode_antigravity: VsCodeAntigravityObservation::Incomplete,
             client_patch: State::Off,
             watchdog: State::Off,
             dns: State::Off,

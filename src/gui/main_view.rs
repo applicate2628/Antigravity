@@ -76,6 +76,7 @@ mod layout_tests {
                 ..Default::default()
             },
             admin: true, installs: Vec::new(), client_patch: State::Off, watchdog: State::Off,
+            vscode_antigravity: crate::ops::VsCodeAntigravityObservation::Incomplete,
             dns: State::Off, local_proxy: State::Off, own_proxy: State::Off,
             builtin_exits: State::Off, group_proxy: State::Off, dns_rotation: State::Off,
             transport_view: crate::ops::TransportView::LegacyOrMissing,
@@ -861,6 +862,9 @@ fn antigravity_card(app: &mut App, ui: &mut egui::Ui) {
         );
         ui.add_space(6.0);
         install_rows(app, ui);
+        if let Some(snapshot) = &app.status {
+            ui.label(status::vscode_antigravity_text(&snapshot.vscode_antigravity));
+        }
 
         #[cfg(target_os = "windows")]
         if app.status.as_ref().is_some_and(|s| s.wsl.show_configuration() || s.wsl.pending) {

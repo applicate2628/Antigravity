@@ -16,6 +16,8 @@ use crate::gate::{Report, View};
 use crate::ops::{State, Status};
 use crate::utils::mask_path;
 
+use super::status::vscode_antigravity_text;
+
 /// How much of the relay's own log goes in: enough to cover the last few
 /// minutes of a busy session, short enough to paste into a chat.
 const LOG_LINES: usize = 60;
@@ -163,6 +165,7 @@ fn status_part(out: &mut String, s: &Status) {
             .unwrap_or_default();
         let _ = writeln!(out, "{}: {path}{patch_note}", row.label);
     }
+    let _ = writeln!(out, "{}", vscode_antigravity_text(&s.vscode_antigravity));
     let _ = writeln!(out, "\n— Переключатели");
     #[cfg(windows)]
     {
