@@ -9,9 +9,9 @@
 //! refused it from the tunnel's foreign exit. The DoH provider had the same gap
 //! (P13): its queries rode the tunnel and came back unsubstituted.
 //!
-//! IP_UNICAST_IF has to be set *before* `connect`, which `TcpStream` cannot do —
-//! it creates and connects in one call — so the socket is built with `socket2`
-//! and handed back as an ordinary `TcpStream`.
+//! The interface option has to be set *before* `connect`. `TcpStream` creates
+//! and connects in one call, so the socket is built with `socket2` and handed
+//! back as an ordinary `TcpStream`.
 //!
 //! Pinning is only switched on while a tunnel holds the default route. With no
 //! tunnel the ISP link *is* the default route, and naming it buys nothing while
@@ -59,8 +59,8 @@ pub fn tunnel_up() -> bool {
     pin_interface() != 0
 }
 
-/// Connects to `addr` inside `timeout`, leaving through `if_index` when it is
-/// not 0.
+/// Connects to `addr` inside `timeout`. On Windows and macOS, a nonzero
+/// `if_index` selects the outgoing interface.
 ///
 /// A pinned connect that the interface cannot carry fails like any other
 /// connect — a kill-switch VPN drops it, a dead link refuses it — so the caller's
@@ -101,7 +101,28 @@ fn connect_pinned(addr: SocketAddr, timeout: Duration, if_index: u32) -> io::Res
     Ok(sock.into())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn connect_pinned(addr: SocketAddr, timeout: Duration, if_index: u32) -> io::Result<TcpStream> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+    let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    bind_to_interface(&sock, addr.is_ipv6(), if_index)?;
+    sock.connect_timeout(&SockAddr::from(addr), timeout)?;
+    Ok(sock.into())
+}
+
+/// Sets the macOS bound-interface option for the socket's address family.
+#[cfg(target_os = "macos")]
+pub(crate) fn bind_to_interface(sock: &socket2::Socket, v6: bool, if_index: u32) -> io::Result<()> {
+    let index = std::num::NonZeroU32::new(if_index);
+    if v6 {
+        sock.bind_device_by_index_v6(index)
+    } else {
+        sock.bind_device_by_index_v4(index)
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn connect_pinned(addr: SocketAddr, timeout: Duration, _if_index: u32) -> io::Result<TcpStream> {
     TcpStream::connect_timeout(&addr, timeout)
 }

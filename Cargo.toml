@@ -36,11 +36,9 @@ aes-gcm = "0.10"
 # expose. `default-features = false` because the image half is eframe's business,
 # not ours; features unify, so the build is unchanged either way.
 arboard = { version = "3.6", default-features = false }
-# The one socket `TcpStream` cannot build: IP_UNICAST_IF has to be set before
-# `connect`, and std creates and connects in one call. Pins the relay's own
-# connections to the ISP link while a VPN holds the default route (`net.rs`),
-# the same way every UDP resolver query already is (I4). Small, no runtime.
-socket2 = "0.6"
+# Interface options have to be set before `connect`, and std creates and connects
+# in one call. `all` exposes the macOS binding used for TCP and DNS (`net.rs`).
+socket2 = { version = "0.6", features = ["all"] }
 # The terminal UI (`--tui`; on Linux also any start with no graphical session,
 # e.g. a server over SSH; on Windows also the fallback when no renderer opens a
 # window). Only the crossterm backend - no widgets beyond the core set.

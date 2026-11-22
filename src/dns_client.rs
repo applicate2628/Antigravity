@@ -61,7 +61,18 @@ mod sys {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod sys {
+    pub fn bind_socket_to_interface(
+        sock: &std::net::UdpSocket,
+        if_index: u32,
+    ) -> Result<(), String> {
+        crate::net::bind_to_interface(&socket2::SockRef::from(sock), false, if_index)
+            .map_err(|error| format!("не удалось привязать сокет к интерфейсу: {error}"))
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod sys {
     pub fn bind_socket_to_interface(_: &std::net::UdpSocket, _: u32) -> Result<(), String> {
         Err("поддерживается только на Windows".to_string())
