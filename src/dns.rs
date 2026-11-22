@@ -565,9 +565,6 @@ pub fn setup_dns_nrpt(_owner: &mut CommandOutcome) -> Result<DnsOutcome, String>
 
 #[cfg(target_os = "windows")]
 pub fn setup_dns_nrpt(owner: &mut CommandOutcome) -> Result<DnsOutcome, String> {
-    // Remove any of our previous rules to keep a clean idempotent state.
-    remove_dns_nrpt_checked(owner).map_err(|e| format!("DNS setup cleanup: {e}"))?;
-
     let egress = egress::detect(owner)?;
     let via_relay = background::is_enabled(owner)?;
 
@@ -584,6 +581,9 @@ pub fn setup_dns_nrpt(owner: &mut CommandOutcome) -> Result<DnsOutcome, String> 
     // Measured all the same, so `DnsOutcome` still reports what the tunnel was
     // doing when the rules went in.
     let (_, client) = egress::vpn_verdict(owner, egress.as_ref())?;
+
+    // Refresh our rules only after the prerequisite observations succeed.
+    remove_dns_nrpt_checked(owner).map_err(|e| format!("DNS setup cleanup: {e}"))?;
 
     let namespaces: Vec<&str> = AG_NRPT_CORE.to_vec();
 
