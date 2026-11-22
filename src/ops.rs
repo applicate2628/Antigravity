@@ -6471,8 +6471,8 @@ fn enable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
     ctx.log(Level::Step, "Локальный прокси");
     let url = proxy::proxy_url();
 
-    // 1. The user-wide pair that builds up to 2.11.0_4 wrote. It goes first:
-    //    leaving it puts the whole machine through loopback (D19).
+    // 1. Windows and Linux clean up legacy user-wide values before enabling our
+    //    private variable (D19). macOS leaves the standard variables alone.
     #[cfg(windows)]
     let legacy = ctx.with_command(|owner| endpoint::remove_legacy_proxy_env(owner, &url));
     #[cfg(not(windows))]

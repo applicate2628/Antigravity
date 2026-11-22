@@ -223,8 +223,8 @@ pub fn remove_cli(owner: &mut CommandOutcome) -> Result<(), String> {
 pub const PROXY_ENV_VAR: &str = crate::patch_binary::PROXY_VAR_NEW;
 
 /// What builds up to `2.11.0_4` wrote into the User environment, and what every
-/// machine upgrading from one still carries. Removed on sight - but only when
-/// the value is one of ours (I45) - by `remove_legacy_proxy_env`.
+/// machine upgrading from one still carries. Windows and Linux remove known
+/// legacy values through `remove_legacy_proxy_env` (I45).
 ///
 /// `HTTPS_PROXY` doubles as the name a *user's own* proxy lives under, which is
 /// why removal is value-scoped and why `foreign_proxy` still reads it.
@@ -381,32 +381,10 @@ fn sync_shell_env(name: &str, value: Option<&str>) {
     }
 }
 
-/// macOS: removes legacy proxy variables from launchctl and shell configurations.
+/// macOS leaves the standard proxy environment under the user's control.
 #[cfg(target_os = "macos")]
-pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
-    use std::process::Command;
-    let mut removed = false;
-    for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
-        let val = Command::new("launchctl")
-            .args(["getenv", name])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        if let Some(ref v) = val {
-            if !v.is_empty() && is_our_proxy_value(v, url) {
-                let _ = Command::new("launchctl").args(["unsetenv", name]).status();
-                sync_shell_env(name, None);
-                removed = true;
-            }
-        }
-    }
-    if let Ok(v) = std::env::var(NO_PROXY_ENV_VAR) {
-        if v.trim() == NO_PROXY_VALUE {
-            let _ = Command::new("launchctl").args(["unsetenv", NO_PROXY_ENV_VAR]).status();
-            sync_shell_env(NO_PROXY_ENV_VAR, None);
-        }
-    }
-    Ok(removed)
+pub fn remove_legacy_proxy_env(_url: &str) -> Result<bool, String> {
+    Ok(false)
 }
 
 /// Linux keeps the persistent half in the drop-in file, which `apply_proxy`
@@ -472,9 +450,7 @@ pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
 /// macOS: applies PROXY_ENV_VAR to launchd user session and shell profiles (~/.zprofile, ~/.zshrc).
 #[cfg(target_os = "macos")]
 pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
-    let migrated = remove_legacy_proxy_env(url).unwrap_or(false);
-    let already = current_env(PROXY_ENV_VAR).as_deref() == Some(url);
-    if already && !migrated {
+    if current_env(PROXY_ENV_VAR).as_deref() == Some(url) {
         return Ok(Outcome::AlreadySet);
     }
     set_env(PROXY_ENV_VAR, Some(url))?;
@@ -564,28 +540,13 @@ pub fn remove_proxy(owner: &mut CommandOutcome, url: &str, ca_path: &str) -> Res
     Ok(())
 }
 
-/// macOS: removes proxy variables from launchctl and shell files.
+/// macOS proxy removal owns only the private proxy variable.
 #[cfg(target_os = "macos")]
-pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
-    let mut trouble: Vec<String> = Vec::new();
+pub fn remove_proxy(_url: &str, _ca_path: &str) -> Result<(), String> {
     if current_env(PROXY_ENV_VAR).is_some() {
-        if let Err(e) = set_env(PROXY_ENV_VAR, None) {
-            trouble.push(e);
-        }
+        set_env(PROXY_ENV_VAR, None)?;
     }
-    if let Err(e) = remove_legacy_proxy_env(url) {
-        trouble.push(e);
-    }
-    if !ca_path.is_empty() {
-        if let Err(e) = set_env(NODE_CA_ENV_VAR, None) {
-            trouble.push(e);
-        }
-    }
-    if trouble.is_empty() {
-        Ok(())
-    } else {
-        Err(trouble.join("; "))
-    }
+    Ok(())
 }
 
 /// Linux: delete the `environment.d` drop-in and unset the live session vars.
@@ -813,10 +774,8 @@ fn profile_root() -> Option<PathBuf> {
 /// already pointing here, or a proxy the user set themselves, is left exactly as
 /// it is.
 ///
-/// It also runs the legacy migration on a machine that never opens menu 1 again:
-/// `apply_proxy` does that, and this is the only other caller of it. Without that
-/// an upgraded machine that just reboots would keep its user-wide `HTTPS_PROXY`
-/// indefinitely.
+/// On platforms with legacy migration, this also checks for an old user-wide
+/// `HTTPS_PROXY` when the private variable is already current.
 ///
 /// **The foreign check comes first, and that order is load bearing.** The patched
 /// server prefers our variable over the user's `HTTPS_PROXY` when both are set
@@ -832,8 +791,7 @@ pub fn ensure_proxy_env(ours: &str) -> Result<Outcome, String> {
         return Ok(Outcome::AlreadySet);
     }
     if current_env(PROXY_ENV_VAR).is_some_and(|v| is_our_proxy_value(&v, ours)) {
-        // Still ours and still current - but an old user-wide pair may be sitting
-        // beside it, and this path is the one a rebooted machine takes.
+        // On Linux, an old user-wide pair may still need cleanup after a reboot.
         return match remove_legacy_proxy_env(ours) {
             Ok(true) => Ok(Outcome::Applied),
             _ => Ok(Outcome::AlreadySet),
@@ -863,7 +821,7 @@ pub fn ensure_proxy_env(owner: &mut CommandOutcome, ours: &str) -> Result<Outcom
 #[cfg(not(target_os = "windows"))]
 pub fn remove_proxy_if_ours(url: &str, ca_path: &str) -> Result<bool, String> {
     if current_env(PROXY_ENV_VAR).is_none() {
-        // Nothing of ours under our own name; a legacy pair may still be there.
+        // Linux can still have a legacy pair without the private variable.
         return remove_legacy_proxy_env(url);
     }
     remove_proxy(url, ca_path).map(|()| true)
