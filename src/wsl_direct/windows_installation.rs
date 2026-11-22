@@ -11,25 +11,38 @@ mod context_native;
 mod signature;
 pub(crate) use ancestor_context::{
     owner_machine_wire, qualify_group, receive_ancestor_context, AncestorAccessContext,
-    AncestorInputs, DeploymentVerifier, OwnerScope, QualifiedGroup,
+    AncestorContextIdentity, AncestorInputs, DeploymentVerifier, OwnerScope, QualifiedGroup,
 };
-pub(crate) use native::ObjectId as NativeObjectId;
+pub(crate) use native::{ObjectId as NativeObjectId, SourceSnapshot};
 pub(crate) use signature::verify_signature;
 #[path = "windows_installation/native.rs"]
 mod native;
 #[path = "windows_installation/background_program.rs"]
 mod background_program;
+#[cfg(test)]
+pub(crate) use background_program::tests::fixture_writable_mapping;
 pub(crate) use background_program::{BackgroundLocations, background_locations, background_process_name,
-    LegacyBackgroundInput, legacy_background_input, BackgroundInputs, background_inputs,
+    LegacyBackgroundInput, legacy_background_input, BackgroundInputs, background_inputs, background_inputs_selected,
     BackgroundLease, BackgroundReplacementReceiving,
-    BackgroundReplacementFailure, background_lease, checked_background_path,
-    create_background_directory, create_background_executable, background_replace_program};
+    BackgroundReplacementFailure, background_lease, wait_for_background_lease, checked_background_path,
+    create_background_directory, create_background_executable, background_replace_program, background_replace_program_guarded};
+#[cfg(test)]
+pub(crate) use background_program::fail_next_source_capture_revalidation;
 pub(crate) use native::{DiagnosticInputs, diagnostic_inputs,
-    MetadataFailure, NonsecretMetadataPlan, read_nonsecret_metadata_checked,
-    write_nonsecret_metadata_checked,
+    MetadataFailure, AcquiredCreation, OwnedUnwind,
+    UserMetadataField, UserMetadataPublication, PendingUserMetadataPublication, PendingMetadataReceiving, PendingMetadataActual,
+    receive_pending_user_metadata, preflight_user_metadata, publish_user_metadata, read_protected_user_metadata,
+    receive_user_metadata_preflight, publish_user_metadata_checked, UserMetadataPreflight,
     PrivateCapturedFile as BackgroundDiagnosticFile,
     create_private_captured_file as create_background_diagnostic_file,
     read_private_captured_file as read_background_diagnostic_file};
+#[cfg(test)]
+pub(crate) use native::{fail_next_acquired_receiving_with_retained_witness, panic_next_acquired_receiving_with_retained_witness,
+    fail_next_metadata_post_publish, test_reset_metadata_rename_trace, test_metadata_rename_count,
+    fail_next_authored_capture_after_write, occupy_next_metadata_vacancy, fail_next_closed_stream_first_read,
+    fail_next_metadata_partial_write, fail_metadata_rename_readback_after,
+    change_creation_before_failed_metadata_rename_receiving, test_change_creation_during_metadata_settlement,
+    test_displace_during_metadata_settlement, test_change_old_during_metadata_settlement};
 #[path = "windows_installation/runtime_gate.rs"]
 mod runtime_gate;
 #[path = "windows_installation/runtime_deployment.rs"]
@@ -39,7 +52,7 @@ use runtime_deployment::{DeploymentField, RuntimeDeployment};
 pub(crate) mod gateway_rules;
 #[path = "windows_installation/runtime_upgrade.rs"]
 mod runtime_upgrade;
-pub(crate) use runtime_upgrade::{upgrade_runtime, rollback_runtime};
+pub(crate) use runtime_upgrade::{prepare_vendor_update, upgrade_runtime, rollback_runtime, VendorRuntimeInput, VendorUpdateCompletion};
 #[path = "windows_installation/runtime_assets.rs"]
 mod runtime_assets;
 pub(crate) use runtime_assets::PackageAssets;
@@ -253,12 +266,15 @@ impl CheckedPath {
     pub(crate) fn security_digest(&self) -> Result<String> {
         Ok(hash(&security(self.file.as_raw_handle(), 1 | 4)?))
     }
-    pub(crate) fn read_snapshot(&self) -> Result<Vec<u8>> {
+    pub(crate) fn read_checked_snapshot(&self) -> Result<SourceSnapshot> {
         let mut file = self
             .file
             .try_clone()
             .map_err(|e| io("clone readonly input", e))?;
-        Ok(read_checked_purpose(&mut file, &self.path, self.purpose)?.bytes)
+        read_checked_purpose(&mut file, &self.path, self.purpose)
+    }
+    pub(crate) fn read_snapshot(&self) -> Result<Vec<u8>> {
+        Ok(self.read_checked_snapshot()?.bytes)
     }
     pub(crate) fn read(&mut self) -> Result<Vec<u8>> {
         Ok(read_checked_purpose(&mut self.file, &self.path, self.purpose)?.bytes)
@@ -402,6 +418,11 @@ struct Binding {
     archive_digest: String,
     archive_metadata: FileIdentity,
 }
+impl Binding {
+    fn contains_member(&self, id: &ObjectId) -> bool {
+        &self.executable == id || &self.archive == id
+    }
+}
 impl BoundInstallation {
     pub(crate) fn open(executable: &Path) -> Result<Self> {
         let parsed = WindowsExecutablePath::parse(executable.as_os_str())?;
@@ -430,7 +451,6 @@ impl BoundInstallation {
         )?;
         let bytes = archive.read()?;
         let executable_digest = hash(&exe.read()?);
-        require_producer(&executable_digest)?;
         Ok(Self {
             executable,
             exe,
@@ -601,20 +621,6 @@ pub(crate) fn context_fixture_directory(parent: &Path) -> Result<PathBuf> {
     create_private_dir(&path)?;
     Ok(path)
 }
-const REVIEWED_DESKTOP_SHA256: &str =
-    "274f58814e19e695a87ab8a6eb52f9763243baaeb2e2ee435aee8b205e6e85d8";
-fn require_producer(digest: &str) -> Result<()> {
-    #[cfg(test)]
-    if TEST_PRODUCER.with(|v| v.get()) {
-        return Ok(());
-    }
-    if digest != REVIEWED_DESKTOP_SHA256 {
-        Err("MaintenanceRequired: Desktop executable integrity/producer is unreviewed".into())
-    } else {
-        Ok(())
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReviewManifest {
@@ -900,6 +906,7 @@ enum Mode {
     SettledApplied,
     SettledReverted,
     Pending,
+    Superseded,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum OperationKind {
@@ -910,6 +917,7 @@ enum OperationKind {
     RollbackRuntime,
     ConfigureGatewayRules,
     RetireGatewayRules,
+    VendorUpdate,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -948,6 +956,14 @@ struct Current {
     settled: Option<Settled>,
     #[serde(default, skip_serializing_if = "DeploymentField::is_absent")]
     runtime_deployment: DeploymentField,
+}
+impl Current {
+    fn require_operation_authority(&self) -> Result<()> {
+        if self.mode == Mode::Superseded {
+            return Err("MaintenanceRequired: canonical slot was superseded".into());
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1024,6 +1040,55 @@ struct Resolution {
     outcome: Outcome,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Supersession {
+    schema: u32,
+    slot_id: String,
+    pending_current: EvidenceRef,
+    operation_id: String,
+    intent: EvidenceRef,
+    historical_success: EvidenceRef,
+    observed_binding: Binding,
+}
+
+const SUPERSESSION_COMPANION: &str = "supersession.json";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SupersessionCompanion {
+    pending_revision: u64,
+    locator: Vec<u16>,
+    evidence: Supersession,
+}
+
+struct SupersededHistory {
+    pending: Binding,
+    applied: Binding,
+    runtime_objects: [ObjectId; 4],
+}
+
+struct ReceivedSlotCurrent {
+    current: Current,
+    digest: String,
+    aliases: Vec<Binding>,
+    runtime_objects: Vec<ObjectId>,
+    companion_issue: Option<String>,
+}
+impl ReceivedSlotCurrent {
+    fn keep_history(&mut self, history: SupersededHistory) {
+        self.aliases.extend([history.pending, history.applied]);
+        self.runtime_objects.extend(history.runtime_objects);
+    }
+
+    fn check_companion(&self) -> Result<()> {
+        match &self.companion_issue {
+            Some(cause) => Err(format!("RecoveryRequired: supersession companion is unconfirmed: {cause}")),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
 enum Settlement {
     Enrollment(TargetState),
@@ -1031,6 +1096,8 @@ enum Settlement {
     Resolution(Resolution),
     RuntimeUpgrade(runtime_upgrade::UpgradeOutcome),
     GatewayRules(gateway_rules::GatewayOutcome),
+    VendorUpdate(runtime_upgrade::VendorUpdateOutcome),
+    Supersession(Supersession),
 }
 
 fn json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -1137,6 +1204,11 @@ fn current_shape(c: &Current, id: &str) -> Result<()> {
         Mode::SettledUnchanged | Mode::SettledReverted
             if c.active_operation.is_none()
                 && c.settled.as_ref().is_some_and(|s| s.applied.is_none()) => {}
+        Mode::Superseded
+            if c.schema == 3
+                && matches!(c.runtime_deployment, DeploymentField::Present(None))
+                && c.active_operation.is_none()
+                && c.settled.as_ref().is_some_and(|s| s.applied.is_none()) => {}
         _ => return Err("canonical current mode/evidence contradiction".into()),
     }
     Ok(())
@@ -1186,6 +1258,11 @@ fn validate_legacy_evidence(slot: &CheckedPath, intent: &Intent) -> Result<()> {
     Ok(())
 }
 fn receive_current(slot: &CheckedPath) -> Result<(Current, String)> {
+    let received = receive_current_with_supersession(slot)?;
+    received.check_companion()?;
+    Ok((received.current, received.digest))
+}
+fn receive_raw_current(slot: &CheckedPath) -> Result<ReceivedSlotCurrent> {
     let bytes = read_private(&slot.path.join("current.json"))?;
     let c: Current = decode(&bytes)?;
     current_shape(
@@ -1209,7 +1286,9 @@ fn receive_current(slot: &CheckedPath) -> Result<(Current, String)> {
         }
     }
     if let Some(op) = &c.active_operation {
-        if matches!(op.kind, OperationKind::UpgradeRuntime | OperationKind::RollbackRuntime) {
+        if matches!(op.kind, OperationKind::VendorUpdate) {
+            runtime_upgrade::receive_vendor_pending(slot, &c, op)?;
+        } else if matches!(op.kind, OperationKind::UpgradeRuntime | OperationKind::RollbackRuntime) {
             runtime_upgrade::receive_pending(slot, &c, op)?;
         } else if matches!(op.kind, OperationKind::ConfigureGatewayRules | OperationKind::RetireGatewayRules) {
             gateway_rules::receive_pending(slot, &c, op)?;
@@ -1234,15 +1313,127 @@ fn receive_current(slot: &CheckedPath) -> Result<(Current, String)> {
         }
         }
     }
-    if c.settled.is_some() { receive_settlement(slot, &c)?; }
+    let history = if c.mode == Mode::Superseded {
+        Some(receive_supersession(slot, &c)?)
+    } else {
+        if c.settled.is_some() { receive_settlement(slot, &c)?; }
+        None
+    };
     if c.mode == Mode::SettledApplied {
         if let DeploymentField::Present(Some(deployment)) = &c.runtime_deployment {
             deployment.receive_receipt(slot)?;
         }
     }
-    Ok((c, hash(&bytes)))
+    let mut received = ReceivedSlotCurrent { current: c, digest: hash(&bytes), aliases: Vec::new(),
+        runtime_objects: Vec::new(), companion_issue: None };
+    if let Some(history) = history { received.keep_history(history); }
+    Ok(received)
+}
+fn receive_supersession(slot: &CheckedPath, current: &Current) -> Result<SupersededHistory> {
+    let settled = current.settled.as_ref().ok_or("supersession evidence absent")?;
+    let Settlement::Supersession(evidence) = decode(&reference(slot, &settled.evidence)?)? else {
+        return Err("supersession evidence kind conflict".into());
+    };
+    let pending: Current = decode(&reference(slot, &evidence.pending_current)?)?;
+    if evidence.pending_current.path != format!("current.previous.{}.json", pending.revision) {
+        return Err("supersession retained Pending path conflict".into());
+    }
+    validate_supersession(slot, current, &pending, &evidence)
+}
+fn validate_supersession(slot: &CheckedPath, current: &Current, pending: &Current, evidence: &Supersession)
+    -> Result<SupersededHistory> {
+    let settled = current.settled.as_ref().ok_or("supersession evidence absent")?;
+    let observed = &evidence.observed_binding;
+    let digest_valid = |value: &str| value.len() == 64
+        && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if evidence.schema != 1 || evidence.slot_id != current.slot_id
+        || observed != &current.binding || settled.target.digest != observed.archive_digest
+        || settled.target.metadata != observed.archive_metadata
+        || !digest_valid(&observed.executable_digest) || !digest_valid(&observed.archive_digest) {
+        return Err("supersession observed binding conflict".into());
+    }
+    current_shape(pending, &current.slot_id)?;
+    let operation = pending.active_operation.as_ref().ok_or("supersession retained Pending operation absent")?;
+    if pending.mode != Mode::Pending || operation.kind != OperationKind::VendorUpdate
+        || !id_valid(&operation.id) || operation.id != evidence.operation_id || operation.intent != evidence.intent
+        || pending.locator != current.locator || pending.revision.checked_add(1) != Some(current.revision) {
+        return Err("supersession retained Pending binding conflict".into());
+    }
+    let history = runtime_upgrade::receive_superseded_vendor_history(slot, pending, operation, &evidence.historical_success)?;
+    if observed.executable_digest == history.applied.executable_digest
+        && observed.archive_digest == history.applied.archive_digest {
+        return Err("supersession observed bytes still match historical success".into());
+    }
+    Ok(history)
+}
+
+fn receive_companion_file(slot: &CheckedPath) -> Result<Option<(SupersessionCompanion, EvidenceRef)>> {
+    let path = slot.path.join(SUPERSESSION_COMPANION);
+    match fs::symlink_metadata(NativeFsPath::from_path(&path)?.as_path()) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io("supersession companion observation", error)),
+        Ok(_) => {}
+    }
+    let bytes = read_private(&path)?;
+    let evidence = EvidenceRef { path: SUPERSESSION_COMPANION.into(), digest: hash(&bytes) };
+    Ok(Some((decode(&bytes)?, evidence)))
+}
+
+fn companion_operation<'a>(pending: &'a Current, digest: &str, companion: &SupersessionCompanion) -> Result<&'a Operation> {
+    let operation = pending.active_operation.as_ref().ok_or("supersession Pending operation absent")?;
+    let evidence = &companion.evidence;
+    if pending.mode != Mode::Pending || operation.kind != OperationKind::VendorUpdate
+        || companion.pending_revision != pending.revision || companion.locator != pending.locator
+        || evidence.slot_id != pending.slot_id || evidence.pending_current.path != "current.json"
+        || evidence.pending_current.digest != digest || evidence.operation_id != operation.id || evidence.intent != operation.intent {
+        return Err("supersession companion Pending binding conflict".into());
+    }
+    Ok(operation)
+}
+
+fn project_companion(slot: &CheckedPath, pending: &Current, digest: &str, companion: &SupersessionCompanion, evidence: EvidenceRef)
+    -> Result<(Current, SupersededHistory)> {
+    companion_operation(pending, digest, companion)?;
+    let binding = companion.evidence.observed_binding.clone();
+    let current = Current { schema: 3, slot_id: pending.slot_id.clone(),
+        revision: pending.revision.checked_add(1).ok_or("supersession revision overflow")?,
+        locator: pending.locator.clone(), mode: Mode::Superseded, active_operation: None,
+        settled: Some(Settled { target: TargetState { digest: binding.archive_digest.clone(),
+            metadata: binding.archive_metadata.clone() }, applied: None, evidence }),
+        binding, runtime_deployment: DeploymentField::Present(None) };
+    let history = validate_supersession(slot, &current, pending, &companion.evidence)?;
+    Ok((current, history))
+}
+
+fn receive_current_with_supersession(slot: &CheckedPath) -> Result<ReceivedSlotCurrent> {
+    let mut received = receive_raw_current(slot)?;
+    let cause = match receive_companion_file(slot) {
+        Ok(None) => return Ok(received),
+        Ok(Some((companion, evidence))) => match project_companion(slot, &received.current, &received.digest, &companion, evidence) {
+            Ok((current, history)) => {
+                received.current = current;
+                received.keep_history(history);
+                return Ok(received);
+            }
+            Err(cause) => cause,
+        },
+        Err(cause) => cause,
+    };
+    if let Some(operation) = received.current.active_operation.as_ref().filter(|op| op.kind == OperationKind::VendorUpdate) {
+        if let Ok(binding) = runtime_upgrade::receive_vendor_intended_binding(slot, &received.current, operation) {
+            received.aliases.push(binding);
+        }
+        if let Ok(Some(evidence)) = runtime_upgrade::vendor_success_reference(slot, operation) {
+            if let Ok(history) = runtime_upgrade::receive_superseded_vendor_history(slot, &received.current, operation, &evidence) {
+                received.keep_history(history);
+            }
+        }
+    }
+    received.companion_issue = Some(cause);
+    Ok(received)
 }
 fn receive_settlement(slot: &CheckedPath, c: &Current) -> Result<(TargetState, Option<archive_install::AppliedArchive>)> {
+    c.require_operation_authority()?;
     let settled = c.settled.as_ref().ok_or("canonical settlement absent")?;
     let evidence: Settlement = decode(&reference(slot, &settled.evidence)?)?;
     let (target, applied) = match evidence {
@@ -1270,6 +1461,7 @@ fn receive_settlement(slot: &CheckedPath, c: &Current) -> Result<(TargetState, O
         }
         Settlement::RuntimeUpgrade(outcome) => runtime_upgrade::receive_settled(slot, c, &outcome)?,
         Settlement::GatewayRules(outcome) => gateway_rules::receive_settled(slot, c, &outcome)?,
+        Settlement::VendorUpdate(outcome) => runtime_upgrade::receive_vendor_settled(slot, c, &outcome)?,
         _ => return Err("settlement evidence kind conflict".into()),
     };
     if target != settled.target || json(&applied)? != json(&settled.applied)? {
@@ -1318,8 +1510,9 @@ fn lookup(
         let ordinary_path = namespace.path.join(&id);
         let slot = CheckedPath::open(&ordinary_path, PathKind::Directory, PathPurpose::Review)?;
         private(&slot.file)?;
-        let (current, digest) = receive_current(&slot)
+        let received = receive_current_with_supersession(&slot)
             .map_err(|e| format!("BindingUnavailable: {}: {e}", ordinary_path.display()))?;
+        let current = &received.current;
         let same_location = ordinal(&current.locator, &bound.root.locator)?;
         let same_leaf = ordinal(
             current
@@ -1337,29 +1530,47 @@ fn lookup(
         let same_object = current.binding.root == binding.root
             || current.binding.resources == binding.resources
             || (current.binding.parent == binding.parent && same_leaf);
-        if same_location || same_object {
+        let superseded_alias = (!received.aliases.is_empty() || received.companion_issue.is_some()) &&
+            std::iter::once(&current.binding).chain(&received.aliases).any(|protected| {
+                protected.root == binding.root || protected.resources == binding.resources
+                    || (same_leaf && protected.parent == binding.parent)
+                    || protected.contains_member(&binding.executable) || protected.contains_member(&binding.archive)
+            });
+        if same_location || same_object || superseded_alias {
+            received.check_companion()?;
             if selected.is_some() {
                 return Err("AuthorityAmbiguous: multiple matching slots".into());
             }
             if !same_location {
                 return Err("LocatorConflict: moved installation requires explicit rebind".into());
             }
-            selected = Some((slot, current, digest));
+            selected = Some((slot, received.current, received.digest));
         }
     }
     Ok(selected)
 }
 impl Authority {
     fn open(bound: &BoundInstallation, enroll: bool, recover: bool) -> Result<Self> {
+        Self::open_inner(bound, enroll, recover, None).map_err(ApplyCurrentReadError::into_owner_error)
+    }
+    fn open_vendor_update(bound: &BoundInstallation, expected: &str) -> Result<Self> {
+        Self::open_inner(bound, false, false, Some(expected)).map_err(ApplyCurrentReadError::into_owner_error)
+    }
+    fn open_inner(bound: &BoundInstallation, enroll: bool, recover: bool, vendor_expected: Option<&str>)
+        -> Result<Self, ApplyCurrentReadError> {
         let (known, product_path, namespace_path) = namespace_paths(bound)?;
-        let namespace_lock = Lease::acquire(&known, "wsl_namespace_v2")?;
+        let namespace_lock = Lease::try_acquire(&known, "wsl_namespace_v2")?
+            .ok_or(ApplyCurrentReadError::Busy(ApplyCurrentLease::Namespace))?;
         if !enroll && !namespace_path.exists() {
             return Err("UnreceivedInstallation: canonical authority absent".into());
         }
         let mut footprint = Vec::new();
-        let result = (|| {
+        let result = (|| -> Result<_, ApplyCurrentReadError> {
             for path in [&product_path, &namespace_path] {
                 if !path.exists() {
+                    if !enroll {
+                        return Err("UnreceivedInstallation: canonical authority absent".into());
+                    }
                     create_private_dir(path)?;
                     footprint.push(path.clone());
                 }
@@ -1376,7 +1587,10 @@ impl Authority {
             private(&namespace.file)?;
             let selected = lookup(&namespace, bound)?;
             let (slot, current, digest) = match selected {
-                Some(x) => x,
+                Some((slot, current, digest)) => {
+                    current.require_operation_authority()?;
+                    (slot, current, digest)
+                }
                 None => {
                     if !enroll {
                         return Err("UnreceivedInstallation: no canonical slot".into());
@@ -1418,14 +1632,15 @@ impl Authority {
             if TEST_BOOTSTRAP_SLOT_FAILURE.with(|v| v.replace(false)) {
                 return Err("injected B1 post-current initialization receiving failure".into());
             }
-            let lease = Lease::acquire(&slot, "wsl_slot_v2")?;
+            let lease = Lease::try_acquire(&slot, "wsl_slot_v2")?
+                .ok_or(ApplyCurrentReadError::Busy(ApplyCurrentLease::Slot))?;
             Ok((product, namespace, slot, current, digest, lease))
         })();
         let (product, namespace, slot, current, digest, lease) = result.map_err(|e| {
             if footprint.is_empty() {
                 e
             } else {
-                format!("PreparationIncomplete: {e}; preserved bootstrap footprint={footprint:?}")
+                format!("PreparationIncomplete: {}; preserved bootstrap footprint={footprint:?}", e.into_owner_error()).into()
             }
         })?;
         drop(namespace_lock);
@@ -1444,7 +1659,7 @@ impl Authority {
                 "RecoveryRequired: slot {} operation {} is Pending",
                 a.current.slot_id,
                 a.current.active_operation.as_ref().unwrap().id
-            ));
+            ).into());
         }
         if a.current.mode == Mode::Bootstrap && recover {
             return Ok(a);
@@ -1478,7 +1693,16 @@ impl Authority {
             a.publish(c)?;
         }
         if !recover {
-            a.check_bound(bound)?;
+            if let Some(expected) = vendor_expected {
+                if a.digest != expected || a.current.mode != Mode::SettledApplied
+                    || !ordinal(&a.current.locator, &bound.root.locator)?
+                    || a.current.binding == bound.binding()? {
+                    return Err("UpdatePending: selected vendor update does not bind the expected settled prior incarnation".into());
+                }
+                a.current.runtime_deployment.received()?.receive_receipt(&a.slot)?;
+            } else {
+                a.check_bound(bound)?;
+            }
         }
         Ok(a)
     }
@@ -1544,12 +1768,22 @@ impl Authority {
         })
     }
     fn publish(&mut self, next: Current) -> Result<()> {
+        self.publish_with_namespace(next, None, || Ok(()))
+    }
+    fn publish_with_namespace(&mut self, next: Current, wait: Option<&dyn Fn() -> Result<()>>,
+        before_write: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.current.require_operation_authority()?;
+        next.require_operation_authority()?;
         if (matches!(self.current.runtime_deployment, DeploymentField::Present(Some(_)))
             || matches!(next.runtime_deployment, DeploymentField::Present(Some(_))))
             && self.runtime_write.is_none() {
             return Err("MaintenanceRequired: exclusive runtime gate is not retained".into());
         }
-        let _namespace = Lease::acquire(&self.known, "wsl_namespace_v2")?;
+        let _namespace = match wait {
+            Some(check) => wait_for_native_lease("publication namespace", check,
+                || Lease::try_acquire(&self.known, "wsl_namespace_v2"))?,
+            None => Lease::acquire(&self.known, "wsl_namespace_v2")?,
+        };
         self.slot.recheck()?;
         self.namespace.recheck()?;
         let (actual, digest) = receive_current(&self.slot)?;
@@ -1567,6 +1801,9 @@ impl Authority {
             return Err("current publication binding conflict".into());
         }
         current_shape(&next, &next.slot_id)?;
+        if let Some(check) = wait { check()?; }
+        before_write()?;
+        if let Some(check) = wait { check()?; }
         self.retain_current()?;
         let path = self
             .slot
@@ -1594,6 +1831,12 @@ impl Authority {
         self.current = actual;
         self.digest = digest;
         Ok(())
+    }
+
+    fn recovery_completion(&self, message: &'static str) -> Result<RecoveryCompletion> {
+        let current_sha256 = hex::decode(&self.digest).map_err(|_| "current digest encoding")?
+            .try_into().map_err(|_| "current digest length")?;
+        Ok(RecoveryCompletion { message, slot_id: self.current.slot_id.clone(), current_sha256 })
     }
 }
 
@@ -1917,34 +2160,349 @@ pub(crate) struct GatewayPendingObservation {
     pub(crate) current_sha256: [u8; 32],
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VendorPendingObservation {
+    pub(crate) slot_id: String,
+    pub(crate) operation_id: String,
+    pub(crate) current_sha256: [u8; 32],
+}
+
+/// Confirmation for the canonical metadata keeper. This is not a recovery,
+/// runtime or package-approval capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VendorSupersessionConfirmation {
+    pub(crate) pending: VendorPendingObservation,
+    pub(crate) historical_success_sha256: [u8; 32],
+    pub(crate) observed_binding_sha256: [u8; 32],
+}
+
+#[derive(Debug)]
+pub(crate) enum VendorSupersessionFailure {
+    Admission(String),
+    Publication(MetadataFailure),
+}
+impl From<String> for VendorSupersessionFailure {
+    fn from(cause: String) -> Self { Self::Admission(cause) }
+}
+impl From<&str> for VendorSupersessionFailure {
+    fn from(cause: &str) -> Self { Self::Admission(cause.into()) }
+}
+impl From<MetadataFailure> for VendorSupersessionFailure {
+    fn from(failure: MetadataFailure) -> Self { Self::Publication(failure) }
+}
+impl std::fmt::Display for VendorSupersessionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(cause) => formatter.write_str(cause),
+            Self::Publication(failure) => std::fmt::Display::fmt(failure, formatter),
+        }
+    }
+}
+
+fn recheck_supersession_target(bound: &BoundInstallation) -> Result<Binding> {
+    bound.revalidate_context()?;
+    for member in [&bound.parent, &bound.root, &bound.resources, &bound.exe, &bound.archive] {
+        member.recheck()?;
+    }
+    shadow_clear(&bound.archive.path)?;
+    if hash(&bound.exe.read_snapshot()?) != bound.executable_digest
+        || bound.archive.read_snapshot()? != bound.bytes {
+        return Err("RecoveryRequired: supersession observed member bytes changed".into());
+    }
+    bound.binding()
+}
+
+struct VerifiedVendorSupersession {
+    _slot_lease: Lease,
+    _namespace_lease: Lease,
+    known: CheckedPath,
+    namespace: CheckedPath,
+    slot: CheckedPath,
+    companion: SupersessionCompanion,
+    confirmation: VendorSupersessionConfirmation,
+    evidence: EvidenceRef,
+    bytes: Vec<u8>,
+    fingerprint: [u8; 32],
+    already_published: bool,
+}
+
+fn check_supersession_cancelled(cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::SeqCst) { return Err("supersession cancelled".into()); }
+    Ok(())
+}
+
+fn receive_vendor_supersession_candidate(bound: &BoundInstallation, cancelled: &AtomicBool)
+    -> Result<VerifiedVendorSupersession> {
+    check_supersession_cancelled(cancelled)?;
+    let (known, _, namespace_path) = namespace_paths(bound)?;
+    let namespace_lease = Lease::acquire(&known, "wsl_namespace_v2")?;
+    let namespace = CheckedPath::open(&namespace_path, PathKind::Directory, PathPurpose::Review)?;
+    private(&namespace.file)?;
+    let (slot, _, _) = lookup(&namespace, bound)?.ok_or("UnreceivedInstallation: no canonical slot")?;
+    let slot_lease = Lease::acquire(&slot, "wsl_slot_v2")?;
+    let raw = receive_raw_current(&slot)?;
+    let pending = &raw.current;
+    if pending.mode != Mode::Pending || !ordinal(&pending.locator, &bound.root.locator)? {
+        return Err("RecoveryRequired: supersession requires the selected raw Pending slot".into());
+    }
+    let operation = pending.active_operation.as_ref().filter(|op| op.kind == OperationKind::VendorUpdate)
+        .ok_or("RecoveryRequired: supersession requires a VendorPending operation")?;
+    let historical_success = runtime_upgrade::vendor_success_reference(&slot, operation)?
+        .ok_or("RecoveryRequired: supersession historical success absent")?;
+    let observed = recheck_supersession_target(bound)?;
+    let decode_sha256 = |digest: &str| -> Result<[u8; 32]> {
+        let mut bytes = [0; 32];
+        hex::decode_to_slice(digest, &mut bytes).map_err(|_| "supersession evidence SHA-256 encoding differs")?;
+        Ok(bytes)
+    };
+    let confirmation = VendorSupersessionConfirmation {
+        pending: VendorPendingObservation { slot_id: pending.slot_id.clone(), operation_id: operation.id.clone(),
+            current_sha256: decode_sha256(&raw.digest)? },
+        historical_success_sha256: decode_sha256(&historical_success.digest)?,
+        observed_binding_sha256: Sha256::digest(&json(&observed)?).into(),
+    };
+    let companion = SupersessionCompanion { pending_revision: pending.revision, locator: pending.locator.clone(),
+        evidence: Supersession { schema: 1, slot_id: pending.slot_id.clone(),
+            pending_current: EvidenceRef { path: "current.json".into(), digest: raw.digest.clone() },
+            operation_id: operation.id.clone(), intent: operation.intent.clone(), historical_success,
+            observed_binding: observed } };
+    let bytes = json(&companion)?;
+    let fingerprint: [u8; 32] = Sha256::digest(&bytes).into();
+    let evidence = EvidenceRef { path: SUPERSESSION_COMPANION.into(), digest: hex::encode(fingerprint) };
+    project_companion(&slot, pending, &raw.digest, &companion, evidence.clone())?;
+    let already_published = match receive_companion_file(&slot)? {
+        Some((_, existing)) if existing == evidence => true,
+        Some(_) => return Err("RecoveryRequired: supersession companion already exists with different bytes".into()),
+        None => false,
+    };
+    check_supersession_cancelled(cancelled)?;
+    Ok(VerifiedVendorSupersession { _slot_lease: slot_lease, _namespace_lease: namespace_lease,
+        known, namespace, slot, companion, confirmation, evidence, bytes, fingerprint, already_published })
+}
+
+/// Read-only observation for an explicit metadata-only confirmation.
+pub(crate) fn observe_vendor_supersession(bound: &BoundInstallation, cancelled: &AtomicBool)
+    -> Result<VendorSupersessionConfirmation> {
+    Ok(receive_vendor_supersession_candidate(bound, cancelled)?.confirmation)
+}
+
+/// Metadata keeper only. The supplied confirmation must cover the exact
+/// Pending, completed history, and selected replacement. Pending is retained.
+pub(crate) fn record_vendor_supersession(bound: &BoundInstallation, confirmation: &VendorSupersessionConfirmation,
+    cancelled: &AtomicBool, revalidate_authority: impl FnOnce() -> Result<()>)
+    -> std::result::Result<[u8; 32], VendorSupersessionFailure> {
+    let candidate = receive_vendor_supersession_candidate(bound, cancelled)?;
+    let expected = &confirmation.pending;
+    let actual = &candidate.confirmation;
+    if actual.pending.slot_id != expected.slot_id || actual.pending.current_sha256 != expected.current_sha256 {
+        return Err("RecoveryRequired: supersession Pending confirmation changed".into());
+    }
+    if actual.pending.operation_id != expected.operation_id {
+        return Err("RecoveryRequired: supersession VendorPending operation confirmation differs".into());
+    }
+    if actual.historical_success_sha256 != confirmation.historical_success_sha256 {
+        return Err("RecoveryRequired: supersession historical success confirmation differs".into());
+    }
+    if actual.observed_binding_sha256 != confirmation.observed_binding_sha256 {
+        return Err("RecoveryRequired: supersession observed binding confirmation differs".into());
+    }
+    check_supersession_cancelled(cancelled)?;
+    if candidate.already_published { return Ok(candidate.fingerprint); }
+    let slot = &candidate.slot;
+    let companion = &candidate.companion;
+    let evidence = &candidate.evidence;
+    let raw_digest = &companion.evidence.pending_current.digest;
+    let observed = &companion.evidence.observed_binding;
+    let stage = format!("supersession.stage.{}", unique_id()?);
+    let leaf = OsStr::new(SUPERSESSION_COMPANION);
+    let verify_currentness = || -> Result<()> {
+        candidate.known.recheck()?;
+        candidate.namespace.recheck()?;
+        slot.recheck()?;
+        let fresh = receive_raw_current(slot)?;
+        if &fresh.digest != raw_digest || &recheck_supersession_target(bound)? != observed {
+            return Err("RecoveryRequired: supersession Pending or observation changed".into());
+        }
+        project_companion(slot, &fresh.current, &fresh.digest, companion, evidence.clone())?;
+        Ok(())
+    };
+    let id = match publish_immutable_slot_receipt(slot, OsStr::new(&stage), leaf, &candidate.bytes, || {
+        verify_currentness()?;
+        check_supersession_cancelled(cancelled)?;
+        revalidate_authority()
+    }) {
+        Ok(id) => id,
+        Err(mut failure) => {
+            if failure.evidence["stageRenameResult"].as_bool() == Some(true) {
+                let received = receive_published_slot_receipt(&mut failure, slot, leaf, &candidate.bytes, verify_currentness);
+                failure.evidence["postEffectReceiving"] = match received {
+                    Ok(release) => serde_json::json!({"result":"received","receiptSha256":evidence.digest,
+                        "rawPendingSha256":raw_digest,"disposition":release}),
+                    Err(cause) => serde_json::json!({"result":"held","cause":cause}),
+                };
+            }
+            return Err(failure.into());
+        }
+    };
+    let readback = (|| {
+        let destination = CheckedPath::open(&slot.path.join(SUPERSESSION_COMPANION), PathKind::File, PathPurpose::Review)?;
+        if destination.native_id() != id || destination.read_snapshot()? != candidate.bytes {
+            return Err("supersession receipt identity or bytes differ".into());
+        }
+        let received = receive_current_with_supersession(slot)?;
+        received.check_companion()?;
+        if received.current.mode != Mode::Superseded || &received.digest != raw_digest
+            || &received.current.binding != observed || &recheck_supersession_target(bound)? != observed {
+            return Err("supersession companion readback does not bind the exact Pending and observation".into());
+        }
+        Ok(candidate.fingerprint)
+    })();
+    readback.map_err(|cause: String| MetadataFailure { phase: "supersession independent receiving", cause,
+        replace_result: None, evidence: serde_json::json!({"stageRenameResult":true,"receiptNativeId":id,
+            "receiptName":SUPERSESSION_COMPANION,"requestedSha256":evidence.digest,"rawPendingSha256":raw_digest}),
+        live: Vec::new(), pending: None, unwind: None, secondary_unwinds: Vec::new() }.into())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyCurrentObservation {
     Absent,
     Settled { slot_id: String, current_sha256: [u8; 32] },
     GatewayPending(GatewayPendingObservation),
+    VendorPending(VendorPendingObservation),
+    VendorReplacement(VendorUpdateObservation),
+}
+
+/// A changed, positively selected incarnation still tied to one settled slot.
+/// This is a prerequisite observation, never permission to execute maintenance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VendorUpdateObservation {
+    pub(crate) slot_id: String,
+    pub(crate) prior_current_sha256: [u8; 32],
+    pub(crate) new_parent_id: ObjectId,
+    pub(crate) new_resources_id: ObjectId,
+    pub(crate) new_archive_id: ObjectId,
+    pub(crate) new_executable_sha256: [u8; 32],
+    pub(crate) new_archive_sha256: [u8; 32],
+    pub(crate) new_binding_sha256: [u8; 32],
+}
+
+fn vendor_update_observation(bound: &BoundInstallation, slot: &CheckedPath, current: &Current,
+    digest: &str) -> Result<VendorUpdateObservation> {
+    let binding = bound.binding()?;
+    if current.mode != Mode::SettledApplied || !ordinal(&current.locator, &bound.root.locator)?
+        || current.binding == binding {
+        return Err("UpdatePending: no distinct settled vendor incarnation".into());
+    }
+    let deployment = current.runtime_deployment.received()?;
+    deployment.receive_receipt(slot)?;
+    let _host = deployment.receive_host(slot)?;
+    bound.exe.recheck()?;
+    if hash(&bound.exe.read_snapshot()?) != bound.executable_digest || bound.archive.read_snapshot()? != bound.bytes {
+        return Err("UpdatePending: selected vendor bytes changed".into());
+    }
+    let host = deployment.host.path.to_str().ok_or("runtime host encoding")?;
+    if desktop_hook::prepare_gui_archive(&bound.bytes, host).map_err(|e| e.to_string())?.hook_status
+        != desktop_hook::HookStatus::Prepared {
+        return Err("UpdatePending: vendor update requires a supported pristine archive".into());
+    }
+    let decode_hash = |value: &str| -> Result<[u8; 32]> {
+        hex::decode(value).map_err(|_| "digest encoding")?.try_into().map_err(|_| "digest length".into())
+    };
+    Ok(VendorUpdateObservation { slot_id: current.slot_id.clone(), prior_current_sha256: decode_hash(digest)?,
+        new_parent_id: binding.parent.clone(), new_resources_id: binding.resources.clone(), new_archive_id: binding.archive.clone(),
+        new_executable_sha256: decode_hash(&binding.executable_digest)?, new_archive_sha256: decode_hash(&binding.archive_digest)?,
+        new_binding_sha256: decode_hash(&hash(&json(&binding)?))? })
+}
+
+pub(crate) fn observe_vendor_update(bound: &BoundInstallation) -> Result<VendorUpdateObservation> {
+    match observe_apply_current(bound)? {
+        ApplyCurrentObservation::VendorReplacement(value) => Ok(value),
+        _ => Err("UpdatePending: no distinct settled vendor incarnation".into()),
+    }
 }
 /// Read-only observation for positive Apply. This data grants no mutation;
 /// recovery re-receives the same exact operation/digest/native binding.
 pub(crate) fn observe_apply_current(bound: &BoundInstallation) -> Result<ApplyCurrentObservation> {
+    observe_apply_current_attempt(bound).map_err(ApplyCurrentReadError::into_owner_error)
+}
+
+pub(crate) fn wait_for_apply_current(bound: &BoundInstallation, stage: &str, check: &dyn Fn() -> Result<()>)
+    -> Result<ApplyCurrentObservation> {
+    wait_for_current_admission(stage, check, || observe_apply_current_attempt(bound))
+}
+
+#[derive(Debug)]
+pub(crate) enum ApplyCurrentLease { Namespace, Slot }
+
+#[derive(Debug)]
+pub(crate) enum ApplyCurrentReadError {
+    Busy(ApplyCurrentLease),
+    Failed(String),
+}
+
+impl ApplyCurrentReadError {
+    fn into_owner_error(self) -> String {
+        match self {
+            Self::Busy(_) => Lease::BUSY.into(),
+            Self::Failed(cause) => cause,
+        }
+    }
+}
+
+impl From<String> for ApplyCurrentReadError {
+    fn from(value: String) -> Self { Self::Failed(value) }
+}
+
+impl From<&str> for ApplyCurrentReadError {
+    fn from(value: &str) -> Self { Self::Failed(value.into()) }
+}
+
+fn wait_for_current_admission<T>(stage: &str, check: &dyn Fn() -> Result<()>,
+    mut attempt: impl FnMut() -> Result<T, ApplyCurrentReadError>) -> Result<T> {
+    wait_for_native_lease(stage, check, || match attempt() {
+        Ok(value) => Ok(Some(value)),
+        Err(ApplyCurrentReadError::Busy(_)) => Ok(None),
+        Err(ApplyCurrentReadError::Failed(error)) => Err(error),
+    })
+}
+
+/// One zero-wait read attempt. Busy carries no lease or partial observation.
+pub(crate) fn observe_apply_current_attempt(bound: &BoundInstallation) -> std::result::Result<ApplyCurrentObservation, ApplyCurrentReadError> {
     let (known, _, namespace_path) = namespace_paths(bound)?;
-    let _namespace = Lease::acquire(&known, "wsl_namespace_v2")?;
+    let _namespace = Lease::try_acquire(&known, "wsl_namespace_v2")?
+        .ok_or(ApplyCurrentReadError::Busy(ApplyCurrentLease::Namespace))?;
     match fs::symlink_metadata(NativeFsPath::from_path(&namespace_path)?.as_path()) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ApplyCurrentObservation::Absent),
-        Err(error) => return Err(io("continuation namespace observation", error)),
+        Err(error) => return Err(io("continuation namespace observation", error).into()),
         Ok(_) => {},
     }
     let namespace = CheckedPath::open(&namespace_path, PathKind::Directory, PathPurpose::Review)?;
     private(&namespace.file)?;
     let Some((slot, _, _)) = lookup(&namespace, bound)? else { return Ok(ApplyCurrentObservation::Absent); };
-    let _slot = Lease::acquire(&slot, "wsl_slot_v2")?;
+    let _slot = Lease::try_acquire(&slot, "wsl_slot_v2")?
+        .ok_or(ApplyCurrentReadError::Busy(ApplyCurrentLease::Slot))?;
     let (current, digest) = receive_current(&slot)?;
+    current.require_operation_authority()?;
     let gateway_pending = current.mode == Mode::Pending && current.active_operation.as_ref().is_some_and(|operation|
         matches!(operation.kind, OperationKind::ConfigureGatewayRules | OperationKind::RetireGatewayRules));
-    if matches!(current.mode, Mode::Bootstrap | Mode::Pending) && !gateway_pending {
-        return Err("RecoveryRequired: continuation target has unresolved Current".into());
+    let vendor_pending = current.mode == Mode::Pending && current.active_operation.as_ref().is_some_and(|operation|
+        operation.kind == OperationKind::VendorUpdate);
+    if vendor_pending {
+        let operation = current.active_operation.as_ref().unwrap();
+        runtime_upgrade::receive_vendor_pending_target(&slot, &current, operation, bound)?;
+        let current_sha256 = hex::decode(digest).map_err(|_| "current digest encoding".to_owned())?
+            .try_into().map_err(|_| "current digest length".to_owned())?;
+        return Ok(ApplyCurrentObservation::VendorPending(VendorPendingObservation {
+            slot_id: current.slot_id, operation_id: operation.id.clone(), current_sha256,
+        }));
     }
-    if current.binding != bound.binding()? { return Err("UpdatePending: continuation target incarnation differs".into()); }
-    let digest: [u8; 32] = hex::decode(digest).map_err(|_| "current digest encoding")?
-        .try_into().map_err(|_| "current digest length")?;
+    if matches!(current.mode, Mode::Bootstrap | Mode::Pending) && !gateway_pending {
+        return Err(ApplyCurrentReadError::Failed("RecoveryRequired: continuation target has unresolved Current".into()));
+    }
+    if current.binding != bound.binding()? {
+        return Ok(ApplyCurrentObservation::VendorReplacement(vendor_update_observation(bound, &slot, &current, &digest)?));
+    }
+    let digest: [u8; 32] = hex::decode(digest).map_err(|_| "current digest encoding".to_owned())?
+        .try_into().map_err(|_| "current digest length".to_owned())?;
     if gateway_pending {
         let operation = current.active_operation.as_ref().unwrap();
         gateway_rules::receive_pending(&slot, &current, operation)?;
@@ -1957,8 +2515,76 @@ fn strict_current_expectation(observation: ApplyCurrentObservation) -> Result<Op
     match observation {
         ApplyCurrentObservation::Absent => Ok(None),
         ApplyCurrentObservation::Settled { slot_id, current_sha256 } => Ok(Some((slot_id, current_sha256))),
-        ApplyCurrentObservation::GatewayPending(_) => Err("RecoveryRequired: continuation target has unresolved Current".into()),
+        ApplyCurrentObservation::GatewayPending(_) | ApplyCurrentObservation::VendorPending(_) => Err("RecoveryRequired: continuation target has unresolved Current".into()),
+        ApplyCurrentObservation::VendorReplacement(_) => Err("UpdatePending: continuation target incarnation differs".into()),
     }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "read-only receipt against an explicitly owned, stable Desktop Current fixture"]
+fn selected_current_attempt_distinguishes_busy_leases_and_releases_namespace() {
+    let executable = PathBuf::from(std::env::var_os("AG_SELECTED_RECOVERY_MUTEX_FIXTURE_EXE")
+        .expect("explicit owned Desktop fixture executable"));
+    let base = PathBuf::from(std::env::var_os("AG_SELECTED_RECOVERY_MUTEX_FIXTURE_BASE")
+        .expect("explicit private fixture state base"));
+    let context = PathBuf::from(std::env::var_os("AG_RUNTIME_UPGRADE_DEPLOYMENT_CONTEXT")
+        .expect("explicit genuine registration path required"));
+
+    let base = CheckedPath::open(&base, PathKind::Directory, PathPurpose::Review).unwrap();
+    private(&base.file).unwrap();
+    let fixture = CheckedPath::open(base.as_path().parent().expect("fixture state parent"), PathKind::Directory, PathPurpose::Review).unwrap();
+    private(&fixture.file).unwrap();
+    let executable = CheckedPath::open(&executable, PathKind::File, PathPurpose::Executable).unwrap();
+    assert!(fixture.contains(&executable).unwrap(), "state and executable must belong to the same private fixture");
+    assert!(!base.contains(&executable).unwrap(), "fixture executable must be outside its state base");
+    let known = CheckedPath::open(&known_folder().unwrap(), PathKind::Directory, PathPurpose::Review).unwrap();
+    let product = known.as_path().join(user_state_location::WINDOWS_STATE_LEAF);
+    assert_ne!(base.native_id(), known.native_id(), "fixture cannot select the ordinary state base");
+    assert!(!base.as_path().ancestors().any(|path| same_windows_path(path, &product).unwrap()),
+        "fixture cannot select the installed product state");
+
+    struct FixtureStateBase(Option<PathBuf>);
+    impl FixtureStateBase {
+        fn receive(path: &Path) -> Self { Self(TEST_BASE.with(|slot| slot.replace(Some(path.to_path_buf())))) }
+    }
+    impl Drop for FixtureStateBase {
+        fn drop(&mut self) { TEST_BASE.with(|slot| { slot.replace(self.0.take()); }); }
+    }
+    fn receive_bound(path: &Path, context_path: &Path) -> BoundInstallation {
+        let mut bound = BoundInstallation::open(path).unwrap();
+        let context = super::windows_deployment::receive_for_installation(&bound, Some(context_path)).unwrap()
+            .expect("explicit genuine fixture context was not received");
+        bound.attach_ancestor_context(context).unwrap();
+        bound
+    }
+    let _state = FixtureStateBase::receive(base.as_path());
+    let bound = receive_bound(executable.as_path(), &context);
+    let expected = observe_apply_current(&bound).unwrap();
+    assert!(!matches!(&expected, ApplyCurrentObservation::Absent));
+    let (known, _, namespace_path) = namespace_paths(&bound).unwrap();
+    let namespace = CheckedPath::open(&namespace_path, PathKind::Directory, PathPurpose::Review).unwrap();
+    let (slot, _, _) = lookup(&namespace, &bound).unwrap().expect("fixture has an enrolled slot");
+    let observe = || {
+        let executable = executable.as_path().to_path_buf();
+        let base = base.as_path().to_path_buf();
+        let context = context.clone();
+        std::thread::spawn(move || {
+            let _state = FixtureStateBase::receive(&base);
+            observe_apply_current_attempt(&receive_bound(&executable, &context))
+        }).join().unwrap()
+    };
+    let held_namespace = Lease::acquire(&known, "wsl_namespace_v2").unwrap();
+    assert!(matches!(observe(), Err(ApplyCurrentReadError::Busy(ApplyCurrentLease::Namespace))));
+    drop(held_namespace);
+
+    let held_slot = Lease::acquire(&slot, "wsl_slot_v2").unwrap();
+    assert!(matches!(observe(), Err(ApplyCurrentReadError::Busy(ApplyCurrentLease::Slot))));
+    let namespace = Lease::try_acquire(&known, "wsl_namespace_v2").unwrap()
+        .expect("slot contention released the already received namespace");
+    drop(namespace);
+    drop(held_slot);
+    assert_eq!(observe().unwrap(), expected);
 }
 /// Continuation/startup readers remain strictly settled and never recover.
 pub(crate) fn capture_current_expectation(bound: &BoundInstallation) -> Result<Option<(String, [u8; 32])>> {
@@ -1973,6 +2599,13 @@ mod apply_current_projection_tests {
         assert_eq!(strict_current_expectation(ApplyCurrentObservation::Settled { slot_id: "a".repeat(32), current_sha256: [7;32] }).unwrap(), Some(("a".repeat(32), [7;32])));
         let pending = GatewayPendingObservation { slot_id: "a".repeat(32), operation_id: "b".repeat(32), current_sha256: [8;32] };
         assert!(strict_current_expectation(ApplyCurrentObservation::GatewayPending(pending)).unwrap_err().contains("unresolved Current"));
+        let pending = VendorPendingObservation { slot_id: "a".repeat(32), operation_id: "c".repeat(32), current_sha256: [9;32] };
+        assert!(strict_current_expectation(ApplyCurrentObservation::VendorPending(pending)).unwrap_err().contains("unresolved Current"));
+        let id = ObjectId { volume: 1, file: [2; 16] };
+        let vendor = VendorUpdateObservation { slot_id: "a".repeat(32), prior_current_sha256: [3; 32],
+            new_parent_id: id.clone(), new_resources_id: id.clone(), new_archive_id: id,
+            new_executable_sha256: [4; 32], new_archive_sha256: [5; 32], new_binding_sha256: [6; 32] };
+        assert!(strict_current_expectation(ApplyCurrentObservation::VendorReplacement(vendor)).unwrap_err().contains("incarnation differs"));
     }
 }
 
@@ -2256,14 +2889,50 @@ pub(crate) struct GatewayRecoveryContext<'a> {
     pub(crate) runner: &'a mut dyn gateway_rules::GatewayRuleRunner,
     pub(crate) cancel: &'a AtomicBool,
 }
+
+/// Current received by the publishing authority before releasing its slot.
+#[derive(Debug)]
+pub(crate) struct RecoveryCompletion {
+    pub(crate) message: &'static str,
+    pub(crate) slot_id: String,
+    pub(crate) current_sha256: [u8; 32],
+}
+
 pub(crate) fn recover<W: MaintenanceWindow>(
     bound: BoundInstallation,
     id: &str,
     expected: &str,
     gateway: Option<GatewayRecoveryContext<'_>>,
     window: &mut W,
-) -> Result<String> {
-    let mut authority = Authority::open(&bound, false, true)?;
+) -> Result<RecoveryCompletion> {
+    recover_inner(bound, id, expected, gateway, window, None)
+}
+
+pub(crate) fn recover_waiting_vendor_metadata<W: MaintenanceWindow>(
+    bound: BoundInstallation,
+    id: &str,
+    expected: &str,
+    gateway: GatewayRecoveryContext<'_>,
+    window: &mut W,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<RecoveryCompletion> {
+    recover_inner(bound, id, expected, Some(gateway), window, Some(check))
+}
+
+fn recover_inner<W: MaintenanceWindow>(
+    bound: BoundInstallation,
+    id: &str,
+    expected: &str,
+    gateway: Option<GatewayRecoveryContext<'_>>,
+    window: &mut W,
+    wait: Option<&dyn Fn() -> Result<()>>,
+) -> Result<RecoveryCompletion> {
+    let mut authority = match wait {
+        Some(check) => wait_for_current_admission("initial canonical admission", check,
+            || Authority::open_inner(&bound, false, true, None))?,
+        None => Authority::open(&bound, false, true)?,
+    };
+    if let Some(check) = wait { check()?; }
     authority.admit_maintenance_gate()?;
     let op = authority
         .current
@@ -2274,6 +2943,9 @@ pub(crate) fn recover<W: MaintenanceWindow>(
     if authority.digest != expected {
         return Err("RecoveryRequired: expectedCurrentDigest differs from held Pending".into());
     }
+    if wait.is_some() && op.kind != OperationKind::VendorUpdate {
+        return Err("RecoveryRequired: exact Pending VendorUpdate required for selected recovery".into());
+    }
     if matches!(op.kind, OperationKind::ConfigureGatewayRules | OperationKind::RetireGatewayRules) {
         bound.revalidate_context()?;
         if authority.current.binding != bound.binding()? { return Err("RecoveryRequired: gateway recovery incarnation differs".into()); }
@@ -2283,9 +2955,11 @@ pub(crate) fn recover<W: MaintenanceWindow>(
         // Release slot/G1 ownership before the existing gateway owner reacquires
         // and revalidates this exact Pending snapshot. Never nest writer gates.
         drop(authority);
-        gateway_rules::recover_gateway_rules(&bound, id, expected, context.runner, window, context.cancel)
-            .map_err(|error| error.to_string())?;
-        return Ok("RecoverySettled: exact Pending gateway operation received without native replay".into());
+        return gateway_rules::recover_gateway_rules(&bound, id, expected, context.runner, window, context.cancel)
+            .map_err(|error| error.to_string());
+    }
+    if matches!(op.kind, OperationKind::VendorUpdate) {
+        return runtime_upgrade::recover_vendor_update(bound, authority, op, gateway, window, wait);
     }
     if matches!(op.kind, OperationKind::UpgradeRuntime | OperationKind::RollbackRuntime) {
         return runtime_upgrade::recover(bound, authority, op, window);
@@ -2504,9 +3178,8 @@ pub(crate) fn recover<W: MaintenanceWindow>(
         evidence: r,
     });
     authority.publish(c)?;
-    Ok(
+    authority.recovery_completion(
         "RecoverySettled: exact Pending operation resolved; original immutable failure retained"
-            .into(),
     )
 }
 pub(crate) fn recover_initialization<W: MaintenanceWindow>(
@@ -2620,7 +3293,7 @@ fn verify_failure_observations(
     Ok(())
 }
 #[cfg(test)]
-thread_local! { static TEST_FIXTURE_PARENT:std::cell::RefCell<Option<PathBuf>>=const{std::cell::RefCell::new(None)};static TEST_BASE:std::cell::RefCell<Option<PathBuf>>=const{std::cell::RefCell::new(None)};static TEST_PRODUCER:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};static TEST_BOOTSTRAP_SLOT_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};static TEST_BOOTSTRAP_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};static TEST_DACL_STATUSES:std::cell::RefCell<Vec<u32>>=const{std::cell::RefCell::new(Vec::new())};static TEST_NATIVE_CALLS:std::cell::Cell<usize>=const{std::cell::Cell::new(0)};static TEST_OUTCOME_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)}; }
+thread_local! { static TEST_FIXTURE_PARENT:std::cell::RefCell<Option<PathBuf>>=const{std::cell::RefCell::new(None)};static TEST_BASE:std::cell::RefCell<Option<PathBuf>>=const{std::cell::RefCell::new(None)};static TEST_BOOTSTRAP_SLOT_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};static TEST_BOOTSTRAP_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};static TEST_DACL_STATUSES:std::cell::RefCell<Vec<u32>>=const{std::cell::RefCell::new(Vec::new())};static TEST_NATIVE_CALLS:std::cell::Cell<usize>=const{std::cell::Cell::new(0)};static TEST_OUTCOME_FAILURE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)}; }
 #[cfg(test)]
 #[path = "windows_installation/tests.rs"]
 mod tests;

@@ -125,6 +125,8 @@ enum Row {
     /// The bypass master switch (`ops::bypass_order`).
     Bypass,
     Install(usize),
+    #[cfg(windows)]
+    InstallationRecovery(std::path::PathBuf),
     /// The fold over «Настройки для опытных».
     Advanced,
     Provider(usize),
@@ -161,6 +163,8 @@ struct App {
     worker: Worker,
     events: Receiver<Event>,
     status: Option<Status>,
+    #[cfg(windows)]
+    installation_recovery: Option<ops::InstallationRecoveryPreview>,
     gate: gate::View,
     gate_at: Instant,
     gate_rx: Receiver<gate::Signal>,
@@ -228,6 +232,8 @@ impl App {
             worker,
             events,
             status: None,
+            #[cfg(windows)]
+            installation_recovery: None,
             gate: gate::View::default(),
             gate_at: Instant::now(),
             gate_rx,
@@ -315,15 +321,10 @@ impl App {
                 }
                 Event::Status(s) => self.status = Some(*s),
                 Event::Busy(what) => self.busy = what,
-                #[cfg(target_os = "macos")]
-                Event::RegistrationCode(result) => match result {
-                    Ok(code) if self.lifetime.accepts_user_action() => {
-                        if crate::utils::set_clipboard_text(&format!("/ag+{code}")) { self.toast("Команда скопирована — отправьте её в группе"); }
-                        else { self.toast("Не удалось скопировать команду"); }
-                    },
-                    Ok(_) => {},
-                    Err(error) => self.toast(format!("Код устройства недоступен: {error}")),
-                },
+                #[cfg(windows)]
+                Event::InstallationRecoveryPrepared(preview) => self.installation_recovery = Some(preview),
+                #[cfg(windows)]
+                Event::InstallationRecoveryClosed => self.installation_recovery = None,
                 Event::ShutdownReady => self.shutdown_ready = true,
             }
             any = true;
@@ -341,6 +342,8 @@ impl App {
     }
 
     fn request_shutdown(&mut self) {
+        #[cfg(windows)]
+        drop(self.installation_recovery.take());
         self.lifetime.request_shutdown();
         self.toast("Завершение работы: ожидаю сохранения и остановки задач.");
     }
@@ -354,6 +357,23 @@ impl App {
         // Raw mode turns Ctrl+C into a key; it still means "leave".
         if ctrl && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C')) {
             if k.kind == KeyEventKind::Press { self.request_shutdown(); }
+            return;
+        }
+        #[cfg(windows)]
+        if self.installation_recovery.is_some() {
+            if k.kind == KeyEventKind::Press {
+                match k.code {
+                    KeyCode::Char('y' | 'Y') if (k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT) && self.busy.is_none() => {
+                        let proposal_id = self.installation_recovery.take().unwrap().proposal_id;
+                        self.worker.send(Cmd::ConfirmInstallationRecovery { proposal_id });
+                    }
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n' | 'N') => {
+                        let proposal_id = self.installation_recovery.take().unwrap().proposal_id;
+                        self.worker.send(Cmd::DismissInstallationRecovery { proposal_id });
+                    }
+                    _ => {}
+                }
+            }
             return;
         }
         if self.screen == Screen::License {
@@ -557,12 +577,20 @@ impl App {
                 if self.busy_refusal() {
                     return;
                 }
+                if !cap.supported() {
+                    self.toast("Обход через DNS недоступен на macOS");
+                    return;
+                }
                 let state = self
                     .status
                     .as_ref()
                     .map(|s| s.get(cap).clone())
                     .unwrap_or(State::Off);
                 if let State::Blocked(why) = &state {
+                    if cap == Cap::BuiltinExits {
+                        self.worker.send(Cmd::Set(cap, false));
+                        return;
+                    }
                     self.toast(format!("Не включается: {why}"));
                     return;
                 }
@@ -579,11 +607,17 @@ impl App {
                     return;
                 }
                 let on = !self.status.as_ref().is_some_and(|s| s.bypass_on());
-                self.worker.send(Cmd::SetBypass(on));
+                for cap in ops::bypass_order(on) {
+                    self.worker.send(Cmd::Set(cap, on));
+                }
             }
             Row::Install(i) => {
                 let text = self.install_path(i).unwrap_or_default();
                 self.input = Some(Input::Path { text, error: None });
+            }
+            #[cfg(windows)]
+            Row::InstallationRecovery(path) => {
+                if !self.busy_refusal() { self.worker.send(Cmd::PrepareInstallationRecovery { path }); }
             }
             Row::Advanced => self.advanced = !self.advanced,
             Row::Provider(i) => {
@@ -600,16 +634,13 @@ impl App {
                 self.toast("Открыто в браузере: https://t.me/nova_txt/69864");
             }
             Row::GroupProxyCopy => {
+                #[cfg(target_os = "macos")]
+                self.worker.send(Cmd::CopyGroupCommand);
                 #[cfg(not(target_os = "macos"))]
                 {
                 let cmd = format!("/ag+{}", crate::hwid::pc_code());
                 crate::utils::set_clipboard_text(&cmd);
                 self.toast(format!("Скопировано: {} — отправьте это сообщение в комнате", cmd));
-                }
-                #[cfg(target_os = "macos")]
-                match crate::hwid::cached_availability() {
-                    Some(Err(error)) => self.toast(format!("Код устройства недоступен: {error}")),
-                    _ => self.worker.send(Cmd::CopyGroupRegistration),
                 }
             }
             Row::GroupProxyPaste => {
@@ -635,28 +666,26 @@ impl App {
             Row::WslMaster => {
                 if let Some(wsl) = self.status.as_ref().map(|s| &s.wsl) {
                     let enabled = wsl.preferences.as_ref().is_some_and(|p| p.enabled);
-                    if !wsl.pending && !wsl.loading { self.worker.send(Cmd::SetWslEnabled(!enabled)); }
+                    if wsl.show_configuration() && !wsl.pending && !wsl.loading { self.worker.send(Cmd::SetWslEnabled(!enabled)); }
                 }
             }
             #[cfg(windows)]
             Row::WslDistro(name) => {
                 if let Some(wsl) = self.status.as_ref().map(|s| &s.wsl) {
                     if let Some(distro) = wsl.distributions.iter().find(|d| d.name == name) {
-                        if wsl.can_set_distro(&name, !distro.selected) { self.worker.send(Cmd::SetWslDistro { name, selected: !distro.selected }); }
+                        if wsl.show_configuration() && wsl.can_set_distro(&name, !distro.selected) { self.worker.send(Cmd::SetWslDistro { name, selected: !distro.selected }); }
                     }
                 }
             }
             #[cfg(windows)]
             Row::WslRefresh => {
-                if self.status.as_ref().is_some_and(|s| !s.wsl.loading && !s.wsl.pending) {
+                if self.status.as_ref().is_some_and(|s| s.wsl.show_configuration() && !s.wsl.loading && !s.wsl.pending) {
                     self.worker.send(Cmd::RefreshWsl);
                 }
             }
             #[cfg(windows)]
             Row::WslApply => {
-                if self.status.as_ref().is_some_and(|s| !s.wsl.pending) {
-                    self.worker.send(Cmd::ApplySettings);
-                }
+                send_wsl_apply(&self.worker, self.status.as_ref().map(|s| &s.wsl));
             }
             #[cfg(windows)]
             Row::WslCancel => self.worker.send(Cmd::CancelWsl),
@@ -698,19 +727,17 @@ impl App {
 
     fn install_path(&self, i: usize) -> Option<String> {
         let row = self.status.as_ref()?.installs.get(i)?;
-        row.path.as_ref().map(|p| p.display().to_string())
+        row.display_path().map(|p| p.display().to_string())
     }
 
     fn forget_install(&mut self, i: usize) {
         let Some(row) = self.status.as_ref().and_then(|s| s.installs.get(i)) else {
             return;
         };
-        match (&row.path, row.manual) {
-            (Some(p), true) => {
-                let p = p.clone();
-                self.worker.send(Cmd::ForgetPath(p));
-            }
-            _ => self.toast("Убрать можно только путь, указанный вручную."),
+        if let Some(saved) = row.saved_path() {
+            self.worker.send(Cmd::ForgetPath(saved.to_path_buf()));
+        } else {
+            self.toast("Убрать можно только путь, указанный вручную.");
         }
     }
 
@@ -760,22 +787,9 @@ impl App {
         let saved = crate::utils::desktop_dir()
             .and_then(|dir| crate::utils::save_text_file(&dir, crate::utils::REPORT_FILE, &text))
             .or_else(|| {
-                #[cfg(not(target_os = "macos"))]
-                {
-                let dir = crate::dns_forwarder::log_dir();
+                let dir = crate::dns_forwarder::checked_log_dir().ok()?;
                 std::fs::create_dir_all(&dir).ok();
                 crate::utils::save_text_file(&dir, crate::utils::REPORT_FILE, &text)
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    let state = match crate::user_state_location::macos_state_paths() {
-                        Ok(state) => state, Err(error) => { eprintln!("report state unavailable: {error}"); return None; }
-                    };
-                    match state.replace_file(crate::utils::REPORT_FILE, text.as_bytes(), crate::user_state_location::MacStateFile::Public) {
-                        Ok(()) => Some(state.state_dir().join(crate::utils::REPORT_FILE)),
-                        Err(error) => { eprintln!("report save failed: {error}"); None }
-                    }
-                }
             });
         let copied = copy_out(&text);
         let msg = match (saved, copied) {
@@ -808,15 +822,31 @@ impl App {
         rows.push(Row::Cap(Cap::ClientPatch));
         rows.push(Row::Bypass);
         rows.push(Row::Cap(Cap::Watchdog));
-        let installs = self.status.as_ref().map_or(0, |s| s.installs.len());
-        rows.extend((0..installs).map(Row::Install));
+        if let Some(status) = &self.status {
+            for (index, install) in status.installs.iter().enumerate() {
+                rows.push(Row::Install(index));
+                #[cfg(windows)]
+                if let Some(path) = install.recovery_path() {
+                    rows.push(Row::InstallationRecovery(path.to_path_buf()));
+                }
+                #[cfg(not(windows))]
+                let _ = install;
+            }
+        }
         #[cfg(windows)]
         {
-            rows.push(Row::WslMaster);
             if let Some(wsl) = self.status.as_ref().map(|s| &s.wsl) {
+                if !wsl.show_configuration() {
+                    if wsl.pending {
+                        rows.push(Row::WslInfo("Операция выполняется или её завершение ещё не подтверждено.".into()));
+                        rows.push(Row::WslCancel);
+                    }
+                } else {
+                rows.push(Row::WslMaster);
                 if wsl.pending { rows.push(Row::WslInfo("Операция выполняется или её завершение ещё не подтверждено".into())); }
                 if wsl.loading { rows.push(Row::WslInfo("Поиск дистрибутивов WSL…".into())); }
                 if let Some(error) = &wsl.error { rows.push(Row::WslInfo(format!("WSL: {error}"))); }
+                if let Err(reason) = &wsl.apply_eligibility { rows.push(Row::WslInfo(reason.clone())); }
                 if wsl.registration_freshness == crate::wsl_api::RegistrationFreshness::Current && wsl.distributions.is_empty() {
                     rows.push(Row::WslInfo("Дистрибутивы WSL не найдены".into()));
                 }
@@ -833,9 +863,10 @@ impl App {
                     rows.push(Row::WslInfo(format!("{}: {state}{detail}", result.name)));
                 }
                 if wsl.pending { rows.push(Row::WslCancel); }
+                rows.push(Row::WslRefresh);
+                rows.push(Row::WslApply);
+                }
             }
-            rows.push(Row::WslRefresh);
-            rows.push(Row::WslApply);
         }
         rows.push(Row::Advanced);
         if self.advanced {
@@ -871,7 +902,7 @@ impl App {
                     .status
                     .as_ref()
                     .and_then(|s| s.installs.get(i))
-                    .is_some_and(|r| r.manual);
+                    .is_some_and(|r| r.saved_path().is_some());
                 let full = self.install_path(i).unwrap_or_default();
                 let mut s = "Enter — указать путь вручную".to_string();
                 if manual {
@@ -882,6 +913,8 @@ impl App {
                 }
                 s
             }
+            #[cfg(windows)]
+            Row::InstallationRecovery(path) => format!("Enter — проверить восстановление {}", path.display()),
             Row::Advanced => "Детали обхода: DNS-серверы, прокси, выходы.".into(),
             Row::Provider(_) => "Пробел — включить или выключить сервер, +/- — выше или ниже в списке.".into(),
             Row::GroupProxyText => "Код этого ПК и состояние ключа.".into(),
@@ -900,7 +933,8 @@ impl App {
             #[cfg(windows)]
             Row::WslRefresh => "Enter — обновить список дистрибутивов.".into(),
             #[cfg(windows)]
-            Row::WslApply => "Enter — применить текущие настройки.".into(),
+            Row::WslApply => self.status.as_ref().and_then(|s| s.wsl.apply_eligibility.as_ref().err().cloned())
+                .unwrap_or_else(|| "Enter — применить текущие настройки.".into()),
             #[cfg(windows)]
             Row::WslCancel => "Enter — отменить выполнение.".into(),
             #[cfg(windows)]
@@ -940,11 +974,12 @@ impl App {
                 let Some(r) = self.status.as_ref().and_then(|s| s.installs.get(i)) else {
                     return ListItem::new("");
                 };
-                let (dot, color, what) = match (&r.path, r.patched) {
+                let path = r.display_path();
+                let (dot, color, what) = match (path, r.patched) {
                     (None, _) => (
                         "○",
                         Color::DarkGray,
-                        "не найдено — Enter: указать путь".to_string(),
+                        r.discovery_note().unwrap_or_else(|| "не найдено — Enter: указать путь".into()).into_owned(),
                     ),
                     (Some(p), patched) => (
                         "●",
@@ -956,12 +991,10 @@ impl App {
                         crate::utils::mask_path(&p.display().to_string()),
                     ),
                 };
-                let tail = match (&r.path, r.patched) {
-                    (Some(_), Some(true)) => " · пропатчен",
-                    (Some(_), Some(false)) => " · не пропатчен",
-                    (Some(_), None) => " · проверяю…",
-                    (None, _) => "",
-                };
+                let tail = r
+                    .patch_observation_label()
+                    .map(|label| format!(" · {label}"))
+                    .unwrap_or_default();
                 ListItem::new(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(format!("{dot} "), Style::new().fg(color)),
@@ -970,6 +1003,8 @@ impl App {
                     Span::styled(tail, Style::new().fg(color)),
                 ]))
             }
+            #[cfg(windows)]
+            Row::InstallationRecovery(_) => ListItem::new("  Проверить восстановление"),
             Row::Advanced => ListItem::new(Line::styled(
                 format!(
                     "{} Настройки для опытных",
@@ -986,35 +1021,26 @@ impl App {
                 switch_line("      ", &name, &state, busy, width)
             }
             Row::GroupProxyText => {
+                #[cfg(target_os = "macos")]
+                let pc = match crate::hwid::cached_pc_code() {
+                    Some(Ok(code)) => code.to_owned(),
+                    Some(Err(error)) => format!("недоступен: {error}"),
+                    None => "не запрошен".to_owned(),
+                };
                 #[cfg(not(target_os = "macos"))]
                 let pc = crate::hwid::pc_code();
                 let key_text = if crate::settings::group_key().is_empty() {
                     "ключа нет"
-                } else if cfg!(target_os = "macos") { "ключ сохранён" } else { "ключ принят" };
-                #[cfg(not(target_os = "macos"))]
-                let availability = format!("{} - {}", pc, key_text);
-                #[cfg(target_os = "macos")]
-                let availability = match crate::hwid::cached_availability() {
-                    None => format!("не проверен — {key_text}"),
-                    Some(Ok(())) => format!("доступен — {key_text}"),
-                    Some(Err(error)) => format!("недоступен: {error} — {key_text}"),
+                } else {
+                    "ключ принят"
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw("      Код ПК: "),
-                    Span::styled(availability, Style::new().fg(Color::Gray)),
+                    Span::styled(format!("{} - {}", pc, key_text), Style::new().fg(Color::Gray)),
                 ]))
             }
             Row::GroupProxyOpenRoom => ListItem::new(Line::from(vec![Span::styled("      > Открыть комнату группы", Style::new().fg(Color::Cyan))])),
-            Row::GroupProxyCopy => {
-                #[cfg(target_os = "macos")]
-                let unavailable = matches!(crate::hwid::cached_availability(), Some(Err(_)));
-                #[cfg(not(target_os = "macos"))]
-                let unavailable = false;
-                ListItem::new(Line::from(vec![Span::styled(
-                    if unavailable { "      > Скопировать команду — недоступно" } else { "      > Скопировать команду" },
-                    Style::new().fg(if unavailable { Color::DarkGray } else { Color::Cyan }),
-                )]))
-            },
+            Row::GroupProxyCopy => ListItem::new(Line::from(vec![Span::styled("      > Скопировать команду", Style::new().fg(Color::Cyan))])),
             Row::GroupProxyPaste => ListItem::new(Line::from(vec![Span::styled("      > Вставить ключ из буфера", Style::new().fg(Color::Cyan))])),
             Row::CustomDnsText => {
                 let text = self.custom_dns_text();
@@ -1059,7 +1085,10 @@ impl App {
             #[cfg(windows)]
             Row::WslRefresh => ListItem::new("  Обновить список WSL"),
             #[cfg(windows)]
-            Row::WslApply => ListItem::new("  Применить"),
+            Row::WslApply => {
+                let available = self.status.as_ref().is_some_and(|s| s.wsl.can_apply());
+                ListItem::new("  Применить").style(if available { Style::default() } else { Style::default().fg(Color::DarkGray) })
+            },
             #[cfg(windows)]
             Row::WslCancel => ListItem::new("  Отменить"),
             #[cfg(windows)]
@@ -1091,8 +1120,13 @@ impl App {
     }
 
     fn title_line(&self) -> Line<'static> {
+        #[cfg(target_os = "macos")]
+        let title_str = format!(" Antigravity Unlocker 2 v{} (macOS Edition by @Fuheshka) ", update::current_version());
+        #[cfg(not(target_os = "macos"))]
+        let title_str = format!(" Antigravity Unlocker 2 v{} ", update::current_version());
+
         let mut spans = vec![Span::styled(
-            format!(" Antigravity Unlocker 2 v{} ", update::current_version()),
+            title_str,
             Style::new().add_modifier(Modifier::BOLD),
         )];
         if let Some(rel) = &self.update {
@@ -1218,6 +1252,17 @@ impl App {
 
         if self.input.is_some() {
             self.draw_input(f, area);
+        }
+        #[cfg(windows)]
+        if let Some(preview) = &self.installation_recovery {
+            let width = area.width.min(74);
+            let height = area.height.min(10);
+            let popup = Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height);
+            let message = format!("{}\nНезавершённая операция {}\nПодтверждение завершит эту операцию. Настройки приложения применяются отдельно.\n\nEnter/Esc — Отменить\nY — Завершить восстановление Desktop",
+                preview.path.display(), preview.operation_id);
+            f.render_widget(Clear, popup);
+            f.render_widget(Paragraph::new(message).wrap(Wrap { trim: true })
+                .block(Block::default().title(" Восстановление Desktop ").borders(Borders::ALL)), popup);
         }
     }
 
@@ -1378,6 +1423,11 @@ impl App {
     }
 }
 
+#[cfg(windows)]
+fn send_wsl_apply(worker: &Worker, status: Option<&crate::wsl_api::WslStatus>) {
+    if status.is_some_and(|status| status.show_configuration() && status.can_apply()) { worker.send(Cmd::ApplySettings); }
+}
+
 /// One switch as a line: `[вкл ] Title — note`.
 fn switch_line(
     indent: &str,
@@ -1437,6 +1487,7 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
         .min(usize::from(u16::MAX)) as u16
 }
 
+/// Local entry uses the same policy as the window.
 fn first_screen(settings: &crate::settings::Settings) -> Screen {
     #[cfg(debug_assertions)]
     let debug_skip = std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some();
@@ -1586,6 +1637,102 @@ mod console {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_apply_enter_obeys_backend_eligibility() {
+        use crate::wsl_api::DesktopDiscovery;
+        let lifetime = Arc::new(ops::GuiLifetime::default());
+        let (worker, commands) = ops::layout_test_worker(lifetime.clone());
+        let (_, update_rx) = channel(); let (_, events) = channel(); let (_, gate_rx) = channel();
+        let status = Status {
+            wsl: crate::wsl_api::WslStatus { desktop_target: DesktopDiscovery::Present,
+                distributions: vec![crate::wsl_api::RegisteredDistro { name: "fixture".into(), registration: crate::wsl_api::RegistrationState::Present, selected: true, running: None }],
+                ..Default::default() }, admin: true, installs: Vec::new(),
+            client_patch: State::Off, watchdog: State::Off, dns: State::Off, local_proxy: State::Off,
+            own_proxy: State::Off, builtin_exits: State::Off, group_proxy: State::Off, dns_rotation: State::Off,
+            transport_view: crate::ops::TransportView::LegacyOrMissing,
+            transport_choices: Ok(crate::settings::TransportChoices::default()), transport_ready: None,
+            vpn: None, own_proxy_text: String::new(), custom_dns_text: String::new(),
+            relay_outdated: false, selected_delivery: Ok(false), relay_running: false,
+            background_observation_error: None, rules: false, rules_observed: None, providers: Vec::new(), relay_egress: None,
+        };
+        let mut app = App { screen: Screen::Main, key: String::new(), key_error: false, key_next_attempt: None,
+            update: None, update_rx, worker, events, status: Some(status), gate: gate::View::default(), gate_at: Instant::now(), gate_rx,
+            log: Vec::new(), busy: None, list: ListState::default(), selected: Row::WslApply, advanced: false,
+            input: None, toast: None, quit: false, shutdown_ready: false, shutdown_error: None, lifetime, installation_recovery: None };
+        for target in [DesktopDiscovery::Absent, DesktopDiscovery::Incomplete { desktop_found: false, error: "неизвестно".into() }] {
+            app.status.as_mut().unwrap().wsl.desktop_target = target;
+            let rows = app.rows();
+            assert!(!rows.iter().any(|row| matches!(row, Row::WslMaster | Row::WslDistro(_) | Row::WslRefresh | Row::WslApply)));
+        }
+        app.status.as_mut().unwrap().wsl.pending = true;
+        let rows = app.rows();
+        assert!(rows.iter().any(|row| matches!(row, Row::WslCancel)));
+        assert!(!rows.iter().any(|row| matches!(row, Row::WslMaster | Row::WslDistro(_) | Row::WslRefresh | Row::WslApply)));
+        app.selected = Row::WslCancel;
+        app.on_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(commands.try_recv(), Ok(Cmd::CancelWsl)));
+        let wsl = &mut app.status.as_mut().unwrap().wsl;
+        wsl.pending = false;
+        let error = "Другая установка не проверена";
+        wsl.desktop_target = DesktopDiscovery::Incomplete { desktop_found: true, error: error.into() };
+        wsl.apply_eligibility = Err(error.into());
+        let rows = app.rows();
+        assert!(rows.iter().any(|row| matches!(row, Row::WslMaster)));
+        assert!(rows.iter().any(|row| matches!(row, Row::WslDistro(name) if name == "fixture")));
+        assert!(rows.iter().any(|row| matches!(row, Row::WslRefresh)));
+        assert!(rows.iter().any(|row| matches!(row, Row::WslApply)));
+        assert!(rows.iter().any(|row| matches!(row, Row::WslInfo(reason) if reason == error)));
+        app.selected = Row::WslApply;
+        app.on_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(commands.try_recv().is_err());
+        let wsl = &mut app.status.as_mut().unwrap().wsl;
+        wsl.desktop_target = DesktopDiscovery::Present;
+        wsl.apply_eligibility = Ok(());
+        app.on_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(commands.try_recv(), Ok(Cmd::ApplySettings)));
+
+        let path = std::path::PathBuf::from(r"C:\Synthetic\Selected Desktop");
+        let snapshot = app.status.as_mut().unwrap();
+        snapshot.wsl.apply_eligibility = Err("unrelated installation incomplete".into());
+        snapshot.installs.push(ops::InstallRow { path: Some(path.clone()), label: "Antigravity 2.0",
+            patched: Some(true), manual: false, observed_kind: None, coverage: ops::InstallCoverage::Complete });
+        let recovery = Row::InstallationRecovery(path.clone());
+        assert!(!app.rows().contains(&recovery));
+        let original = app.status.as_ref().unwrap().installs[0].clone();
+        for (coverage, expected) in [
+            (ops::InstallCoverage::Complete, "не найдено"),
+            (ops::InstallCoverage::Incomplete, "не удалось проверить"),
+            (ops::InstallCoverage::ObservedStandard, "обнаружена в стандартном месте"),
+        ] {
+            let row = &mut app.status.as_mut().unwrap().installs[0];
+            row.path = None;
+            row.patched = None;
+            row.coverage = coverage;
+            assert!(format!("{:?}", app.row_item(Row::Install(0), 100)).contains(expected));
+            assert!(!app.rows().iter().any(|row| matches!(row, Row::InstallationRecovery(_))));
+        }
+        app.status.as_mut().unwrap().installs[0] = original;
+        app.status.as_mut().unwrap().installs[0].observed_kind = Some(crate::InstallationKind::Desktop);
+        app.selected = Row::Install(0);
+        app.on_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.input.take(), Some(Input::Path { .. })));
+        app.selected = recovery;
+        app.on_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(commands.try_recv(), Ok(Cmd::PrepareInstallationRecovery { path: selected }) if selected == path));
+        for (id, key, confirm) in [("dismiss", KeyCode::Enter, false), ("confirm", KeyCode::Char('y'), true)] {
+            app.installation_recovery = Some(ops::InstallationRecoveryPreview { proposal_id: id.into(), path: path.clone(),
+                operation_id: "recorded-operation".into() });
+            app.on_key(KeyEvent::new(key, KeyModifiers::NONE));
+            match commands.try_recv().unwrap() {
+                Cmd::ConfirmInstallationRecovery { proposal_id } if confirm => assert_eq!(proposal_id, id),
+                Cmd::DismissInstallationRecovery { proposal_id } if !confirm => assert_eq!(proposal_id, id),
+                _ => panic!("unexpected selected recovery action"),
+            }
+        }
+        assert!(commands.try_recv().is_err());
+    }
 
     #[test]
     fn base64_matches_the_standard_alphabet_and_padding() {

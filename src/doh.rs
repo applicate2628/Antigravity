@@ -154,7 +154,7 @@ fn tls_config(ip: IpAddr) -> Arc<ClientConfig> {
         cfg.resumption = Resumption::in_memory_sessions(16);
         Arc::new(cfg)
     };
-    let Ok(mut map) = PER_ADDR.get_or_init(Default::default).lock() else {
+    let Ok(mut map) = PER_ADDR.get_or_init(Default::default).try_lock() else {
         // Poisoned only by a panic inside `fresh`; a config that cannot resume
         // still connects, which is all this path has to guarantee.
         return fresh();
@@ -301,7 +301,9 @@ pub fn query(ep: &Endpoint, wire: &[u8], budget: Duration) -> Result<Vec<u8>, St
 /// `query` over a given pool - separate so a test can count what one pool
 /// opened without the rest of the process sharing it.
 fn query_via(pool: &Pool, ep: &Endpoint, wire: &[u8], budget: Duration) -> Result<Vec<u8>, String> {
-    let deadline = Instant::now() + budget;
+    let deadline = Instant::now().checked_add(budget)
+        .filter(|d| *d > Instant::now())
+        .ok_or_else(|| "бюджет DoH истёк или слишком велик".to_string())?;
     let mut last = "нет адресов".to_string();
     let n = ep.addrs.len();
     if n == 0 {
@@ -323,9 +325,13 @@ fn query_via(pool: &Pool, ep: &Endpoint, wire: &[u8], budget: Duration) -> Resul
             PER_ADDR_BUDGET
         };
         let slice = cap.min(deadline - now);
-        match query_one(pool, ep, ip, wire, slice) {
+        let address_deadline = now.checked_add(slice).unwrap_or(deadline).min(deadline);
+        match query_one(pool, ep, ip, wire, address_deadline) {
             Ok(reply) => {
                 unbench(ip);
+                if Instant::now() >= deadline {
+                    return Err("бюджет DoH истёк".to_string());
+                }
                 return Ok(reply);
             }
             Err(e) => {
@@ -356,14 +362,14 @@ const BENCH_MAX: Duration = Duration::from_secs(15 * 60);
 static BENCH: Mutex<Option<HashMap<IpAddr, (Instant, u32)>>> = Mutex::new(None);
 
 fn bench(ip: IpAddr, now: Instant) {
-    let mut g = BENCH.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(mut g) = BENCH.try_lock() else { return };
     let map = g.get_or_insert_with(HashMap::new);
     let fails = map.get(&ip).map_or(0, |&(_, f)| f).saturating_add(1);
     map.insert(ip, (now + bench_for(fails), fails));
 }
 
 fn unbench(ip: IpAddr) {
-    let mut g = BENCH.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(mut g) = BENCH.try_lock() else { return };
     if let Some(map) = g.as_mut() {
         map.remove(&ip);
     }
@@ -379,7 +385,9 @@ fn bench_for(fails: u32) -> Duration {
 /// address is benched the whole list is tried anyway: a bench is a preference,
 /// never a reason to answer nothing.
 fn plan(ips: &[IpAddr], start: usize, now: Instant) -> Vec<IpAddr> {
-    let g = BENCH.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(g) = BENCH.try_lock() else {
+        return walk(ips.len(), start).map(|i| ips[i]).collect();
+    };
     let out: Vec<IpAddr> = walk(ips.len(), start)
         .map(|i| ips[i])
         .filter(|ip| {
@@ -396,19 +404,21 @@ fn plan(ips: &[IpAddr], start: usize, now: Instant) -> Vec<IpAddr> {
 
 /// One address, one query: on a kept connection if there is one, and once
 /// more on a fresh one if the kept one turns out to be gone. Both attempts
-/// share `budget` - the address's slice - so a retry can never push `query`
+/// share `deadline` - the address's slice - so a retry can never push `query`
 /// past its own deadline.
 fn query_one(
     pool: &Pool,
     ep: &Endpoint,
     ip: IpAddr,
     wire: &[u8],
-    budget: Duration,
+    deadline: Instant,
 ) -> Result<Vec<u8>, String> {
-    let deadline = Instant::now() + budget;
     let path = format!("{}?dns={}", ep.path, base64url(wire));
     let mut kept = pool.take(ep.host, ip);
     loop {
+        if Instant::now() >= deadline {
+            return Err(format!("{}: бюджет DoH истёк", ip));
+        }
         let reused = kept.is_some();
         let mut conn = match kept.take() {
             Some(conn) => conn,
@@ -422,7 +432,8 @@ fn query_one(
             conn.close();
         }
         match outcome {
-            Ok(answer) => return Ok(answer.body),
+            Ok(answer) if Instant::now() < deadline => return Ok(answer.body),
+            Ok(_) => return Err(format!("{}: бюджет DoH истёк", ip)),
             Err(fail) if retry_on_fresh(reused, &fail) => {
                 pool.retried.fetch_add(1, Ordering::Relaxed);
             }
@@ -527,7 +538,7 @@ impl Pool {
     fn take(&self, host: &str, ip: IpAddr) -> Option<Conn> {
         let now = Instant::now();
         let (found, stale) = {
-            let Ok(mut idle) = self.idle.lock() else {
+            let Ok(mut idle) = self.idle.try_lock() else {
                 return None;
             };
             let (fresh, stale): (Vec<Conn>, Vec<Conn>) = std::mem::take(&mut *idle)
@@ -551,7 +562,7 @@ impl Pool {
     /// kept per address; past that the longest-idle one is closed.
     fn put(&self, conn: Conn) {
         let evicted = {
-            let Ok(mut idle) = self.idle.lock() else {
+            let Ok(mut idle) = self.idle.try_lock() else {
                 conn.close();
                 return;
             };
@@ -703,19 +714,21 @@ impl Conn {
             std::io::Write::write_all(&mut tls, &out).and_then(|_| std::io::Write::flush(&mut tls));
         let answer = match sent {
             Ok(()) => read_reply(&mut tls, &mut self.buf, stream, ip, deadline),
-            Err(_) => Err(Fail::Gone(format!("{}: запрос не ушёл", ip))),
+            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                Err(Fail::Broken(format!("{}: запрос не уложился в бюджет: {}", ip, e)))
+            }
+            Err(e) => Err(Fail::Gone(format!("{}: запрос не ушёл: {}", ip, e))),
         };
         self.last_used = Instant::now();
         answer
     }
 
-    /// Ends the connection politely - close_notify, so the server logs a clean
-    /// close rather than a reset - without letting that cost anything: errors
-    /// are ignored and the write gets a short leash. The socket closes on drop.
+    /// Attempt close_notify only without waiting. The socket closes on drop.
     fn close(mut self) {
-        self.sock.deadline = Instant::now() + Duration::from_millis(200);
-        self.tls.send_close_notify();
-        let _ = self.tls.write_tls(&mut self.sock);
+        if Instant::now() < self.sock.deadline && self.sock.sock.set_nonblocking(true).is_ok() {
+            self.tls.send_close_notify();
+            let _ = self.tls.write_tls(&mut self.sock.sock);
+        }
     }
 }
 
@@ -733,13 +746,14 @@ fn handshake(
     // Pinned to the ISP link while a tunnel holds the default route (P13): a
     // provider that substitutes only for Russian addresses answers a query that
     // arrives from the tunnel's foreign exit with the genuine address.
-    let mut sock = crate::net::connect(
+    let sock = crate::net::connect(
         SocketAddr::new(ip, 443),
         budget,
         crate::net::pin_interface(),
     )
     .map_err(|_| format!("{}: нет соединения", ip))?;
     sock.set_nodelay(true).ok();
+    let mut sock = Bounded { sock, deadline };
 
     let server = ServerName::try_from(ep.host.to_string())
         .map_err(|_| "неверное имя DoH-сервера".to_string())?;
@@ -751,15 +765,12 @@ fn handshake(
     // the same reason: an address that completes TCP and stalls in TLS is the
     // failure this has to notice quickly (G23).
     while conn.is_handshaking() {
-        let left = remaining(deadline);
-        if left.is_zero() {
+        if remaining(deadline).is_zero() {
             return Err(format!("{}: TLS не уложился в бюджет", ip));
         }
-        sock.set_read_timeout(Some(left)).ok();
-        sock.set_write_timeout(Some(left)).ok();
         if conn.wants_write() {
             conn.write_tls(&mut sock)
-                .map_err(|_| format!("{}: обрыв при handshake", ip))?;
+                .map_err(|e| format!("{}: ошибка записи при handshake: {}", ip, e))?;
         }
         if conn.is_handshaking() && conn.wants_read() {
             match conn.read_tls(&mut sock) {
@@ -768,14 +779,17 @@ fn handshake(
                     .process_new_packets()
                     .map(|_| ())
                     .map_err(|e| format!("{}: TLS отклонён: {}", ip, e))?,
-                Err(_) => return Err(format!("{}: обрыв при handshake", ip)),
+                Err(e) => return Err(format!("{}: ошибка чтения при handshake: {}", ip, e)),
             }
         }
+    }
+    if remaining(deadline).is_zero() {
+        return Err(format!("{}: TLS не уложился в бюджет", ip));
     }
     if conn.alpn_protocol() != Some(b"h2") {
         return Err(format!("{}: сервер не согласовал h2", ip));
     }
-    Ok((sock, conn))
+    Ok((sock.sock, conn))
 }
 
 /// Reads frames until `stream` ends, collecting its DATA.
@@ -809,6 +823,9 @@ fn read_reply(
 
     loop {
         while buf.len() >= 9 {
+            if Instant::now() >= deadline {
+                return Err(Fail::Broken(format!("{}: DoH не ответил в срок", ip)));
+            }
             let len = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize;
             if len > MAX_BODY {
                 return Err(Fail::Broken(format!(
@@ -848,6 +865,9 @@ fn read_reply(
                         return Err(Fail::Broken(format!("{}: ответ слишком велик", ip)));
                     }
                     if flags & FLAG_END_STREAM != 0 {
+                        if Instant::now() >= deadline {
+                            return Err(Fail::Broken(format!("{}: DoH не ответил в срок", ip)));
+                        }
                         return Ok(Answer { body, last: goaway });
                     }
                 }
@@ -856,6 +876,9 @@ fn read_reply(
                     // A response with no body: nothing to hand back, and saying
                     // so beats returning bytes that will fail to parse as DNS.
                     if flags & FLAG_END_STREAM != 0 {
+                        if Instant::now() >= deadline {
+                            return Err(Fail::Broken(format!("{}: DoH не ответил в срок", ip)));
+                        }
                         return if body.is_empty() {
                             Err(Fail::Broken(format!("{}: ответ без тела", ip)))
                         } else {
@@ -1177,6 +1200,36 @@ mod tests {
     }
 
     #[test]
+    fn expired_buffered_end_stream_is_not_an_answer() {
+        for kind in [FRAME_DATA, FRAME_HEADERS] {
+            let mut buf = frame(FRAME_DATA, 0, 1, b"reply");
+            buf.extend_from_slice(&frame(kind, FLAG_END_STREAM, 1, b""));
+            let mut transport = scripted(Vec::new());
+            let result = read_reply(&mut transport, &mut buf, 1,
+                "127.0.0.1".parse().unwrap(), Instant::now());
+            assert!(matches!(result, Err(Fail::Broken(_))));
+            assert_eq!(transport.pos, 0);
+        }
+    }
+
+    #[test]
+    fn zero_and_overflow_budgets_fail_before_network() {
+        let ep = Endpoint { host: "example.invalid", path: "/dns-query", addrs: &["127.0.0.1"] };
+        let pool = Pool::new();
+        assert!(query_via(&pool, &ep, b"q", Duration::ZERO).is_err());
+        assert!(query_via(&pool, &ep, b"q", Duration::MAX).is_err());
+        assert!(query_one(&pool, &ep, "127.0.0.1".parse().unwrap(), b"q", Instant::now()).is_err());
+        assert_eq!(pool.opened.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn busy_pool_is_an_immediate_cache_miss() {
+        let pool = Pool::new();
+        let _guard = pool.idle.lock().unwrap();
+        assert!(pool.take("example.invalid", "127.0.0.1".parse().unwrap()).is_none());
+    }
+
+    #[test]
     fn reassembles_data_split_across_frames_and_reads() {
         let mut script = Vec::new();
         script.extend_from_slice(&frame(FRAME_SETTINGS, 0, 0, &[]));
@@ -1439,7 +1492,7 @@ mod tests {
             ] {
                 let q = dns_client::build_query(name, 0x4E4E);
                 let started = Instant::now();
-                let reply = query_one(&Pool::new(), ep, ip, &q, Duration::from_secs(8))
+                let reply = query_one(&Pool::new(), ep, ip, &q, Instant::now() + Duration::from_secs(8))
                     .unwrap_or_else(|e| panic!("{} {}: {}", addr, name, e));
                 let got = dns_client::answer_addrs(&reply);
                 let reference = dns_client::resolve_a_via(name, "8.8.8.8".parse().unwrap(), 0)
@@ -1510,7 +1563,7 @@ mod tests {
         for &ip in &ips {
             for _ in 0..10 {
                 let before = pool.resumed.load(Relaxed);
-                query_one(&pool, ep, ip, &q, Duration::from_secs(8))
+                query_one(&pool, ep, ip, &q, Instant::now() + Duration::from_secs(8))
                     .unwrap_or_else(|e| panic!("{}", e));
                 pool.clear();
                 if pool.resumed.load(Relaxed) == before {
@@ -1657,7 +1710,7 @@ mod tests {
                 pool.clear();
                 let before = pool.resumed.load(Relaxed);
                 let q = dns_client::build_query(names[0], 0x2000 + i as u16 * 8 + round);
-                let reply = query_one(&pool, ep, ip, &q, Duration::from_secs(8))
+                let reply = query_one(&pool, ep, ip, &q, Instant::now() + Duration::from_secs(8))
                     .unwrap_or_else(|e| panic!("{}", e));
                 assert_answers(&q, &reply);
                 kinds.push(if pool.resumed.load(Relaxed) > before {
@@ -1710,7 +1763,7 @@ mod tests {
             );
             let name = ["microsoft.com", "amazon.com"][sent as usize % 2];
             let q = txt_query(name, 0x3000 + sent);
-            let reply = query_one(&pool, ep, ip, &q, Duration::from_secs(8))
+            let reply = query_one(&pool, ep, ip, &q, Instant::now() + Duration::from_secs(8))
                 .unwrap_or_else(|e| panic!("после {} байт по соединению: {}", carried, e));
             assert_eq!(&reply[0..2], &q[0..2]);
             let now_on = pool.opened.load(Relaxed);

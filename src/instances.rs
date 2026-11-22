@@ -44,21 +44,10 @@ pub fn close_others() {
 #[cfg(target_os = "windows")]
 #[path = "gui_instance.rs"]
 mod gui_instance;
-#[cfg(target_os = "macos")]
-#[path = "instances/macos_writer.rs"]
-mod macos_writer;
-#[cfg(target_os = "macos")]
-pub(crate) use macos_writer::MacSettingsWriterLease;
-
-#[cfg(target_os = "macos")]
-pub(crate) fn acquire_gui_writer(state: &crate::user_state_location::MacStateDirectory)
-    -> Result<MacSettingsWriterLease<'_>, String> {
-    macos_writer::acquire_from_admitted_directory(state.directory()).map_err(|error| error.to_string())
-}
 #[cfg(target_os = "windows")]
 pub(crate) use gui_instance::{
-    receive_replacement, request_elevation, ElevationProgress, GuiApplyContinuation,
-    GuiCurrentExpectation, GuiReplacementAction, GuiReplacementReady, GuiReplacementTarget,
+    receive_replacement, request_elevation, ElevationProgress, GuiApplyContinuation, GuiRetirementInputRef,
+    GuiCurrentExpectation, GuiReplacementAction, GuiReplacementReady, GuiReplacementTarget, ReceivedReplacement,
     GuiTargetExpectation, GuiTargetKind, GUI_REPLACEMENT_FLAG,
 };
 
@@ -119,6 +108,60 @@ mod platform {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    pub fn acquire_gui_writer() -> Result<File, String> {
+        let directory = crate::dns_forwarder::checked_log_dir()?;
+        if !directory.is_absolute() {
+            return Err("путь настроек должен быть абсолютным".into());
+        }
+        std::fs::create_dir_all(&directory).map_err(|error| format!("каталог настроек: {error}"))?;
+        acquire_writer(&directory, "settings-writer.lock", libc::O_NOFOLLOW)
+    }
+
+    pub fn acquire_watchdog_worker() -> Result<File, String> {
+        let directory = crate::background::install_dir()?;
+        let held_directory = crate::background::watchdog_directory()?;
+        let file = acquire_writer(&directory, "watchdog-worker.lock", libc::O_NOFOLLOW_ANY)?;
+        crate::background::recheck_watchdog_directory(&held_directory)?;
+        Ok(file)
+    }
+
+    fn acquire_writer(directory: &std::path::Path, name: &str, flags: i32) -> Result<File, String> {
+        let path = directory.join(name);
+        let file = OpenOptions::new().read(true).write(true).create(true).mode(0o600)
+            .custom_flags(flags | libc::O_CLOEXEC).open(&path)
+            .map_err(|error| format!("файл блокировки настроек: {error}"))?;
+        let recheck = || -> Result<(), String> {
+            let held = file.metadata().map_err(|error| error.to_string())?;
+            let entry = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if !held.is_file() || !entry.is_file() || held.uid() != unsafe { libc::geteuid() }
+                || held.nlink() != 1 || held.len() != 0 || held.mode() & 0o077 != 0
+                || held.dev() != entry.dev() || held.ino() != entry.ino()
+                || held.uid() != entry.uid() || held.mode() != entry.mode() || entry.nlink() != 1 {
+                return Err("небезопасная или изменённая блокировка настроек".into());
+            }
+            Ok(())
+        };
+        recheck()?;
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => "другое окно уже использует настройки".to_owned(),
+            std::fs::TryLockError::Error(error) => format!("блокировка настроек: {error}"),
+        })?;
+        recheck()?;
+        Ok(file)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use platform::acquire_gui_writer;
+
+#[cfg(target_os = "macos")]
+pub use platform::acquire_watchdog_worker;
 
 #[cfg(test)]
 mod tests {

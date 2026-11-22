@@ -66,6 +66,10 @@ pub struct App {
     worker: Worker,
     events: Receiver<Event>,
     status: Option<Status>,
+    #[cfg(windows)]
+    configured_draft: Option<crate::settings::TransportChoices>,
+    #[cfg(windows)]
+    installation_recovery: Option<ops::InstallationRecoveryPreview>,
 
     /// What the gate watcher last found: the client's own region-400s, and the
     /// relay's record of what it did about them.
@@ -128,6 +132,8 @@ impl App {
             key_next_attempt: None, key_attempts: Vec::new(),
             key_cooldown: std::time::Duration::from_millis(100),
             update: None, update_rx, worker, events, status: Some(status),
+            #[cfg(windows)] configured_draft: None,
+            #[cfg(windows)] installation_recovery: None,
             gate: gate::View::default(), gate_at: std::time::Instant::now(), gate_rx,
             log: Vec::new(), log_all_selected: false, busy: None,
             own_proxy_input: String::new(), custom_dns_input: String::new(),
@@ -165,7 +171,8 @@ impl App {
         // saved last silently reverted the other.
         let settings = Settings::load();
         let screen = first_screen(&settings);
-        // Direct entry never passes the licence screen, which otherwise sends Unlocked.
+        // A debug build told to skip the key never passes the licence screen,
+        // which is where `Unlocked` is otherwise sent from.
         if matches!(screen, Screen::Main) {
             worker.send(Cmd::Unlocked);
         }
@@ -187,6 +194,10 @@ impl App {
             worker,
             events,
             status: None,
+            #[cfg(windows)]
+            configured_draft: None,
+            #[cfg(windows)]
+            installation_recovery: None,
             gate: gate::View::default(),
             gate_at: std::time::Instant::now(),
             gate_rx,
@@ -211,6 +222,25 @@ impl App {
 
     fn is_busy(&self) -> bool {
         self.busy.is_some()
+    }
+
+    #[cfg(windows)]
+    fn choose_system(&self) { self.worker.send(Cmd::UseSystemTcp); }
+
+    #[cfg(windows)]
+    fn open_configured(&mut self) {
+        self.configured_draft = self.status.as_ref().and_then(|s| s.transport_choices.as_ref().ok().copied());
+    }
+
+    #[cfg(windows)]
+    fn cancel_configured(&mut self) { self.configured_draft = None; }
+
+    #[cfg(windows)]
+    fn apply_configured(&mut self) {
+        let Some(c) = self.configured_draft else { return; };
+        if [c.dns, c.local_proxy, c.builtin_exits, c.group_proxy, c.own_proxy_enabled].iter().any(Option::is_none) { return; }
+        self.worker.send(Cmd::UseExistingConfigured(c));
+        self.configured_draft = None;
     }
 
     /// The "новая версия" button, drawn on both screens (spec item 10: it must
@@ -285,16 +315,10 @@ impl App {
                     self.status = Some(*status);
                 }
                 Event::Busy(what) => self.busy = what,
-                #[cfg(target_os = "macos")]
-                Event::RegistrationCode(result) => match result {
-                    Ok(code) if self.lifetime.accepts_user_action() => {
-                        let copied = crate::utils::set_clipboard_text(&format!("/ag+{code}"));
-                        self.log.push((if copied { Level::Info } else { Level::Err },
-                            if copied { "Команда скопирована — отправьте её в группе." } else { "Не удалось скопировать команду." }.into()));
-                    },
-                    Ok(_) => {},
-                    Err(error) => self.log.push((Level::Err, format!("Код устройства недоступен: {error}"))),
-                },
+                #[cfg(windows)]
+                Event::InstallationRecoveryPrepared(preview) => self.installation_recovery = Some(preview),
+                #[cfg(windows)]
+                Event::InstallationRecoveryClosed => self.installation_recovery = None,
                 Event::ShutdownReady => self.shutdown_ready = true,
             }
         }
@@ -322,6 +346,8 @@ impl eframe::App for App {
             let frame = ui.ctx().cumulative_frame_nr();
             if self.shutdown_request_frame != Some(frame) {
                 self.shutdown_request_frame = Some(frame);
+                #[cfg(windows)]
+                drop(self.installation_recovery.take());
                 self.lifetime.request_shutdown();
             }
         }
@@ -382,6 +408,8 @@ impl eframe::App for App {
         if matches!(self.screen, Screen::Main) {
             let ctx = ui.ctx().clone();
             main_view::path_dialog(self, &ctx);
+            #[cfg(windows)]
+            main_view::installation_recovery_dialog(self, &ctx);
         }
     }
 }
@@ -456,6 +484,369 @@ pub fn run(lifetime: Arc<ops::GuiLifetime>) -> Result<(), String> {
     Err(format!("не удалось открыть окно ({})", failures.join("; ")))
 }
 
+#[cfg(windows)]
+const STOPPED_DELIVERY_TITLE: &str = "Обновление фонового файла Antigravity Unlocker";
+
+#[cfg(windows)]
+pub(crate) fn run_stopped_delivery(lifetime: Arc<ops::GuiLifetime>) -> Result<i32, String> {
+    if !matches!(first_screen(&Settings::load()), Screen::Main) {
+        return Err("Для обновления требуется действующий ключ этой версии Antigravity Unlocker.".into());
+    }
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_title(STOPPED_DELIVERY_TITLE)
+            .with_inner_size([520.0, 300.0]).with_min_inner_size([420.0, 240.0]),
+        renderer: eframe::Renderer::Glow,
+        persist_window: false,
+        ..Default::default()
+    };
+    let worker_lifetime = lifetime.clone();
+    receive_stopped_delivery_window(&lifetime, || {
+        eframe::run_native(STOPPED_DELIVERY_TITLE, options, Box::new(move |_| {
+            Ok(Box::new(StoppedDeliveryWindow { lifetime: worker_lifetime, closing: false, close_after_error: false,
+                close_sent: false, error: None }))
+        })).map_err(|error| format!("Не удалось открыть окно обновления: {error}"))
+    })
+}
+
+#[cfg(windows)]
+fn confirm_maintenance_retry(caption: &str, hold: &str) -> std::io::Result<bool> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDCANCEL, IDRETRY, MB_DEFBUTTON2, MB_ICONWARNING, MB_RETRYCANCEL,
+    };
+
+    let message = format!("{hold}\n\nПосле устранения причины подтвердите повторную попытку завершения. При отмене процесс сохранит владение ресурсом.");
+    let text = message.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let title = caption.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let result = unsafe {
+        MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_RETRYCANCEL | MB_DEFBUTTON2 | MB_ICONWARNING)
+    };
+    match result {
+        IDRETRY => Ok(true),
+        IDCANCEL => Ok(false),
+        0 => Err(std::io::Error::last_os_error()),
+        other => Err(std::io::Error::other(format!("Неожиданный результат диалога Windows ({other})"))),
+    }
+}
+
+#[cfg(windows)]
+fn receive_stopped_delivery_window(lifetime: &ops::GuiLifetime, render: impl FnOnce() -> Result<(), String>) -> Result<i32, String> {
+    use ops::StoppedDeliveryStatus;
+
+    let window = std::panic::catch_unwind(std::panic::AssertUnwindSafe(render));
+    // Main still retains the writer across renderer return or unwind.
+    lifetime.request_shutdown();
+    settle_maintenance_window(lifetime, STOPPED_DELIVERY_TITLE, || match lifetime.stopped_delivery_status() {
+        StoppedDeliveryStatus::ResourceHeld(hold) => Some(hold),
+        _ => None,
+    }, |hold| lifetime.retry_stopped_delivery_hold(&hold));
+    let outcome = lifetime.stopped_delivery_status();
+    let retained_panic = lifetime.take_command_panics().into_iter().next();
+    let window = match window {
+        Ok(window) => window,
+        Err(payload) => {
+            if let StoppedDeliveryStatus::Finished(Err(operation)) = &outcome {
+                crate::utils::message_box(STOPPED_DELIVERY_TITLE, operation);
+            }
+            std::panic::resume_unwind(payload);
+        }
+    };
+    let result = if let Err(error) = window {
+        match outcome {
+            StoppedDeliveryStatus::Finished(Err(operation)) => Err(format!("{operation}\n\n{error}")),
+            _ => Err(error),
+        }
+    } else {
+        match outcome {
+            StoppedDeliveryStatus::Ready | StoppedDeliveryStatus::Finished(Ok(())) => Ok(0),
+            StoppedDeliveryStatus::Finished(Err(_)) => Ok(1),
+            _ => Err("Рабочий поток завершился без результата обновления.".into()),
+        }
+    };
+    if let Some(payload) = retained_panic {
+        if let Err(error) = &result { crate::utils::message_box(STOPPED_DELIVERY_TITLE, error); }
+        std::panic::resume_unwind(payload);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn settle_maintenance_window(lifetime: &ops::GuiLifetime, title: &str, held: impl Fn() -> Option<Arc<String>>, retry: impl Fn(Arc<String>)) {
+    let mut last_failure = None;
+    let mut offered_hold = None;
+    loop {
+        match lifetime.poll_close() {
+            Ok(true) => break,
+            Ok(false) => {
+                if let Some(hold) = held().filter(|hold| !offered_hold.as_ref().is_some_and(|prior| Arc::ptr_eq(prior, hold))) {
+                    offered_hold = Some(hold.clone());
+                    match confirm_maintenance_retry(title, &hold) {
+                        Ok(true) => retry(hold),
+                        unanswered => {
+                            if let Err(error) = unanswered {
+                                use std::io::Write;
+                                let _ = writeln!(std::io::stderr(), "Не удалось подтвердить завершение: {error}. Владение ресурсом сохранено.");
+                            }
+                            // The renderer is gone and the worker is waiting
+                            // for this exact hold. Keep both owners alive.
+                            loop { std::thread::park(); }
+                        }
+                    }
+                }
+            }
+            Err(error) if last_failure.as_ref() != Some(&error) => {
+                crate::utils::message_box(title, &error);
+                last_failure = Some(error);
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(windows)]
+const VENDOR_SUPERSESSION_TITLE: &str = "История замены Antigravity Desktop";
+
+#[cfg(windows)]
+pub(crate) fn run_vendor_supersession(lifetime: Arc<ops::GuiLifetime>) -> Result<i32, String> {
+    use ops::{VendorSupersessionCommand as Command, VendorSupersessionStatus as Status};
+
+    let settings = Settings::load();
+    if !matches!(first_screen(&settings), Screen::Main) {
+        return Err("Для записи истории требуется действующий ключ этой версии Antigravity Unlocker.".into());
+    }
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_title(VENDOR_SUPERSESSION_TITLE)
+            .with_inner_size([720.0, 490.0]).with_min_inner_size([480.0, 380.0]),
+        renderer: eframe::Renderer::Glow,
+        persist_window: false,
+        ..Default::default()
+    };
+    let session = ops::start_vendor_supersession(&lifetime, settings.manual_paths)?;
+    let window_lifetime = lifetime.clone();
+    let window_session = session.clone();
+    let window = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eframe::run_native(VENDOR_SUPERSESSION_TITLE, options, Box::new(move |_| {
+            Ok(Box::new(VendorSupersessionWindow { lifetime: window_lifetime, session: window_session,
+                closing: false, acknowledged: false, close_sent: false, approval_error: None }))
+        })).map_err(|error| format!("Не удалось открыть окно истории Desktop: {error}"))
+    }));
+    session.send(Command::Cancel);
+    settle_maintenance_window(&lifetime, VENDOR_SUPERSESSION_TITLE, || match session.status() {
+        Status::Held(hold) => Some(hold),
+        _ => None,
+    }, |hold| session.send(Command::Retry(hold)));
+    let outcome = session.status();
+    let failure = match &outcome { Status::Finished(Err(error)) => Some(error.to_string()), _ => None };
+    let retained_panic = lifetime.take_command_panics().into_iter().next();
+    let result = match window {
+        Err(payload) => {
+            if let Some(error) = failure { crate::utils::message_box(VENDOR_SUPERSESSION_TITLE, &error); }
+            std::panic::resume_unwind(payload);
+        }
+        Ok(Err(error)) => Err(match failure { Some(operation) => format!("{operation}\n\n{error}"), None => error }),
+        Ok(Ok(())) => match outcome {
+            Status::Finished(Ok(_)) => Ok(0),
+            Status::Finished(Err(_)) => Ok(1),
+            _ => Err("Рабочий поток завершился без результата записи истории.".into()),
+        },
+    };
+    if let Some(payload) = retained_panic {
+        if let Err(error) = &result { crate::utils::message_box(VENDOR_SUPERSESSION_TITLE, error); }
+        std::panic::resume_unwind(payload);
+    }
+    result
+}
+
+#[cfg(windows)]
+struct VendorSupersessionWindow {
+    lifetime: Arc<ops::GuiLifetime>,
+    session: ops::VendorSupersessionSession,
+    closing: bool,
+    acknowledged: bool,
+    close_sent: bool,
+    approval_error: Option<String>,
+}
+
+#[cfg(windows)]
+fn receive_vendor_foreground(frame: &eframe::Frame) -> Result<crate::background::VendorForegroundOwner, String> {
+    use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+
+    let window = frame.window_handle().map_err(|error| format!("Не удалось получить окно подтверждения Desktop: {error}"))?;
+    let RawWindowHandle::Win32(window) = window.as_raw() else { return Err("Окно подтверждения Windows недоступно.".into()); };
+    crate::background::VendorForegroundOwner::receive(window.hwnd)
+}
+
+#[cfg(windows)]
+impl eframe::App for VendorSupersessionWindow {
+    fn persist_egui_memory(&self) -> bool { false }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        use ops::{VendorSupersessionCommand as Command, VendorSupersessionStatus as Status};
+
+        let ctx = ui.ctx().clone();
+        let status = self.session.status();
+        if ctx.input(|input| input.viewport().close_requested()) && !self.close_sent {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if !self.closing {
+                self.closing = true;
+                self.acknowledged = matches!(&status, Status::Finished(_));
+                self.session.send(Command::Cancel);
+            }
+        }
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.heading(VENDOR_SUPERSESSION_TITLE);
+            egui::ScrollArea::both().max_height((ui.available_height() - 42.0).max(100.0)).show(ui, |ui| {
+                match &status {
+                    Status::Checking => { ui.label("Проверяю установку и защищённую запись Desktop."); }
+                    Status::Select(paths) if !self.closing => {
+                        ui.label("Выберите проверенную установку Desktop.");
+                        for (index, path) in paths.iter().enumerate() {
+                            if ui.button(path.to_string_lossy()).clicked() { self.session.send(Command::Select(index)); }
+                        }
+                    }
+                    Status::Confirm(preview) if !self.closing => {
+                        let observation = &preview.observation;
+                        ui.label(preview.path.to_string_lossy());
+                        ui.label(format!("Операция {} · запись {}", observation.pending.operation_id, observation.pending.slot_id));
+                        for (label, digest) in [("Текущая запись", observation.pending.current_sha256),
+                            ("Исторический результат", observation.historical_success_sha256),
+                            ("Обнаруженная установка", observation.observed_binding_sha256)] {
+                            ui.label(label);
+                            ui.monospace(hex::encode(digest));
+                        }
+                        ui.label("Подтверждение создаст отдельное защищённое свидетельство. Установка и прежняя запись сохраняются.");
+                        if ui.button("Записать свидетельство").clicked() {
+                            match receive_vendor_foreground(frame) {
+                                Ok(foreground) => {
+                                    self.approval_error = None;
+                                    self.session.send(Command::Confirm(preview.clone(), foreground));
+                                }
+                                Err(error) => self.approval_error = Some(error),
+                            }
+                        }
+                        if let Some(error) = &self.approval_error { ui.label(error); }
+                    }
+                    Status::Held(hold) => {
+                        ui.label(hold.as_str());
+                        if ui.button("Повторить завершение").clicked() { self.session.send(Command::Retry(hold.clone())); }
+                    }
+                    Status::Finished(Ok(Some(digest))) => {
+                        ui.label("Защищённая запись подтверждена независимым чтением.");
+                        ui.monospace(hex::encode(digest));
+                    }
+                    Status::Finished(Err(error)) => { ui.label(error.to_string()); }
+                    _ => { ui.label("Ожидаю завершения."); }
+                }
+            });
+            if !self.closing && ui.button(if matches!(&status, Status::Finished(_)) { "Закрыть" } else { "Отмена" }).clicked() {
+                self.closing = true;
+                self.acknowledged = matches!(&status, Status::Finished(_));
+                self.session.send(Command::Cancel);
+            }
+        });
+        if self.closing && !self.close_sent {
+            match self.lifetime.poll_close() {
+                Ok(true) => {
+                    if self.acknowledged || matches!(self.session.status(), Status::Finished(Ok(None))) {
+                        self.close_sent = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else { self.closing = false; }
+                }
+                Ok(false) => {}
+                Err(error) => { ui.label(error); }
+            }
+        }
+        if !self.close_sent && !matches!(&status, Status::Finished(_)) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+#[cfg(windows)]
+struct StoppedDeliveryWindow {
+    lifetime: Arc<ops::GuiLifetime>,
+    closing: bool,
+    close_after_error: bool,
+    close_sent: bool,
+    error: Option<String>,
+}
+
+#[cfg(windows)]
+impl eframe::App for StoppedDeliveryWindow {
+    fn persist_egui_memory(&self) -> bool { false }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        use ops::StoppedDeliveryStatus;
+
+        let ctx = ui.ctx().clone();
+        let status = self.lifetime.stopped_delivery_status();
+        if ctx.input(|input| input.viewport().close_requested()) && !self.close_sent {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if !self.closing {
+                self.closing = true;
+                self.close_after_error = matches!(&status, StoppedDeliveryStatus::Finished(Err(_)));
+                self.lifetime.request_shutdown();
+            }
+        }
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.heading("Обновление фонового файла");
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                match &status {
+                    StoppedDeliveryStatus::Ready => ui.label("Обе фоновые задачи должны быть остановлены. Перед заменой будет показано отдельное подтверждение."),
+                    StoppedDeliveryStatus::Running if self.closing => ui.label("Запрошена отмена. Ожидается завершение операции."),
+                    StoppedDeliveryStatus::Running => ui.label("Проверяю фоновые задачи и выбранный файл."),
+                    StoppedDeliveryStatus::ResourceHeld(error) => ui.label(error.as_str()),
+                    StoppedDeliveryStatus::Finished(Err(error)) => ui.label(error),
+                    StoppedDeliveryStatus::Finished(Ok(())) => ui.label("Фоновый файл и его поколение проверены. Обе задачи остановлены."),
+                };
+                if let Some(error) = &self.error { ui.label(error); }
+            });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if !self.closing && self.error.is_none() && matches!(&status, StoppedDeliveryStatus::Ready)
+                    && ui.button("Начать проверку для обновления").clicked() {
+                    let repaint = ctx.clone();
+                    if let Err(error) = self.lifetime.start_stopped_delivery(move || repaint.request_repaint()) {
+                        if !matches!(self.lifetime.stopped_delivery_status(), StoppedDeliveryStatus::Finished(Err(_))) {
+                            self.error = Some(error);
+                        }
+                        ctx.request_repaint();
+                    }
+                }
+                let close_label = match &status {
+                    StoppedDeliveryStatus::ResourceHeld(_) => Some("Повторить завершение"),
+                    StoppedDeliveryStatus::Finished(_) => Some("Закрыть"),
+                    _ if !self.closing => Some("Отмена"),
+                    _ => None,
+                };
+                if close_label.is_some_and(|label| ui.button(label).clicked()) {
+                    self.closing = true;
+                    self.close_after_error = matches!(&status, StoppedDeliveryStatus::Finished(Err(_)));
+                    self.lifetime.request_shutdown();
+                    if let StoppedDeliveryStatus::ResourceHeld(hold) = &status { self.lifetime.retry_stopped_delivery_hold(hold); }
+                }
+            });
+        });
+        if !self.close_sent && (self.closing || matches!(&status, StoppedDeliveryStatus::Running)) {
+            match self.lifetime.poll_close() {
+                Ok(true) if !self.closing => ctx.request_repaint(),
+                Ok(true) if !self.close_after_error
+                    && matches!(self.lifetime.stopped_delivery_status(), StoppedDeliveryStatus::Finished(Err(_))) => {
+                    self.closing = false;
+                    ctx.request_repaint();
+                }
+                Ok(true) => {
+                    self.close_sent = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Ok(false) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+                Err(error) => self.error = Some(error),
+            }
+        }
+    }
+}
+
 /// winit's `os error at <file>.rs:<line>: <what>` is for its own developers;
 /// the user gets `<what>`.
 fn without_source_location(msg: &str) -> &str {
@@ -464,6 +855,7 @@ fn without_source_location(msg: &str) -> &str {
         .unwrap_or(msg)
 }
 
+/// Local entry uses the shared licence, personal-build and debug policy.
 fn first_screen(settings: &Settings) -> Screen {
     #[cfg(debug_assertions)]
     let debug_skip = std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some();
@@ -476,12 +868,42 @@ fn first_screen(settings: &Settings) -> Screen {
 }
 
 fn title() -> String {
+    #[cfg(target_os = "macos")]
+    return format!("Antigravity Unlocker 2 v{} (macOS Edition)", update::current_version());
+    #[cfg(not(target_os = "macos"))]
     format!("Antigravity Unlocker 2 v{}", update::current_version())
 }
 
 #[cfg(test)]
 mod tests {
     use super::without_source_location;
+
+    #[cfg(windows)]
+    #[test]
+    fn stopped_delivery_renderer_unwind_retires_before_resuming_original_panic() {
+        let lifetime = super::ops::GuiLifetime::default();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::receive_stopped_delivery_window(&lifetime, || std::panic::panic_any(73u32))
+        })).expect_err("renderer panic must propagate after retirement");
+        assert_eq!(panic.downcast_ref::<u32>(), Some(&73));
+        assert!(!lifetime.can_retry_renderer(), "retirement must request cancellation first");
+        assert_eq!(lifetime.poll_close(), Ok(true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stopped_delivery_exit_receives_the_original_operation_panic() {
+        let lifetime = super::ops::GuiLifetime::default();
+        let scope = lifetime.new_command_scope().unwrap();
+        let operation = scope.with_result::<()>(|_| std::panic::panic_any(123u32));
+        assert!(operation.is_err());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::receive_stopped_delivery_window(&lifetime, || Ok(()))
+        })).expect_err("maintenance exit must receive the original operation panic");
+        assert_eq!(panic.downcast_ref::<u32>(), Some(&123));
+        assert_eq!(lifetime.poll_close(), Ok(true));
+        assert!(lifetime.take_command_panics().is_empty());
+    }
 
     #[test]
     fn a_winit_error_loses_the_build_machine_path_and_keeps_what_happened() {

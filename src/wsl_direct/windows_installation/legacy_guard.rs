@@ -32,11 +32,17 @@ pub(crate) fn admit_legacy_write(path: &Path) -> Result<LegacyNativeWrite> {
 }
 pub(crate) fn canonical_installed(path: &Path) -> Result<bool> { Ok(admit_write(path, None, true)?.canonical) }
 type NativeSelection = (fn(&Path) -> Vec<PathBuf>, fn(&BoundInstallation) -> Result<Option<AncestorAccessContext>>);
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_REVERSE_NEXT_SLOT_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 pub(crate) fn admit_native_binary(path: &Path, selected: fn(&Path) -> Vec<PathBuf>,
     receive_context: fn(&BoundInstallation) -> Result<Option<AncestorAccessContext>>) -> Result<LegacyNativeWrite> {
     admit_write(path, Some((selected, receive_context)), false)
 }
 fn admit_write(path: &Path, native: Option<NativeSelection>, inspect: bool) -> Result<LegacyNativeWrite> {
+    #[cfg(test)]
+    let reverse_slots = TEST_REVERSE_NEXT_SLOT_SCAN.with(|value| value.replace(false));
     let parent_path = match fs::symlink_metadata(NativeFsPath::from_path(path)?.as_path()) {
         Ok(metadata) if metadata.is_dir() => path,
         Ok(_) => path.parent().ok_or("legacy target parent absent")?,
@@ -70,84 +76,120 @@ fn admit_write(path: &Path, native: Option<NativeSelection>, inspect: bool) -> R
     if pins.last().ok_or("canonical namespace pin missing")?.contains(&pins[0])? {
         return Err("canonical metadata/runtime deployment is not a native-binary target".into());
     }
-    for entry in fs::read_dir(NativeFsPath::from_path(&namespace)?.as_path()).map_err(|error| io("canonical namespace receiving", error))? {
+    let entries = fs::read_dir(NativeFsPath::from_path(&namespace)?.as_path())
+        .map_err(|error| io("canonical namespace receiving", error))?;
+    #[cfg(test)]
+    let entries = {
+        let mut entries: Vec<_> = entries.collect();
+        if reverse_slots { entries.reverse(); }
+        entries
+    };
+    let mut selected_slot = None;
+    let mut unresolved_companion = None;
+    for entry in entries {
         let entry = entry.map_err(|error| io("canonical namespace entry", error))?;
         if !entry.file_name().to_str().is_some_and(id_valid) { return Err("canonical namespace identity is unconfirmed".into()); }
         let slot = CheckedPath::open(&namespace.join(entry.file_name()), PathKind::Directory, PathPurpose::Review)?;
         private(&slot.file)?;
-        let (current, _) = receive_current(&slot)?;
+        let received = receive_current_with_supersession(&slot)?;
+        let current = &received.current;
         if let Some(target) = &target {
             let id = target.native_id();
-            let mut protected = vec![current.binding.executable.clone(), current.binding.archive.clone()];
-            if let DeploymentField::Present(Some(deployment)) = &current.runtime_deployment {
-                protected.extend([deployment.host.native_id.clone(), deployment.gate.native_id.clone()]);
+            let deployed = matches!(&current.runtime_deployment, DeploymentField::Present(Some(deployment))
+                if deployment.host.native_id == id || deployment.gate.native_id == id);
+            let historical = received.aliases.iter().any(|binding| binding.contains_member(&id))
+                || received.runtime_objects.contains(&id);
+            if current.binding.contains_member(&id) || deployed || historical {
+                received.check_companion()?;
+                current.require_operation_authority()?;
+                return Err("bound Desktop/archive/runtime/gate identity is not a native-binary target".into());
             }
-            if protected.contains(&id) { return Err("bound Desktop/archive/runtime/gate identity is not a native-binary target".into()); }
         }
         let target_parent = &pins[0];
         let prefix = current.locator.len();
         let same_locator = target_parent.locator.len() >= prefix
             && ordinal(&target_parent.locator[..prefix], &current.locator)?
             && (target_parent.locator.len() == prefix || target_parent.locator[prefix] == 92);
-        let same_native = target_parent.object == current.binding.root || target_parent.object == current.binding.resources
+        let matches_directory = |id: &ObjectId| {
+            *id == current.binding.root || *id == current.binding.resources
+                || received.aliases.iter().any(|binding| *id == binding.root || *id == binding.resources)
+        };
+        let same_native = matches_directory(&target_parent.object)
             || target_parent._ancestors.iter().map(object_id).collect::<Result<Vec<_>>>()?.iter()
-                .any(|id| *id == current.binding.root || *id == current.binding.resources);
+                .any(matches_directory);
         if same_locator || same_native {
-            if inspect {
-                let slot_lease = Lease::acquire(&slot, "wsl_slot_v2")?;
-                let (fresh, _) = receive_current(&slot)?;
-                if matches!(fresh.mode, Mode::Bootstrap | Mode::Pending) { return Err("RecoveryRequired: canonical Current is not settled".into()); }
-                pins.push(slot);
-                drop(lease);
-                return Ok(LegacyNativeWrite { _lease: slot_lease, _pins: pins, bound: None,
-                    expected: None, _target: None, canonical: true });
+            received.check_companion()?;
+            current.require_operation_authority()?;
+            if selected_slot.is_some() {
+                return Err("AuthorityAmbiguous: multiple matching legacy slots".into());
             }
-            let Some((selected, receive_context)) = native else {
-                return Err("MaintenanceRequired: canonical WSL installation must use its common maintenance owner; legacy archive write refused".into());
-            };
-            let slot_lease = Lease::acquire(&slot, "wsl_slot_v2")?;
-            let (fresh, _) = receive_current(&slot)?;
-            if matches!(fresh.mode, Mode::Bootstrap | Mode::Pending) { return Err("RecoveryRequired: canonical native work requires settled Current".into()); }
-            let root_path = pins[0].path.ancestors().find_map(|path| {
-                CheckedPath::open(path, PathKind::Directory, PathPurpose::Source).ok()
-                    .filter(|pin| pin.object == fresh.binding.root).map(|pin| pin.path)
-            }).ok_or("UpdatePending: canonical native root identity changed")?;
-            // This is the existing GUI's supported Desktop producer path, not
-            // discovery of a backup or a same-hash executable under another name.
-            let mut bound = BoundInstallation::open(&root_path.join("Antigravity.exe"))?;
-            if let Some(context) = receive_context(&bound)? { bound.attach_ancestor_context(context)?; }
-            bound.revalidate_context()?;
-            let actual_binding = bound.binding()?;
-            if actual_binding != fresh.binding { return Err("UpdatePending: canonical native installation incarnation differs".into()); }
-            let target = target.ok_or("native target pin absent")?;
-            // Basename selection cannot authorize an alias of an existing
-            // script owned by the JS patcher. Only NotFound means optional
-            // absence; observation or identity failures remain dependent holds.
-            for script_path in crate::patch_ide::js_targets(&root_path).into_paths() {
-                match fs::symlink_metadata(NativeFsPath::from_path(&script_path)?.as_path()) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(io("JS exclusion observation", error)),
-                    Ok(_) => {},
-                }
-                let script = CheckedPath::open(&script_path, PathKind::File, PathPurpose::Source)?;
-                if script.native_id() == target.native_id() {
-                    return Err("JS owner object/alias is not a native-binary target".into());
-                }
-                pins.push(script);
-            }
-            let mut positively_selected = false;
-            for candidate in selected(&root_path) {
-                if let Ok(candidate) = CheckedPath::open(&candidate, PathKind::File, PathPurpose::ReplaceSource) {
-                    if candidate.native_id() == target.native_id() { positively_selected = true; break; }
-                }
-            }
-            if !positively_selected { return Err("native file was not positively selected by the existing LS/CLI target owner".into()); }
+            selected_slot = Some(slot);
+        } else {
             pins.push(slot);
-            drop(lease);
-            return Ok(LegacyNativeWrite { _lease: slot_lease, _pins: pins, bound: Some(bound),
-                expected: Some(actual_binding), _target: Some(target), canonical: true });
         }
-        pins.push(slot);
+        if !inspect && unresolved_companion.is_none() {
+            unresolved_companion = received.companion_issue;
+        }
     }
-    Ok(LegacyNativeWrite { _lease: lease, _pins: pins, bound: None, expected: None, _target: target, canonical: false })
+    if let Some(cause) = unresolved_companion {
+        return Err(format!("RecoveryRequired: legacy write cannot exclude an unconfirmed supersession alias: {cause}"));
+    }
+    let Some(slot) = selected_slot else {
+        return Ok(LegacyNativeWrite { _lease: lease, _pins: pins, bound: None, expected: None, _target: target, canonical: false });
+    };
+    // Every slot's protected objects have been checked while holding the
+    // namespace lease. Receive the selected record again under its slot lease.
+    if inspect {
+        let slot_lease = Lease::acquire(&slot, "wsl_slot_v2")?;
+        let (fresh, _) = receive_current(&slot)?;
+        fresh.require_operation_authority()?;
+        if matches!(fresh.mode, Mode::Bootstrap | Mode::Pending) { return Err("RecoveryRequired: canonical Current is not settled".into()); }
+        pins.push(slot);
+        drop(lease);
+        return Ok(LegacyNativeWrite { _lease: slot_lease, _pins: pins, bound: None,
+            expected: None, _target: None, canonical: true });
+    }
+    let Some((selected, receive_context)) = native else {
+        return Err("MaintenanceRequired: canonical WSL installation must use its common maintenance owner; legacy archive write refused".into());
+    };
+    let slot_lease = Lease::acquire(&slot, "wsl_slot_v2")?;
+    let (fresh, _) = receive_current(&slot)?;
+    fresh.require_operation_authority()?;
+    if matches!(fresh.mode, Mode::Bootstrap | Mode::Pending) { return Err("RecoveryRequired: canonical native work requires settled Current".into()); }
+    let root_path = pins[0].path.ancestors().find_map(|path| {
+        CheckedPath::open(path, PathKind::Directory, PathPurpose::Source).ok()
+            .filter(|pin| pin.object == fresh.binding.root).map(|pin| pin.path)
+    }).ok_or("UpdatePending: canonical native root identity changed")?;
+    // This is the existing GUI's supported Desktop producer path.
+    let mut bound = BoundInstallation::open(&root_path.join("Antigravity.exe"))?;
+    if let Some(context) = receive_context(&bound)? { bound.attach_ancestor_context(context)?; }
+    bound.revalidate_context()?;
+    let actual_binding = bound.binding()?;
+    if actual_binding != fresh.binding { return Err("UpdatePending: canonical native installation incarnation differs".into()); }
+    let target = target.ok_or("native target pin absent")?;
+    // Basename selection cannot authorize an alias of an existing script
+    // owned by the JS patcher. Only NotFound means optional absence.
+    for script_path in crate::patch_ide::js_targets(&root_path).into_paths() {
+        match fs::symlink_metadata(NativeFsPath::from_path(&script_path)?.as_path()) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io("JS exclusion observation", error)),
+            Ok(_) => {},
+        }
+        let script = CheckedPath::open(&script_path, PathKind::File, PathPurpose::Source)?;
+        if script.native_id() == target.native_id() {
+            return Err("JS owner object/alias is not a native-binary target".into());
+        }
+        pins.push(script);
+    }
+    let mut positively_selected = false;
+    for candidate in selected(&root_path) {
+        if let Ok(candidate) = CheckedPath::open(&candidate, PathKind::File, PathPurpose::ReplaceSource) {
+            if candidate.native_id() == target.native_id() { positively_selected = true; break; }
+        }
+    }
+    if !positively_selected { return Err("native file was not positively selected by the existing LS/CLI target owner".into()); }
+    pins.push(slot);
+    drop(lease);
+    Ok(LegacyNativeWrite { _lease: slot_lease, _pins: pins, bound: Some(bound),
+        expected: Some(actual_binding), _target: Some(target), canonical: true })
 }

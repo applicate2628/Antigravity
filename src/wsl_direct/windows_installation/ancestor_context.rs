@@ -128,6 +128,18 @@ pub(crate) struct AncestorAccessContext {
     issuer: Option<IssuerSnapshot>,
     verifier: Option<Box<dyn DeploymentVerifier>>,
 }
+
+/// Detached, comparable observation for a selected confirmation. The live
+/// context remains the only capability, with all of its ownership checks.
+#[derive(PartialEq, Eq)]
+pub(crate) struct AncestorContextIdentity {
+    owner: Sid,
+    sam: Option<Sid>,
+    observations: Vec<(ObjectId, String)>,
+    group: Option<(Sid, [Sid; 2], [String; 2])>,
+    issuer: Option<IssuerSnapshot>,
+    registration: Option<ObjectId>,
+}
 pub(crate) fn receive_ancestor_context(
     _scope: OwnerScope,
     inputs: AncestorInputs,
@@ -205,6 +217,16 @@ pub(crate) fn receive_ancestor_context(
     Ok(context)
 }
 impl AncestorAccessContext {
+    pub(crate) fn confirmation_identity(&self) -> Result<AncestorContextIdentity> {
+        self.revalidate()?;
+        Ok(AncestorContextIdentity { owner: self.owner.clone(), sam: self.sam.clone(),
+            observations: self.observations.iter().map(|observation| (observation.id.clone(), observation.descriptor.clone())).collect(),
+            group: self.group.as_ref().map(|group| (group.sid.clone(), group.roles.clone(), group.names.clone())),
+            issuer: self.issuer.clone(),
+            registration: self.verifier.as_ref().map(|verifier| object_id(verifier.registration_file())).transpose()?,
+        })
+    }
+
     pub(super) fn applies(&self, file: &File) -> Result<bool> {
         let id = object_id(file)?;
         Ok(self.observations.iter().any(|o| o.id == id))

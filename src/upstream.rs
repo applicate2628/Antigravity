@@ -20,7 +20,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
@@ -202,8 +202,89 @@ impl Route {
     }
 }
 
-/// The user's own proxy, as a route. Built-in exits carry one of these each.
-pub static OWN: Route = Route::new("свой прокси", crate::routes::Kind::Own);
+/// One received endpoint and its own health; old work keeps its original Arc.
+pub(crate) struct OwnContext {
+    endpoint: Upstream,
+    route: Route,
+    drops: std::sync::atomic::AtomicUsize,
+}
+
+static CURRENT_OWN: Mutex<Option<Arc<OwnContext>>> = Mutex::new(None);
+
+pub(crate) fn while_own_absent<T>(f: impl FnOnce() -> T) -> Result<Option<T>, String> {
+    let slot = CURRENT_OWN.lock().map_err(|_| "own proxy state unavailable".to_string())?;
+    Ok(if slot.is_none() { Some(f()) } else { None })
+}
+
+pub(crate) fn capture_own() -> Result<Option<Arc<OwnContext>>, String> {
+    let mut current = CURRENT_OWN.lock().map_err(|_| "own proxy state unavailable".to_string())?;
+    let received = configured_checked()?;
+    select_own(&mut current, received)
+}
+
+fn select_own(current: &mut Option<Arc<OwnContext>>, received: Option<Upstream>) -> Result<Option<Arc<OwnContext>>, String> {
+    if current.as_ref().is_some_and(|old| Some(&old.endpoint) == received.as_ref()) {
+        return Ok(current.clone());
+    }
+    if current.is_some() || received.is_some() { crate::routes::reset_own_projection()?; }
+    *current = received.map(|endpoint| Arc::new(OwnContext {
+        endpoint, route: Route::new("свой прокси", crate::routes::Kind::Own), drops: std::sync::atomic::AtomicUsize::new(0),
+    }));
+    Ok(current.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_select_own(endpoint: Option<Upstream>) -> Option<Arc<OwnContext>> {
+    select_own(&mut CURRENT_OWN.lock().unwrap(), endpoint).unwrap()
+}
+
+impl OwnContext {
+    #[cfg(test)]
+    pub(crate) fn fixture(endpoint: Upstream) -> Arc<Self> {
+        Arc::new(Self { endpoint, route: Route::new("fixture", crate::routes::Kind::Own), drops: std::sync::atomic::AtomicUsize::new(0) })
+    }
+    pub(crate) fn endpoint(&self) -> &Upstream { &self.endpoint }
+    pub(crate) fn usable(&self) -> bool { self.route.usable() }
+    pub(crate) fn is_benched(&self) -> bool { self.route.health.is_benched() }
+    pub(crate) fn note_open_failure(&self) { self.route.health.note(false); }
+    pub(crate) fn add_drops(&self, count: usize) -> usize {
+        self.drops.fetch_add(count, std::sync::atomic::Ordering::Relaxed).saturating_add(count)
+    }
+    pub(crate) fn clear_drops(&self) { self.drops.store(0, std::sync::atomic::Ordering::Relaxed); }
+    pub(crate) fn if_current<T>(self: &Arc<Self>, f: impl FnOnce() -> T) -> Option<T> {
+        let current = CURRENT_OWN.lock().ok()?;
+        if current.as_ref().is_some_and(|item| Arc::ptr_eq(item, self)) { Some(f()) } else { None }
+    }
+    pub(crate) fn probe(self: &Arc<Self>, check_region: bool) -> Result<(), String> {
+        if check_region {
+            match exit_info(&self.endpoint) {
+                Some((ip, loc)) if region_is_blocked(&loc) => {
+                    self.route.note_blocked_exit(&ip, &loc);
+                    return Err("own proxy exit is blocked".into());
+                }
+                Some((ip, loc)) => self.route.note_usable_exit(&ip, &loc),
+                None => (),
+            }
+        }
+        let started = Instant::now();
+        let result = probe(&self.endpoint);
+        self.receive_probe(&result, started.elapsed());
+        result
+    }
+    fn receive_probe(self: &Arc<Self>, result: &Result<(), String>, elapsed: Duration) {
+        match &result {
+            Ok(()) => self.route.health.revive("проверка прошла"),
+            Err(why) => {
+                crate::dns_forwarder::log_proxy(&format!("{} не отвечает: {}", self.route.label, why));
+                self.route.health.probe_failed();
+            }
+        }
+        self.if_current(|| match &result {
+            Ok(()) => crate::routes::record(crate::routes::Kind::Own, elapsed),
+            Err(_) => crate::routes::record_failure(crate::routes::Kind::Own),
+        });
+    }
+}
 
 /// A user-supplied HTTP CONNECT proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,44 +373,20 @@ pub fn parse(input: &str) -> Result<Upstream, String> {
 /// connections - runs under an S4U principal for that same user and reads it.
 /// A registry value or an environment variable would need a relay restart to
 /// take effect; a file is picked up on the next connection.
-const CONFIG_FILE: &str = "upstream.txt";
-
-#[cfg(not(target_os = "macos"))]
-pub fn config_path() -> PathBuf {
-    crate::dns_forwarder::log_dir().join(CONFIG_FILE)
-}
-
-#[cfg(target_os = "macos")]
-pub fn config_path() -> Result<PathBuf, crate::user_state_location::MacStateError> {
-    Ok(crate::user_state_location::macos_state_paths()?.state_dir().join(CONFIG_FILE))
+fn config_path() -> Result<PathBuf, String> {
+    crate::dns_forwarder::checked_log_dir().map(|dir| dir.join("upstream.txt"))
 }
 
 pub fn save(up: &Upstream) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let state = crate::user_state_location::macos_state_paths().map_err(|error| error.to_string())?;
-        return state.replace_file(CONFIG_FILE, up.as_line().as_bytes(), crate::user_state_location::MacStateFile::Secret)
-            .map_err(|error| format!("save upstream configuration: {error}"));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-    let path = config_path();
+    let path = config_path()?;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     fs::write(&path, up.as_line()).map_err(|e| e.to_string())
-    }
 }
 
 pub fn clear() -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let state = crate::user_state_location::macos_state_paths().map_err(|error| error.to_string())?;
-        return state.remove_file(CONFIG_FILE, crate::user_state_location::MacStateFile::Secret)
-            .map_err(|error| format!("clear upstream configuration: {error}"));
-    }
-    #[cfg(not(target_os = "macos"))]
-    clear_path(&config_path())
+    clear_path(&config_path()?)
 }
 
 fn clear_path(path: &std::path::Path) -> Result<(), String> {
@@ -347,32 +404,18 @@ fn clear_path(path: &std::path::Path) -> Result<(), String> {
 /// a background service for it to matter. One small read per connection is
 /// nothing beside the handshake that follows it - the same reasoning the old CA
 /// lookup used.
-#[cfg(not(target_os = "macos"))]
 pub fn configured() -> Option<Upstream> {
-    let raw = fs::read_to_string(config_path()).ok()?;
+    let raw = fs::read_to_string(config_path().ok()?).ok()?;
     parse(&raw).ok()
 }
 
-#[cfg(target_os = "macos")]
-pub fn configured() -> Result<Option<Upstream>, String> { checked_mac_configured() }
-
-/// A missing file is an omitted proxy; unavailable state and invalid or
-/// unreadable existing files are distinct failures on macOS.
-#[cfg(target_os = "macos")]
-pub(crate) fn checked_mac_configured() -> Result<Option<Upstream>, String> {
-    mac_configured_with_state(crate::user_state_location::macos_state_paths(),
-        |state| state.read_file(CONFIG_FILE, crate::user_state_location::MacStateFile::Secret)
-            .and_then(|bytes| String::from_utf8(bytes).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))))
-}
-
-#[cfg(target_os = "macos")]
-fn mac_configured_with_state<T>(state: Result<T, crate::user_state_location::MacStateError>,
-    read: impl FnOnce(T) -> std::io::Result<String>) -> Result<Option<Upstream>, String> {
-    let state = state.map_err(|error| error.to_string())?;
-    match read(state) {
-        Ok(raw) => parse(&raw).map(Some).map_err(|_| "invalid upstream configuration".to_owned()),
+/// Checked observation for the existing configuration writer. A failed read or
+/// malformed file is not proof that an attempted clear left no runtime proxy.
+pub(crate) fn configured_checked() -> Result<Option<Upstream>, String> {
+    match fs::read_to_string(config_path()?) {
+        Ok(raw) => parse(&raw).map(Some).map_err(|_| "saved proxy configuration is malformed".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("read upstream configuration: {error}")),
+        Err(error) => Err(format!("saved proxy read failed: {:?}/{:?}", error.kind(), error.raw_os_error())),
     }
 }
 
@@ -381,13 +424,9 @@ fn mac_configured_with_state<T>(state: Result<T, crate::user_state_location::Mac
 /// Three things have to hold: the user gave us one, it is answering, and it
 /// comes out somewhere Google will accept. The last is checked against a pinned
 /// address rather than a clock - see `Route`.
-#[cfg(not(target_os = "macos"))]
 pub fn available() -> bool {
-    configured().is_some() && OWN.usable()
+    capture_own().ok().flatten().is_some_and(|own| own.usable())
 }
-
-#[cfg(target_os = "macos")]
-pub fn available() -> Result<bool, String> { Ok(configured()?.is_some() && OWN.usable()) }
 
 fn basic(auth: &str) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -590,18 +629,12 @@ pub fn probe(up: &Upstream) -> Result<(), String> {
 /// where the trace only guesses from Cloudflare's geolocation, and a benched
 /// Own gives way like any route (G81). Owner's decision: no trace traffic to
 /// third-party hosts through their proxy every two minutes.
-#[cfg(not(target_os = "macos"))]
 pub fn probe_health() {
-    let Some(up) = configured() else {
-        return;
-    };
-    OWN.probe(&up, false);
-}
-
-#[cfg(target_os = "macos")]
-pub fn probe_health() -> Result<(), String> {
-    if let Some(up) = configured()? { OWN.probe(&up, false); }
-    Ok(())
+    match capture_own() {
+        Ok(Some(own)) => { let _ = own.probe(false); }
+        Ok(None) => (),
+        Err(error) => crate::dns_forwarder::log_proxy(&format!("own proxy observation failed: {error}")),
+    }
 }
 
 /// The address the proxy comes out on, and the country Cloudflare puts it in.
@@ -739,19 +772,44 @@ pub fn region_is_blocked(loc: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn mac_configured_distinguishes_unavailable_missing_and_invalid() {
-        use super::mac_configured_with_state;
-        use std::io::{Error, ErrorKind};
-        assert!(mac_configured_with_state::<()>(Err(crate::user_state_location::MacStateError::Uninitialized),
-            |_| panic!("state failure must not read configuration")).is_err());
-        assert!(mac_configured_with_state(Ok(()), |_| Err(Error::from(ErrorKind::NotFound))).unwrap().is_none());
-        assert!(mac_configured_with_state(Ok(()), |_| Err(Error::from(ErrorKind::PermissionDenied))).is_err());
-        assert!(mac_configured_with_state(Ok(()), |_| Ok("invalid".into())).is_err());
-        assert_eq!(mac_configured_with_state(Ok(()), |_| Ok("example.test:8080".into())).unwrap().unwrap().port, 8080);
-    }
     use super::*;
+
+    #[test]
+    #[ignore = "isolated process: owns the current Own slot and route projection"]
+    fn own_endpoint_switch_retains_work_identity_and_revives_current() {
+        struct Restore(Option<Arc<OwnContext>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Ok(mut slot) = CURRENT_OWN.lock() { *slot = self.0.take(); }
+                let _ = crate::routes::reset_own_projection();
+            }
+        }
+        let previous = CURRENT_OWN.lock().unwrap().take();
+        let _restore = Restore(previous);
+        let a = parse("192.0.2.1:8080").unwrap();
+        let b = parse("192.0.2.2:8080").unwrap();
+        let select = |endpoint| select_own(&mut CURRENT_OWN.lock().unwrap(), endpoint).unwrap();
+        let old_a = select(Some(a.clone())).unwrap();
+        old_a.note_open_failure();
+        old_a.note_open_failure();
+        assert!(!old_a.usable());
+        let current_b = select(Some(b.clone())).unwrap();
+        assert!(current_b.usable());
+        assert!(Arc::ptr_eq(&current_b, &select(Some(b)).unwrap()));
+        old_a.receive_probe(&Ok(()), Duration::from_millis(17));
+        assert!(crate::routes::latency(crate::routes::Kind::Own).is_none());
+        current_b.note_open_failure();
+        current_b.note_open_failure();
+        assert!(!current_b.usable());
+        current_b.receive_probe(&Ok(()), Duration::from_millis(23));
+        assert!(current_b.usable());
+        assert_eq!(crate::routes::latency(crate::routes::Kind::Own), Some(Duration::from_millis(23)));
+        select(None);
+        let new_a = select(Some(a)).unwrap();
+        assert!(!Arc::ptr_eq(&old_a, &new_a));
+        old_a.receive_probe(&Ok(()), Duration::from_millis(31));
+        assert!(crate::routes::latency(crate::routes::Kind::Own).is_none());
+    }
 
     #[cfg(windows)]
     #[test]

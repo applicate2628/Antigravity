@@ -36,6 +36,327 @@ impl MaintenanceWindow for Window {
     }
 }
 
+// Pure wire/field guards use invented in-memory identities, never native call
+// evidence or a production Current. Actual failure fixtures below use the owner.
+fn synthetic_group_sd(group: u32) -> Vec<u8> {
+    let sid = |value: u32| { let mut sid = vec![1, 1, 0, 0, 0, 0, 0, 5]; sid.extend_from_slice(&value.to_le_bytes()); sid };
+    let mut sd = vec![1, 0, 4, 128];
+    for offset in [20u32, 32, 0, 44] { sd.extend_from_slice(&offset.to_le_bytes()); }
+    sd.extend(sid(17)); sd.extend(sid(group));
+    sd.extend([2, 0, 8, 0, 0, 0, 0, 0]);
+    sd
+}
+#[test]
+fn group_resolution_post_fields_use_failed_index_and_candidate_size_not_source() {
+    let source = TargetState { digest: hash(b"old"), metadata: FileIdentity { volume: 1, index: 3, size: 3,
+        attributes: 32, creation: 8, write: 9, security_descriptor: synthetic_group_sd(17) } };
+    let candidate = b"patched-longer";
+    let mut failed = source.clone();
+    failed.digest = hash(candidate); failed.metadata.index = 7; failed.metadata.size = candidate.len() as u64;
+    failed.metadata.security_descriptor = synthetic_group_sd(18);
+    assert!(post_fields(&failed, &failed, &source, candidate));
+    for field in ["index", "size", "digest", "volume", "attributes", "creation", "write"] {
+        let mut altered = failed.clone();
+        match field {
+            "index" => altered.metadata.index = source.metadata.index,
+            "size" => altered.metadata.size = source.metadata.size,
+            "digest" => altered.digest = source.digest.clone(),
+            "volume" => altered.metadata.volume += 1,
+            "attributes" => altered.metadata.attributes ^= 1,
+            "creation" => altered.metadata.creation += 1,
+            "write" => altered.metadata.write += 1,
+            _ => unreachable!(),
+        }
+        assert!(!post_fields(&altered, &failed, &source, candidate), "{field}");
+    }
+    let mut desired = failed.clone(); desired.metadata.security_descriptor = source.metadata.security_descriptor.clone();
+    assert!(post_fields(&desired, &failed, &source, candidate));
+    let actor = &source.metadata.security_descriptor[20..32];
+    assert!(!native::receive_group_metadata(&failed.metadata.security_descriptor, &failed.metadata.security_descriptor, &source.metadata.security_descriptor, actor).unwrap());
+    assert!(native::receive_group_metadata(&desired.metadata.security_descriptor, &failed.metadata.security_descriptor, &source.metadata.security_descriptor, actor).unwrap());
+    let third_group = synthetic_group_sd(19);
+    let mut control = synthetic_group_sd(18); control[2] ^= 0x10;
+    let mut owner = synthetic_group_sd(18); owner[28] ^= 1;
+    let mut dacl = synthetic_group_sd(18); dacl[45] ^= 1;
+    for sd in [third_group, control, owner, dacl] {
+        assert!(native::receive_group_metadata(&sd, &failed.metadata.security_descriptor, &source.metadata.security_descriptor, actor).is_err());
+    }
+    for size in [0, 19, 27, 43, 51] {
+        assert!(native::receive_group_metadata(&synthetic_group_sd(18)[..size], &failed.metadata.security_descriptor,
+            &source.metadata.security_descriptor, actor).is_err());
+    }
+    let mut invalid = synthetic_group_sd(18); invalid[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(native::receive_group_metadata(&invalid, &failed.metadata.security_descriptor, &source.metadata.security_descriptor, actor).is_err());
+    assert!(native::receive_group_metadata(&failed.metadata.security_descriptor, &failed.metadata.security_descriptor,
+        &synthetic_group_sd(18), actor).is_err());
+}
+#[test]
+fn group_unknown_and_returned_codes_never_admit_another_call() {
+    assert!(group_call_can_follow(None).unwrap_err().contains("Unknown"));
+    for win_error in [0, 5] { assert!(group_call_can_follow(Some(&GroupCallStatus::Returned { win_error })).unwrap_err().contains("no repeat")); }
+    assert!(group_call_can_follow(Some(&GroupCallStatus::NotCalled { cause: String::new() })).is_err());
+    group_call_can_follow(Some(&GroupCallStatus::NotCalled { cause: "actual access denied before native call".into() })).unwrap();
+}
+
+#[test]
+fn group_private_wire_is_closed_required_nullable_and_does_not_decode_as_native_success() {
+    let reference = EvidenceRef { path: "operation/input.json".into(), digest: "a".repeat(64) };
+    let target = TargetState { digest: "b".repeat(64), metadata: FileIdentity { volume: 1, index: 4, size: 3,
+        attributes: 32, creation: 8, write: 9, security_descriptor: synthetic_group_sd(18) } };
+    let call = GroupCallIntentV1 { schema: 1, kind: GroupFrameKind::GroupCallIntent, resolution_intent: reference.clone(),
+        ordinal: 1, previous_not_called: None, pre_call: GroupObject { target, native_id: ObjectId { volume: 1, file: [2; 16] } } };
+    let value = serde_json::to_value(&call).unwrap();
+    assert!(value.get("previousNotCalled").unwrap().is_null());
+    for field in ["kind", "resolutionIntent", "ordinal", "previousNotCalled", "preCall"] {
+        let mut missing = value.clone(); missing.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<GroupCallIntentV1>(missing).is_err(), "{field}");
+    }
+    let mut unknown = value.clone(); unknown["consent"] = true.into();
+    assert!(serde_json::from_value::<GroupCallIntentV1>(unknown).is_err());
+    let mut unknown_kind = value; unknown_kind["kind"] = "unrecognized".into();
+    assert!(serde_json::from_value::<GroupCallIntentV1>(unknown_kind).is_err());
+    assert!(decode::<StepOutcome>(&json(&call).unwrap()).is_err());
+    for status in [GroupCallStatus::NotCalled { cause: "actual pre-call denial".into() }, GroupCallStatus::Returned { win_error: 5 }] {
+        let result = GroupCallResultV1 { schema: 1, kind: GroupFrameKind::GroupCallResult, call_intent: reference.clone(), outcome: status };
+        let mut value = serde_json::to_value(&result).unwrap(); value["outcome"]["unknown"] = true.into();
+        assert!(serde_json::from_value::<GroupCallResultV1>(value).is_err());
+    }
+    let real_failure_shape = serde_json::json!({"phase":"metadata-preservation", "cause":"retained cause", "replace_result":true,
+        "recovery":{"target":["synthetic", "Missing"], "staged":null, "original_backup":null, "displaced_backup":null}});
+    let actual: ActualFailure = serde_json::from_value(real_failure_shape.clone()).unwrap();
+    assert_eq!(actual.replace_result, Some(true));
+    assert!(known_vendor_group_failure(&actual));
+    for result in [serde_json::Value::Null, false.into()] {
+        let mut wrong = real_failure_shape.clone(); wrong["replace_result"] = result;
+        assert!(!known_vendor_group_failure(&serde_json::from_value::<ActualFailure>(wrong).unwrap()));
+    }
+    let mut wrong = real_failure_shape.clone(); wrong["phase"] = "readback".into();
+    assert!(!known_vendor_group_failure(&serde_json::from_value::<ActualFailure>(wrong).unwrap()));
+    let mut missing = real_failure_shape; missing.as_object_mut().unwrap().remove("replace_result");
+    assert!(serde_json::from_value::<ActualFailure>(missing).is_err());
+}
+
+fn vendor_group_failure(name: &str) -> Fixture {
+    let f = fixture(name);
+    native::initialize_token_group_fixture(&f.desktop.parent().unwrap().join("resources/app.asar")).unwrap();
+    f.upgrade().unwrap();
+    let (_, prior_digest) = f.current();
+    replace_with_vendor_update(&f);
+    native::TEST_GROUP_CALLS.with(|v| v.set(0));
+    TEST_GROUP_STOP.with(|v| v.set(None));
+    archive_install::TEST_WRONG_GROUP_STAGE.with(|v| v.set(true));
+    let digest = hash(&f.host.read_snapshot().unwrap());
+    let mut window = Window;
+    let error = prepare_vendor_update(&prior_digest, f.bound(), None,
+        VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &digest }, None,
+        &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).err()
+        .expect("wrong-group fixture must return its actual strict metadata failure");
+    assert!(error.contains("metadata-preservation"), "actual OS fixture did not produce the admitted failure: {error}");
+    let authority = Authority::open(&f.bound(), false, true).unwrap();
+    let op = authority.current.active_operation.as_ref().unwrap();
+    let vendor = receive_vendor_intent(&authority.slot, &op.intent).unwrap();
+    let input = receive_group_failure(&authority.slot, &op.intent, &vendor).unwrap();
+    assert_ne!(input.step.source.metadata.index, input.postimage.metadata.index);
+    assert_ne!(input.step.source.metadata.size, input.postimage.metadata.size);
+    assert_eq!(object_state(&f.archive()), input.postimage);
+    drop(authority);
+    assert!(matches!(observe_apply_current(&f.bound()).unwrap(), ApplyCurrentObservation::VendorPending(_)));
+    f
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture, genuine context and new pristine archive; real ReplaceFileW and group-only API"]
+fn vendor_group_recovery_settles_real_failed_postimage_and_preserves_old_failure() {
+    let f = vendor_group_failure("vendor-group-settle");
+    let archive_calls = TEST_NATIVE_CALLS.with(|v| v.get());
+    let before = f.archive();
+    let authority = Authority::open(&f.bound(), false, true).unwrap();
+    let op = authority.current.active_operation.as_ref().unwrap().clone();
+    let dir = operation_dir(&authority.slot, &op.intent).unwrap();
+    let failure = read_private(&dir.join("apply-v2-failure.json")).unwrap();
+    drop(authority);
+    assert!(f.recover().unwrap().message.contains("RecoverySettled"));
+    assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+    assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), archive_calls);
+    let after = f.archive();
+    assert_eq!(before.bytes, after.bytes); assert_eq!(before.identity.index, after.identity.index); assert_eq!(before.identity.size, after.identity.size);
+    let authority = Authority::open(&f.bound(), false, false).unwrap();
+    assert_eq!(authority.current.mode, Mode::SettledApplied);
+    assert_eq!(authority.current.binding.archive_metadata, after.identity);
+    assert_eq!(authority.current.binding.archive_digest, after.digest);
+    assert_eq!(read_private(&dir.join("apply-v2-failure.json")).unwrap(), failure);
+    assert!(optional_reference(&authority.slot, &dir.join("apply-v2-outcome.json")).unwrap().is_none());
+    let proof = optional_reference(&authority.slot, &dir.join("group-metadata-resolution.json")).unwrap().unwrap();
+    assert!(receive_step(&authority.slot, &proof, &op.id, "apply-v2").is_err(), "old success-only receiver must fail closed");
+    let result: VendorGroupMetadataResolutionV1 = decode(&reference(&authority.slot, &proof).unwrap()).unwrap();
+    assert!(matches!(result.proof, GroupResolutionProof::ReturnedAndVerified { .. }));
+    assert_eq!(result.applied.post, after.identity);
+    assert_eq!(result.applied.original_backup_identity, read_path(&result.applied.original_backup, READ).unwrap().identity);
+    assert_eq!(result.applied.displaced_identity, read_path(&result.applied.displaced_backup, READ).unwrap().identity);
+    assert!(receive_vendor_apply(&authority.slot, &result.failure, &op.intent, &receive_vendor_intent(&authority.slot, &op.intent).unwrap()).is_err());
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; actual failed replacement, no group replay"]
+fn vendor_group_unknown_intent_holds_without_native_or_archive_replay() {
+    let f = vendor_group_failure("vendor-group-unknown");
+    TEST_GROUP_STOP.with(|v| v.set(Some("after-intent")));
+    assert!(f.recover().unwrap_err().contains("after-intent"));
+    let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+    assert!(f.recover().unwrap_err().contains("Unknown"));
+    assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 0);
+    assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+    assert_eq!(f.current().0.mode, Mode::Pending);
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; actual group call, result/capture/publication interruption"]
+fn vendor_group_acquired_result_and_observed_convergence_never_repeat_call() {
+    for stage in ["after-native-before-result", "after-result", "after-resolution", "before-publish", "after-publish"] {
+        let f = vendor_group_failure(&format!("vendor-group-{stage}"));
+        let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+        TEST_GROUP_STOP.with(|v| v.set(Some(stage)));
+        let error = f.recover().unwrap_err();
+        assert!(error.contains(stage));
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+        if stage != "after-publish" { f.recover().unwrap(); }
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+        assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+        assert_eq!(f.current().0.mode, Mode::SettledApplied);
+        if matches!(stage, "after-native-before-result" | "after-result") {
+            let authority = Authority::open(&f.bound(), false, false).unwrap();
+            let settlement: Settlement = decode(&reference(&authority.slot, &authority.current.settled.as_ref().unwrap().evidence).unwrap()).unwrap();
+            let Settlement::VendorUpdate(outcome) = settlement else { panic!("vendor settlement required") };
+            let resolved: VendorGroupMetadataResolutionV1 = decode(&reference(&authority.slot, &outcome.step).unwrap()).unwrap();
+            assert!(matches!(resolved.proof, GroupResolutionProof::ObservedDesired { .. }));
+            assert_eq!(resolved.attempts.len(), 1);
+            if stage == "after-native-before-result" { assert!(resolved.attempts[0].result.is_none()); }
+        }
+    }
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; positive NotCalled then distinct later Recover"]
+fn vendor_group_not_called_admits_only_a_later_distinct_attempt() {
+    let f = vendor_group_failure("vendor-group-not-called");
+    let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+    TEST_GROUP_STOP.with(|v| v.set(Some("before-call")));
+    assert!(f.recover().unwrap_err().contains("NotCalled"));
+    assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 0);
+    f.recover().unwrap();
+    assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+    assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+    let authority = Authority::open(&f.bound(), false, false).unwrap();
+    let settlement: Settlement = decode(&reference(&authority.slot, &authority.current.settled.as_ref().unwrap().evidence).unwrap()).unwrap();
+    let Settlement::VendorUpdate(outcome) = settlement else { panic!("vendor settlement required") };
+    let resolved: VendorGroupMetadataResolutionV1 = decode(&reference(&authority.slot, &outcome.step).unwrap()).unwrap();
+    assert_eq!(resolved.attempts.len(), 2);
+    let second: GroupCallIntentV1 = decode(&reference(&authority.slot, &resolved.attempts[1].intent).unwrap()).unwrap();
+    assert_eq!(second.previous_not_called, resolved.attempts[0].result);
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; inject persistence failure after real native success"]
+fn vendor_group_persistence_failure_retains_acquired_return_and_can_only_observe() {
+    for stage in ["save:group-call-1-result.json", "save:group-call-1-readback.json", "save:group-metadata-resolution.json"] {
+        let f = vendor_group_failure(&format!("vendor-group-persistence-{}", stage.replace(':', "-")));
+        let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+        TEST_GROUP_STOP.with(|v| v.set(Some(stage)));
+        let error = f.recover().unwrap_err();
+        assert!(error.contains(stage));
+        if stage.ends_with("-result.json") || stage.ends_with("-readback.json") { assert!(error.contains("win_error: 0"), "acquired native status must survive: {error}"); }
+        assert_eq!(f.current().0.mode, Mode::Pending);
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+        f.recover().unwrap();
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 1);
+        assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+    }
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; malformed private fixture evidence never native authority"]
+fn vendor_group_corrupt_terminal_and_lineage_holes_hold_without_replay() {
+    for name in ["group-call-1-result.json", "group-call-3-intent.json", "group-call-01-result.json"] {
+        let f = vendor_group_failure("vendor-group-corrupt");
+        TEST_GROUP_STOP.with(|v| v.set(Some("after-intent")));
+        f.recover().unwrap_err();
+        let authority = Authority::open(&f.bound(), false, true).unwrap();
+        let op = authority.current.active_operation.as_ref().unwrap();
+        let dir = operation_dir(&authority.slot, &op.intent).unwrap();
+        // Deliberately malformed data only, never a forged native terminal.
+        write_private(&dir.join(name), b"{").unwrap();
+        drop(authority);
+        let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+        assert!(f.recover().is_err());
+        assert_eq!(f.current().0.mode, Mode::Pending);
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 0);
+        assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+    }
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; production Apply prerequisite receiver only, no package/source or effects"]
+fn vendor_pending_reaches_real_apply_prerequisite_before_package_planning() {
+    let f = vendor_group_failure("vendor-apply-prerequisite");
+    let bound = f.bound();
+    let target = crate::instances::GuiReplacementTarget { kind: crate::instances::GuiTargetKind::Desktop,
+        root_path: f.desktop.parent().unwrap().to_owned(), native_root_id: bound.native_root_id(),
+        anchor_path: f.desktop.clone(), anchor_native_id: bound.native_executable_id() };
+    let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+    // This is the production classifier used by Cmd::ApplySettings's plan
+    // receiver, before inspect_native_apply and selected source/assets receiving.
+    let result = crate::ops::receive_desktop_apply_current(bound, &target, [7; 32]);
+    let Err(crate::ops::ApplyPlanError::VendorMetadataRecoveryRequired(prerequisite)) = result else { panic!("typed vendor prerequisite required") };
+    assert_eq!(prerequisite.saved_sha256, [7; 32]);
+    assert_eq!(prerequisite.target, target);
+    let (pending, digest) = f.current();
+    assert_eq!(prerequisite.observation.slot_id, pending.slot_id);
+    assert_eq!(prerequisite.observation.operation_id, pending.active_operation.unwrap().id);
+    assert_eq!(hex::encode(prerequisite.observation.current_sha256), digest);
+    assert!(super::super::strict_current_expectation(observe_apply_current(&f.bound()).unwrap()).is_err());
+    drop(prerequisite);
+    let mut changed = target; changed.anchor_native_id.file[0] ^= 1;
+    assert!(matches!(crate::ops::receive_desktop_apply_current(f.bound(), &changed, [7; 32]), Err(crate::ops::ApplyPlanError::Receiving(_))));
+    assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 0);
+    assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+}
+
+#[test]
+#[ignore = "explicit owned canonical fixture and genuine context; actual staged/backup/content drift, zero recovery calls"]
+fn vendor_group_actual_drift_holds_before_group_call() {
+    for which in ["target", "stage", "backup"] {
+        let f = vendor_group_failure(&format!("vendor-group-drift-{which}"));
+        let authority = Authority::open(&f.bound(), false, true).unwrap();
+        let op = authority.current.active_operation.as_ref().unwrap();
+        let vendor = receive_vendor_intent(&authority.slot, &op.intent).unwrap();
+        let path = match which {
+            "target" => f.desktop.parent().unwrap().join("resources/app.asar"),
+            "stage" => vendor.apply_layout.staged,
+            "backup" => vendor.apply_layout.original_backup,
+            _ => unreachable!(),
+        };
+        drop(authority);
+        if which == "stage" { write_private(&path, b"occupied synthetic stage").unwrap(); }
+        else { fs::write(NativeFsPath::from_path(&path).unwrap().as_path(), b"changed synthetic bytes").unwrap(); }
+        let calls = TEST_NATIVE_CALLS.with(|v| v.get());
+        assert!(f.recover().is_err());
+        assert_eq!(native::TEST_GROUP_CALLS.with(|v| v.get()), 0);
+        assert_eq!(TEST_NATIVE_CALLS.with(|v| v.get()), calls);
+    }
+}
+
+#[test]
+fn vendor_runtime_choice_never_defaults_to_a_new_package() {
+    #[derive(Deserialize)]
+    struct LegacyChoice {
+        #[serde(default)]
+        runtime_input: VendorRuntimeRecord,
+    }
+    let legacy: LegacyChoice = serde_json::from_str("{}").unwrap();
+    assert!(legacy.runtime_input.is_reuse());
+    assert!(serde_json::from_str::<VendorRuntimeRecord>(r#"{"kind":"qualifiedPackage"}"#).is_err());
+}
+
 struct Fixture {
     root: PathBuf,
     desktop: PathBuf,
@@ -74,7 +395,7 @@ impl Fixture {
     fn archive(&self) -> SourceSnapshot {
         read_path(&self.bound().archive.path, READ | DELETE).unwrap()
     }
-    fn recover(&self) -> Result<String> {
+    fn recover(&self) -> Result<RecoveryCompletion> {
         let (current, expected) = self.current();
         let id = &current.active_operation.as_ref().unwrap().id;
         super::super::recover(self.bound(), id, &expected, None, &mut Window)
@@ -82,6 +403,587 @@ impl Fixture {
     fn rollback(&self) -> Result<()> {
         rollback_runtime(self.bound(), &self.current().1, None, &mut Window)
     }
+}
+
+fn replace_with_vendor_update(f: &Fixture) -> Vec<u8> {
+    let input = PathBuf::from(std::env::var_os("AG_VENDOR_UPDATE_ARCHIVE_FIXTURE")
+        .expect("explicit received new pristine archive fixture"));
+    let bytes = CheckedPath::open(&input, PathKind::File, PathPurpose::Source).unwrap().read_snapshot().unwrap();
+    assert_eq!(desktop_hook::inspect_archive(&bytes).unwrap().hook_status, desktop_hook::HookStatus::Prepared);
+    fs::write(NativeFsPath::from_path(&f.desktop).unwrap().as_path(), b"MZ synthetic updated producer; never executed").unwrap();
+    let archive = f.desktop.parent().unwrap().join("resources/app.asar");
+    fs::write(NativeFsPath::from_path(&archive).unwrap().as_path(), &bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn superseded_current_requires_strict_schema_three_and_explicit_nulls() {
+    let id = "a".repeat(32);
+    let bytes = [1u8; 16];
+    let object = serde_json::json!({"volume":1,"file":bytes});
+    let target = TargetState { digest: hash(b"observed archive"), metadata: FileIdentity {
+        volume: 1, index: 1, size: 16, attributes: 32, creation: 3, write: 4,
+        security_descriptor: synthetic_group_sd(17),
+    }};
+    let mut wire = serde_json::json!({
+        "schema":3, "slotId":id, "revision":4, "locator":[1], "mode":"Superseded",
+        "binding":{"parent":object, "root":object, "resources":object, "executable":object,
+            "archive":object, "executableDigest":hash(b"observed exe"),
+            "archiveDigest":target.digest, "archiveMetadata":target.metadata},
+        "activeOperation":null, "runtimeDeployment":null,
+        "settled":{"target":target, "applied":null, "evidence":{"path":"supersession.json","digest":hash(b"receipt")}},
+    });
+    let receive_shape = |wire: &serde_json::Value| -> Result<Current> {
+        let current = decode(&json(wire)?)?;
+        current_shape(&current, &id)?;
+        Ok(current)
+    };
+    assert!(receive_shape(&wire).unwrap().require_operation_authority().is_err());
+    for field in ["activeOperation", "runtimeDeployment", "settled"] {
+        let mut missing = wire.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(receive_shape(&missing).is_err(), "{field}");
+    }
+    let mut missing = wire.clone();
+    missing["settled"].as_object_mut().unwrap().remove("applied");
+    assert!(receive_shape(&missing).is_err());
+    let mut pending = wire.clone();
+    pending["activeOperation"] = serde_json::json!({"id":id,"kind":"VendorUpdate",
+        "intent":{"path":"intent.json","digest":hash(b"intent")},"priorCurrentDigest":hash(b"prior")});
+    assert!(receive_shape(&pending).is_err());
+    wire["runtimeDeployment"] = serde_json::json!({});
+    assert!(receive_shape(&wire).is_err());
+    wire.as_object_mut().unwrap().remove("runtimeDeployment");
+    wire["schema"] = 2.into();
+    assert!(receive_shape(&wire).is_err());
+
+    let evidence = |path: &str| serde_json::json!({"path":path,"digest":hash(path.as_bytes())});
+    let mut receipt = serde_json::json!({"kind":"Supersession","value":{
+        "schema":1,"slotId":id,"pendingCurrent":evidence("current.previous.3.json"),
+        "operationId":"b".repeat(32),"intent":evidence("intent.json"),
+        "historicalSuccess":evidence("outcome.json"),"observedBinding":wire["binding"],
+    }});
+    assert!(matches!(decode::<Settlement>(&json(&receipt).unwrap()).unwrap(), Settlement::Supersession(_)));
+    for field in ["pendingCurrent", "operationId", "intent", "historicalSuccess", "observedBinding"] {
+        let mut missing = receipt.clone();
+        missing["value"].as_object_mut().unwrap().remove(field);
+        assert!(decode::<Settlement>(&json(&missing).unwrap()).is_err(), "{field}");
+    }
+    receipt["value"]["packageVerified"] = true.into();
+    assert!(decode::<Settlement>(&json(&receipt).unwrap()).is_err());
+}
+
+fn inert_desktop(root: &Path, archive: &[u8]) -> BoundInstallation {
+    create_private_dir(root).unwrap();
+    create_private_dir(&root.join("resources")).unwrap();
+    let exe = root.join("Antigravity.exe");
+    write_private(&exe, b"inert fixture, no executable image").unwrap();
+    write_private(&root.join("resources/app.asar"), archive).unwrap();
+    BoundInstallation::open(&exe).unwrap()
+}
+
+fn fixture_target(binding: &Binding) -> TargetState {
+    TargetState { digest: binding.archive_digest.clone(), metadata: binding.archive_metadata.clone() }
+}
+
+fn supersession_fixture_file(slot: &Path, relative: &str, bytes: &[u8]) -> EvidenceRef {
+    write_private(&slot.join(relative), bytes).unwrap();
+    EvidenceRef { path: relative.into(), digest: hash(bytes) }
+}
+
+fn inert_vendor_archive() -> Vec<u8> {
+    // The validator requires this member syntax and package identity string.
+    // The member is an inert string fixture in a package with no entry script.
+    let script = br#"function neverCalled() {
+            spawnArgs = (0, wsl_1.wslShellArgs)(wsl.distro, `ANTIGRAVITY_VSCODE_HOST=1 exec "${wsl.binaryPath}" "$@"`, args);
+}"#;
+    let package = br#"{"name":"antigravity","version":"synthetic","main":"dist/main.js"}"#;
+    let member = |bytes: &[u8], offset: usize| serde_json::json!({
+        "size": bytes.len(), "offset": offset.to_string(), "integrity": {
+            "algorithm":"SHA256","hash":hash(bytes),"blockSize":bytes.len(),"blocks":[hash(bytes)],
+        },
+    });
+    let header = serde_json::to_vec(&serde_json::json!({"files":{
+        "package.json": member(package, 0),
+        "dist":{"files":{"languageServer.js":member(script, package.len())}},
+    }})).unwrap();
+    let length = u32::try_from(header.len()).unwrap();
+    let aligned = length.next_multiple_of(4);
+    let mut archive = Vec::new();
+    for length in [4, aligned + 8, aligned + 4, length] {
+        archive.extend_from_slice(&length.to_le_bytes());
+    }
+    archive.extend_from_slice(&header);
+    archive.resize(16 + aligned as usize, 0);
+    archive.extend_from_slice(package);
+    archive.extend_from_slice(script);
+    archive
+}
+
+fn supersession_fixture_history(root: &Path, slot: &Path, slot_id: String, selected: &BoundInstallation,
+    observed: Binding) -> (Supersession, Binding, CheckedPath) {
+    create_private_dir(&slot.join("operation")).unwrap();
+    let put = |path: &str, bytes: &[u8]| supersession_fixture_file(slot, path, bytes);
+    let host_path = slot.join("fixture-host.exe");
+    put("fixture-host.exe", b"inert fixture host, no executable image");
+    put("runtime-gate", b"inert fixture gate");
+    let host = CheckedPath::open(&host_path, PathKind::File, PathPurpose::Executable).unwrap();
+    let gate = CheckedPath::open(&slot.join("runtime-gate"), PathKind::File, PathPurpose::Review).unwrap();
+    let pristine_bytes = inert_vendor_archive();
+    // Use the same in-memory validator as the history receiver, only on the
+    // miniature archive above. Its output lives solely in the evidence store.
+    let host_name = host_path.to_str().unwrap();
+    let prepared = desktop_hook::prepare_gui_archive(&pristine_bytes, host_name).unwrap();
+    let member_sha256 = desktop_hook::gui_member_digest(&prepared.bytes, host_name).unwrap();
+    let pristine = put("operation/pristine.bin", &pristine_bytes);
+    let candidate = put("operation/candidate.bin", &prepared.bytes);
+    let pristine_file = CheckedPath::open(&slot.join(&pristine.path), PathKind::File, PathPurpose::Review).unwrap();
+    let candidate_file = CheckedPath::open(&slot.join(&candidate.path), PathKind::File, PathPurpose::Review).unwrap();
+    let mut deployment = RuntimeDeployment { version: 1,
+        gate: GateBinding { name: "runtime-gate".into(), native_id: gate.native_id() },
+        host: HostBinding { path: host_path, native_id: host.native_id(), sha256: hash(&host.read_snapshot().unwrap()) },
+        hook: HookBinding { revision: "wsl-gui-v2".into(), member_sha256 },
+        receipt: EvidenceRef { path: String::new(), digest: String::new() }, gateway_rules: None };
+    let deployment_bytes = json(&deployment.receipt()).unwrap();
+    deployment.receipt = put("prior-deployment.json", &deployment_bytes);
+
+    let prior = inert_desktop(&root.join("PriorBinding"), b"inert predecessor state").binding().unwrap();
+    let vendor = inert_desktop(&root.join("VendorBinding"), b"inert historical vendor state").binding().unwrap();
+    let source = TargetState { digest: pristine.digest.clone(), metadata: identity(&pristine_file.file).unwrap() };
+    let target = TargetState { digest: candidate.digest.clone(), metadata: identity(&candidate_file.file).unwrap() };
+    let new_binding = Binding { archive: pristine_file.native_id(), archive_digest: source.digest.clone(),
+        archive_metadata: source.metadata.clone(), ..vendor };
+    let historical = Binding { archive: candidate_file.native_id(), archive_digest: target.digest.clone(),
+        archive_metadata: target.metadata.clone(), ..new_binding.clone() };
+    let workspace = CheckedPath::open(root, PathKind::Directory, PathPurpose::Review).unwrap();
+    let layout = LayoutBinding { workspace: workspace.path.clone(), workspace_id: workspace.native_id(),
+        staged: root.join("inert-stage"), original_backup: root.join("inert-original"),
+        displaced_backup: root.join("inert-displaced") };
+    let prior_preimage = put("prior-preimage.bin", b"inert predecessor state");
+    let applied = |source: &TargetState, target: &TargetState| archive_install::AppliedArchive {
+        record_version: 1, target: selected.archive.path.clone(), original: source.metadata.clone(),
+        pre_digest: source.digest.clone(), post: target.metadata.clone(), post_digest: target.digest.clone(),
+        original_backup: layout.original_backup.clone(), original_backup_identity: source.metadata.clone(),
+        displaced_backup: layout.displaced_backup.clone(), displaced_identity: source.metadata.clone(),
+    };
+    let prior_target = fixture_target(&prior);
+    let prior_applied = applied(&prior_target, &prior_target);
+    let prior_operation = unique_id().unwrap();
+    let prior_intent = Intent { schema: 2, slot_id: slot_id.clone(), operation_id: prior_operation.clone(),
+        kind: OperationKind::Apply, expected_current_digest: prior_preimage.digest.clone(),
+        prior_current: prior_preimage.clone(), binding: prior.clone(), layout: layout.clone(),
+        preimage: prior_preimage, candidate: None, review_manifest: None, review_manifest_digest: None,
+        prior_applied: None, legacy: None };
+    let prior_intent = put("prior-intent.json", &json(&prior_intent).unwrap());
+    // These are synthetic test input frames, not evidence of a native call.
+    let prior_outcome = Settlement::Outcome(Outcome { schema: 2, slot_id: slot_id.clone(),
+        operation_id: prior_operation, intent: prior_intent, native_call: NativeCall::ReturnedSuccess,
+        target: prior_target.clone(), applied: Some(prior_applied.clone()), layout: layout.clone() });
+    let prior_outcome = put("prior-outcome.json", &json(&prior_outcome).unwrap());
+    let mut pending = Current { schema: 3, slot_id: slot_id.clone(), revision: 1,
+        locator: selected.root.locator.clone(), binding: prior, mode: Mode::SettledApplied,
+        active_operation: None, settled: Some(Settled { target: prior_target, applied: Some(prior_applied), evidence: prior_outcome }),
+        runtime_deployment: DeploymentField::Present(Some(deployment.clone())) };
+    let prior_current = put("current.previous.1.json", &json(&pending).unwrap());
+    deployment.receipt = put("operation/vendor-runtime-deployment.json", &deployment_bytes);
+    let operation_id = unique_id().unwrap();
+    let vendor_intent = VendorUpdateIntent { schema: 3, slot_id: slot_id.clone(), operation_id: operation_id.clone(),
+        expected_current_digest: prior_current.digest.clone(), prior_current: prior_current.clone(),
+        new_binding: new_binding.clone(), pristine: pristine.clone(), candidate, apply_layout: layout.clone(),
+        deployment, runtime_input: VendorRuntimeRecord::ReuseReceivedRuntime };
+    let intent = put("operation/vendor-intent.json", &json(&vendor_intent).unwrap());
+    let apply = applied(&source, &target);
+    let step_intent = StepIntent { schema: 3, operation_id: operation_id.clone(), step: "apply-v2".into(),
+        source: source.clone(), source_native_id: new_binding.archive, preimage: pristine, layout, reverted: None };
+    let step_intent = put("operation/apply-v2-intent.json", &json(&step_intent).unwrap());
+    let step = StepOutcome { schema: 3, step: "apply-v2".into(), intent: step_intent,
+        native_call: NativeCall::ReturnedSuccess, target, native_id: historical.archive.clone(), applied: Some(apply) };
+    let step = put("operation/apply-v2-outcome.json", &json(&step).unwrap());
+    let outcome = Settlement::VendorUpdate(VendorUpdateOutcome { slot_id: slot_id.clone(),
+        operation_id: operation_id.clone(), intent: intent.clone(), step,
+        retirement_steps: Vec::new(), retirement_final_checks: Vec::new() });
+    let historical_success = put("operation/outcome.json", &json(&outcome).unwrap());
+    pending.mode = Mode::Pending;
+    pending.revision = 2;
+    pending.active_operation = Some(Operation { id: operation_id.clone(), kind: OperationKind::VendorUpdate,
+        intent: intent.clone(), prior_current_digest: prior_current.digest });
+    pending.settled = None;
+    let pending_current = put("current.json", &json(&pending).unwrap());
+    (Supersession { schema: 1, slot_id, pending_current, operation_id, intent, historical_success,
+        observed_binding: observed }, historical, host)
+}
+
+#[test]
+#[ignore = "requires an explicitly selected private fixture parent with qualified native ancestry"]
+fn superseded_vendor_history_denies_selected_effects_and_preserves_neighbor() {
+    struct RestoreTestBase(Option<PathBuf>);
+    impl Drop for RestoreTestBase {
+        fn drop(&mut self) { TEST_BASE.with(|value| value.replace(self.0.take())); }
+    }
+    let parent = PathBuf::from(std::env::var_os("AG_SUPERSESSION_FIXTURE_PARENT")
+        .expect("explicit private supersession fixture parent"));
+    let parent = CheckedPath::open(&parent, PathKind::Directory, PathPurpose::Review).unwrap();
+    private(&parent.file).unwrap();
+    for path in &parent._ancestors { ancestor_integrity(path).unwrap(); }
+    let root = parent.path.join(format!("supersession-reader-{}", unique_id().unwrap()));
+    let state = root.join("state");
+    let product = state.join(user_state_location::WINDOWS_STATE_LEAF);
+    let namespace = product.join(INSTALLATIONS_NAMESPACE);
+    let slot_id = unique_id().unwrap();
+    let slot_path = namespace.join(&slot_id);
+    let neighbor_id = unique_id().unwrap();
+    let neighbor_slot = namespace.join(&neighbor_id);
+    for path in [&root, &state, &product, &namespace, &slot_path, &neighbor_slot] { create_private_dir(path).unwrap(); }
+    let _base = RestoreTestBase(TEST_BASE.with(|value| value.replace(Some(state))));
+
+    let observed_bytes = b"inert observed archive stand-in";
+    let neighbor_root = root.join("Neighbor");
+    let selected = inert_desktop(&root.join("Selected"), observed_bytes);
+    let neighbor = inert_desktop(&neighbor_root, b"inert independent archive stand-in");
+    let observed = selected.binding().unwrap();
+    let neighbor_binding = neighbor.binding().unwrap();
+    let neighbor_target = fixture_target(&neighbor_binding);
+    let enroll = Settlement::Enrollment(neighbor_target.clone());
+    let neighbor_current = Current { schema: 2, slot_id: neighbor_id, revision: 1,
+        locator: neighbor.root.locator.clone(), binding: neighbor_binding, mode: Mode::SettledUnchanged,
+        active_operation: None, settled: Some(Settled { target: neighbor_target, applied: None,
+            evidence: supersession_fixture_file(&neighbor_slot, "enrollment.json", &json(&enroll).unwrap()) }),
+        runtime_deployment: DeploymentField::Absent };
+    let neighbor_before = supersession_fixture_file(&neighbor_slot, "current.json", &json(&neighbor_current).unwrap()).digest;
+
+    let (receipt, historical, host) = supersession_fixture_history(&root, &slot_path, slot_id, &selected, observed.clone());
+    let source_sha256 = hash(&host.read_snapshot().unwrap());
+    let current_path = NativeFsPath::from_path(&slot_path.join("current.json")).unwrap();
+    let historical_path = slot_path.join(&receipt.historical_success.path);
+    let before = fs::read(current_path.as_path()).unwrap();
+    let historical_before = read_private(&historical_path).unwrap();
+    let slot = CheckedPath::open(&slot_path, PathKind::Directory, PathPurpose::Review).unwrap();
+    let native_calls = TEST_NATIVE_CALLS.with(|calls| calls.get());
+    let companion_path = slot.path.join(SUPERSESSION_COMPANION);
+    let decode_sha = |sha: &str| -> [u8; 32] { hex::decode(sha).unwrap().try_into().unwrap() };
+    let confirmed = VendorSupersessionConfirmation { pending: VendorPendingObservation {
+        slot_id: receipt.slot_id.clone(), operation_id: receipt.operation_id.clone(),
+        current_sha256: decode_sha(&receipt.pending_current.digest) },
+        historical_success_sha256: decode_sha(&receipt.historical_success.digest),
+        observed_binding_sha256: decode_sha(&hash(&json(&observed).unwrap())) };
+    assert_eq!(receive_current(&slot).unwrap().0.mode, Mode::Pending);
+    let mut wrong = confirmed.clone();
+    wrong.pending.current_sha256 = [0; 32];
+    let ready = AtomicBool::new(false);
+    assert!(record_vendor_supersession(&selected, &wrong, &ready, || Ok(())).unwrap_err().to_string().contains("Pending confirmation changed"));
+    let mut wrong = confirmed.clone();
+    wrong.observed_binding_sha256 = [0; 32];
+    assert!(record_vendor_supersession(&selected, &wrong, &ready, || Ok(())).unwrap_err().to_string().contains("observed binding confirmation differs"));
+    assert!(record_vendor_supersession(&selected, &confirmed, &AtomicBool::new(true), || Ok(())).unwrap_err().to_string().contains("cancelled"));
+    assert!(receive_companion_file(&slot).unwrap().is_none());
+
+    let raw = receive_raw_current(&slot).unwrap();
+    let mut unchanged = SupersessionCompanion { pending_revision: raw.current.revision,
+        locator: raw.current.locator.clone(), evidence: receipt.clone() };
+    unchanged.evidence.observed_binding = historical;
+    let unchanged_ref = EvidenceRef { path: SUPERSESSION_COMPANION.into(), digest: hash(&json(&unchanged).unwrap()) };
+    assert!(project_companion(&slot, &raw.current, &raw.digest, &unchanged, unchanged_ref)
+        .err().unwrap().contains("still match historical success"));
+    let mut forged = unchanged;
+    // The wrong raw digest is stale. Its member hint must not poison another slot.
+    forged.evidence.pending_current.digest = "0".repeat(64);
+    forged.evidence.observed_binding = neighbor.binding().unwrap();
+    write_private(&companion_path, &json(&forged).unwrap()).unwrap();
+    assert!(observe_apply_current(&selected).unwrap_err().contains("companion is unconfirmed"));
+    assert!(canonical_installed(selected.root.as_path()).unwrap_err().contains("companion is unconfirmed"));
+    assert!(matches!(observe_apply_current(&neighbor).unwrap(), ApplyCurrentObservation::Settled { .. }));
+    forged.evidence.pending_current = receipt.pending_current.clone();
+    forged.evidence.historical_success.digest = "0".repeat(64);
+    let forged_bytes = json(&forged).unwrap();
+    fs::write(&companion_path, &forged_bytes).unwrap();
+    assert!(observe_apply_current(&selected).unwrap_err().contains("historical outcome reference"));
+    assert!(matches!(observe_apply_current(&neighbor).unwrap(), ApplyCurrentObservation::Settled { .. }));
+    assert!(canonical_installed(neighbor.root.as_path()).unwrap());
+    let disjoint = neighbor_root.join("resources/disjoint.exe");
+    write_private(&disjoint, b"MZ disjoint fixture; never executed").unwrap();
+    assert!(admit_native_binary(&disjoint, select_inert_binaries, |_| Ok(None)).err().unwrap()
+        .contains("cannot exclude an unconfirmed supersession alias"));
+    assert!(record_vendor_supersession(&selected, &confirmed, &ready, || Ok(())).unwrap_err().to_string().contains("companion is unconfirmed"));
+    assert_eq!(read_private(&companion_path).unwrap(), forged_bytes);
+
+    let known = CheckedPath::open(&state_base().unwrap(), PathKind::Directory, PathPurpose::Review).unwrap();
+    let namespace_lease = Lease::acquire(&known, "wsl_namespace_v2").unwrap();
+    let slot_lease = Lease::acquire(&slot, "wsl_slot_v2").unwrap();
+    let cancelled_stage = OsStr::new("supersession.stage.fixture-cancelled");
+    let cancelled = publish_immutable_slot_receipt(&slot, cancelled_stage, OsStr::new(SUPERSESSION_COMPANION),
+        b"inert precommit cancellation probe", || Err("precommit cancelled".into())).unwrap_err();
+    assert!(cancelled.cause.contains("precommit cancelled"));
+    assert!(cancelled.evidence["stageRenameResult"].is_null());
+    assert_eq!(cancelled.evidence["disposition"]["stageAbsent"].as_bool(), Some(true));
+    assert!(cancelled.live.is_empty());
+    absent(&slot.path.join(cancelled_stage)).unwrap();
+    let collision_stage = OsStr::new("supersession.stage.fixture-collision");
+    let collision = publish_immutable_slot_receipt(&slot, collision_stage, OsStr::new(SUPERSESSION_COMPANION),
+        b"inert no-overwrite probe", || Ok(())).unwrap_err();
+    assert_eq!(collision.evidence["stageRenameResult"].as_bool(), Some(false), "{collision}");
+    assert_eq!(collision.evidence["disposition"]["stageAbsent"].as_bool(), Some(true));
+    assert!(collision.live.is_empty());
+    absent(&slot.path.join(collision_stage)).unwrap();
+    assert_eq!(read_private(&companion_path).unwrap(), forged_bytes);
+    drop(slot_lease);
+    drop(namespace_lease);
+    fs::rename(&companion_path, slot.path.join("stale-companion-fixture.json")).unwrap();
+
+    let renames_before = test_metadata_rename_total();
+    let native_slot = NativeFsPath::from_path(&slot.path).unwrap();
+    let count_stages = || fs::read_dir(native_slot.as_path()).unwrap().filter(|entry| {
+        entry.as_ref().unwrap().file_name().to_string_lossy().starts_with("supersession.stage.")
+    }).count();
+    let stale_authority = record_vendor_supersession(&selected, &confirmed, &ready, || {
+        assert_eq!(count_stages(), 1);
+        absent(&companion_path).unwrap();
+        Err("synthetic confirmation authority went stale before rename".into())
+    }).unwrap_err();
+    let VendorSupersessionFailure::Publication(stale_authority) = stale_authority else {
+        panic!("expected final confirmation refusal during staging");
+    };
+    assert_eq!(stale_authority.cause, "synthetic confirmation authority went stale before rename");
+    assert!(stale_authority.evidence["stageRenameResult"].is_null());
+    assert_eq!(stale_authority.evidence["disposition"]["stageAbsent"].as_bool(), Some(true));
+    assert!(stale_authority.live.is_empty());
+    absent(&companion_path).unwrap();
+    assert_eq!(count_stages(), 0);
+    assert_eq!(test_metadata_rename_total(), renames_before);
+
+    fail_metadata_rename_readback_after(1);
+    let VendorSupersessionFailure::Publication(failure) = record_vendor_supersession(&selected, &confirmed, &ready, || Ok(())).unwrap_err() else {
+        panic!("expected typed receipt publication failure");
+    };
+    assert_eq!(failure.cause, "synthetic receiving failure after successful native rename");
+    assert_eq!(failure.evidence["stageRenameResult"].as_bool(), Some(true));
+    let receiving = &failure.evidence["postEffectReceiving"];
+    assert_eq!(receiving["result"].as_str(), Some("received"), "{failure:?}");
+    assert!(failure.live.is_empty());
+    let completed = decode_sha(receiving["receiptSha256"].as_str().unwrap());
+    let companion_pin = CheckedPath::open(&companion_path, PathKind::File, PathPurpose::Review).unwrap();
+    let received = companion_pin.read_snapshot().unwrap();
+    assert_eq!(completed, decode_sha(&hash(&received)));
+    assert_eq!(test_metadata_rename_count(&companion_pin.native_id()), 1);
+    let renames_after_receiving = test_metadata_rename_total();
+    assert_eq!(renames_after_receiving, renames_before + 1);
+    assert_eq!(record_vendor_supersession(&selected, &confirmed, &ready, || Ok(())).unwrap(), completed);
+    let repeated = CheckedPath::open(&companion_path, PathKind::File, PathPurpose::Review).unwrap();
+    assert_eq!(repeated.native_id(), companion_pin.native_id());
+    assert_eq!(repeated.read_snapshot().unwrap(), received);
+    assert_eq!(test_metadata_rename_count(&companion_pin.native_id()), 1);
+    assert_eq!(test_metadata_rename_total(), renames_after_receiving);
+    assert_eq!(receive_raw_current(&slot).unwrap().current.mode, Mode::Pending);
+    assert_eq!(receive_current(&slot).unwrap().0.mode, Mode::Superseded);
+    let denied = |cause: String| cause.contains("canonical slot was superseded");
+    assert!(Authority::open(&selected, true, false).err().is_some_and(denied));
+    assert!(Authority::open(&selected, false, true).err().is_some_and(denied));
+    assert!(observe_apply_current(&selected).err().is_some_and(denied));
+    assert!(canonical_installed(selected.root.as_path()).err().is_some_and(denied));
+    assert!(admit_legacy_write(selected.resources()).err().is_some_and(denied));
+    assert!(match gateway_rules::GatewayHostInput::receive(&selected, &host, &source_sha256) {
+        Err(gateway_rules::GatewayRuleError::RecoveryRequired(cause)) => denied(cause),
+        _ => false,
+    });
+    let mut neighbor_authority = Authority::open(&neighbor, false, false).unwrap();
+    let mut forbidden_next = neighbor_authority.current.clone();
+    forbidden_next.mode = Mode::Superseded;
+    assert!(neighbor_authority.publish(forbidden_next).err().is_some_and(denied));
+    assert_eq!(receive_current(&neighbor_authority.slot).unwrap().1, neighbor_before);
+    drop(neighbor_authority);
+    assert!(matches!(observe_apply_current(&neighbor).unwrap(), ApplyCurrentObservation::Settled { .. }));
+    assert!(canonical_installed(neighbor.root.as_path()).unwrap());
+    assert_eq!(fs::read(current_path.as_path()).unwrap(), before);
+    assert_eq!(read_private(&historical_path).unwrap(), historical_before);
+    assert_eq!(selected.archive.read_snapshot().unwrap(), observed_bytes);
+    assert_eq!(TEST_NATIVE_CALLS.with(|calls| calls.get()), native_calls);
+
+    fn select_inert_binaries(root: &Path) -> Vec<PathBuf> {
+        ["disjoint.exe", "protected-alias.exe"].into_iter()
+            .map(|name| root.join("resources").join(name)).collect()
+    }
+    let alias = neighbor_root.join("resources/protected-alias.exe");
+    let archive = selected.archive.path.clone();
+    drop(selected);
+    fs::rename(&archive, &alias).unwrap();
+    let received_alias = CheckedPath::open(&alias, PathKind::File, PathPurpose::ReplaceSource).unwrap();
+    assert_eq!(received_alias.native_id(), observed.archive);
+    drop(received_alias);
+
+    for reverse in [false, true] {
+        legacy_guard::TEST_REVERSE_NEXT_SLOT_SCAN.with(|value| value.set(reverse));
+        assert!(admit_native_binary(&alias, select_inert_binaries, |_| Ok(None)).err().is_some_and(denied));
+        legacy_guard::TEST_REVERSE_NEXT_SLOT_SCAN.with(|value| value.set(reverse));
+        let admitted = admit_native_binary(&disjoint, select_inert_binaries, |_| Ok(None)).unwrap();
+        admitted.recheck().unwrap();
+    }
+
+    // The same captured ASAR identity can be opened under the executable role
+    // after a move. Canonical lookup must still find the conflicting slot.
+    let moved_root = root.join("MovedMember");
+    create_private_dir(&moved_root).unwrap();
+    create_private_dir(&moved_root.join("resources")).unwrap();
+    let moved_exe = moved_root.join("Antigravity.exe");
+    fs::rename(&alias, &moved_exe).unwrap();
+    write_private(&moved_root.join("resources/app.asar"), b"inert moved-member archive stand-in").unwrap();
+    let moved = BoundInstallation::open(&moved_exe).unwrap();
+    assert_eq!(moved.exe.native_id(), observed.archive);
+    assert!(observe_apply_current(&moved).unwrap_err().contains("LocatorConflict"));
+    assert_eq!(fs::read(current_path.as_path()).unwrap(), before);
+    assert_eq!(read_private(&historical_path).unwrap(), historical_before);
+    assert_eq!(TEST_NATIVE_CALLS.with(|calls| calls.get()), native_calls);
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_reuse_rejects_different_or_missing_engine_before_window() {
+    struct CountingWindow(usize);
+    impl MaintenanceWindow for CountingWindow {
+        fn ensure_held(&mut self) -> Result<()> { self.0 += 1; Ok(()) }
+    }
+    let f = fixture("vendor-update-engine-mismatch");
+    f.upgrade().unwrap();
+    let (_, prior_digest) = f.current();
+    let original = replace_with_vendor_update(&f);
+    let different = CheckedPath::open(&f.desktop, PathKind::File, PathPurpose::Executable).unwrap();
+    let different_hash = hash(&different.read_snapshot().unwrap());
+    let source_hash = hash(&f.host.read_snapshot().unwrap());
+    assert_ne!(different_hash, source_hash);
+    let calls = TEST_NATIVE_CALLS.with(|value| value.get());
+    for (source, digest) in [(&different, different_hash.as_str()), (&f.host, "")] {
+        let mut window = CountingWindow(0);
+        let error = match prepare_vendor_update(&prior_digest, f.bound(), None,
+            VendorRuntimeInput::ReuseReceivedRuntime { source, source_sha256: digest },
+            None, &AtomicBool::new(false), &mut window) {
+            Ok(_) => panic!("mismatched engine was admitted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("UpdatePending"));
+        assert_eq!(window.0, 0);
+        assert_eq!(TEST_NATIVE_CALLS.with(|value| value.get()), calls);
+        assert_eq!(f.archive().bytes, original);
+        assert_eq!(hex::encode(observe_vendor_update(&f.bound()).unwrap().prior_current_sha256), prior_digest);
+    }
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_reuse_rechecks_engine_before_execute_effects() {
+    struct CountingWindow(usize);
+    impl MaintenanceWindow for CountingWindow {
+        fn ensure_held(&mut self) -> Result<()> { self.0 += 1; Ok(()) }
+    }
+    let f = fixture("vendor-update-engine-changed");
+    f.upgrade().unwrap();
+    let (_, prior_digest) = f.current();
+    let original = replace_with_vendor_update(&f);
+    let digest = hash(&f.host.read_snapshot().unwrap());
+    let calls = TEST_NATIVE_CALLS.with(|value| value.get());
+    let mut window = CountingWindow(0);
+    let mut prepared = prepare_vendor_update(&prior_digest, f.bound(), None,
+        VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &digest },
+        None, &AtomicBool::new(false), &mut window).unwrap();
+    // Synthetic degraded operation input; the retained Windows source handle
+    // intentionally prevents this test from replacing its bytes in place.
+    prepared.runtime_input = VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: "" };
+    assert!(prepared.execute(None, &AtomicBool::new(false)).is_err());
+    assert_eq!(window.0, 1);
+    assert_eq!(TEST_NATIVE_CALLS.with(|value| value.get()), calls);
+    assert_eq!(f.archive().bytes, original);
+    assert_eq!(hex::encode(observe_vendor_update(&f.bound()).unwrap().prior_current_sha256), prior_digest);
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_update_receives_new_original_and_retains_runtime_custody() {
+    let f = fixture("vendor-update");
+    f.upgrade().unwrap();
+    let (prior, prior_digest) = f.current();
+    let prior_runtime = prior.runtime_deployment.received().unwrap().clone();
+    let new_original = replace_with_vendor_update(&f);
+    let observed = observe_vendor_update(&f.bound()).unwrap();
+    assert_eq!(observed.slot_id, prior.slot_id);
+    assert_eq!(hex::encode(observed.prior_current_sha256), prior_digest);
+    let before = TEST_NATIVE_CALLS.with(|value| value.get());
+    let source_sha256 = hash(&f.host.read_snapshot().unwrap());
+    assert!(prepare_vendor_update(&"0".repeat(64), f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &source_sha256 },
+        None, &AtomicBool::new(false), &mut Window).is_err());
+    assert_eq!(TEST_NATIVE_CALLS.with(|value| value.get()), before);
+    let mut window = Window;
+    prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &source_sha256 },
+        None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).unwrap();
+    let (current, _) = f.current();
+    let actual = current.runtime_deployment.received().unwrap();
+    assert_eq!(actual.host, prior_runtime.host);
+    assert_eq!(actual.gate, prior_runtime.gate);
+    assert_eq!(actual.gateway_rules, prior_runtime.gateway_rules);
+    assert_ne!(actual.receipt, prior_runtime.receipt);
+    assert_eq!(current.settled.as_ref().unwrap().applied.as_ref().unwrap().pre_digest, hash(&new_original));
+    prepare_revert(f.bound(), None, &mut Window).unwrap().execute().unwrap();
+    assert_eq!(f.archive().bytes, new_original);
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_update_qualified_package_stages_new_host_without_rules() {
+    let f = fixture("vendor-update-package");
+    f.upgrade().unwrap();
+    let (prior, prior_digest) = f.current();
+    let old = prior.runtime_deployment.received().unwrap().clone();
+    let new_original = replace_with_vendor_update(&f);
+    let source_hash = hash(&f.host.read_snapshot().unwrap());
+    let mut window = Window;
+    prepare_vendor_update(&prior_digest, f.bound(), None,
+        VendorRuntimeInput::QualifiedPackage { source: &f.host, expected_host_sha256: &source_hash, assets: &f.assets, selection: None },
+        None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).unwrap();
+    let (current, _) = f.current();
+    let received = current.runtime_deployment.received().unwrap();
+    assert_ne!(received.host.native_id, old.host.native_id);
+    assert_eq!(received.host.sha256, source_hash);
+    assert_eq!(received.gate, old.gate);
+    assert_eq!(received.version, 1);
+    assert!(received.gateway_rules.is_none());
+    assert_eq!(current.settled.as_ref().unwrap().applied.as_ref().unwrap().pre_digest, hash(&new_original));
+    prepare_revert(f.bound(), None, &mut Window).unwrap().execute().unwrap();
+    assert_eq!(f.archive().bytes, new_original);
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_update_received_success_recovers_without_native_replay() {
+    let f = fixture("vendor-update-recovery");
+    f.upgrade().unwrap();
+    let (_, prior_digest) = f.current();
+    replace_with_vendor_update(&f);
+    let source_sha256 = hash(&f.host.read_snapshot().unwrap());
+    TEST_STOP_AFTER_RECEIPT.with(|value| value.set(Some("apply-v2")));
+    let mut window = Window;
+    assert!(prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &source_sha256 },
+        None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).is_err());
+    let calls = TEST_NATIVE_CALLS.with(|value| value.get());
+    let recovered = f.recover().unwrap();
+    assert_eq!(TEST_NATIVE_CALLS.with(|value| value.get()), calls);
+    let (settled, digest) = f.current();
+    assert_eq!(settled.mode, Mode::SettledApplied);
+    assert_eq!(recovered.slot_id, settled.slot_id);
+    assert_eq!(hex::encode(recovered.current_sha256), digest);
+}
+
+#[test]
+#[ignore = "owned qualified fixture, genuine context and explicit new pristine archive; real file replacements"]
+fn vendor_update_lost_receipt_stays_pending_without_replay() {
+    let f = fixture("vendor-update-lost-receipt");
+    f.upgrade().unwrap();
+    let (_, prior_digest) = f.current();
+    replace_with_vendor_update(&f);
+    let source_sha256 = hash(&f.host.read_snapshot().unwrap());
+    TEST_LOSE_RECEIPT.with(|value| value.set(Some("apply-v2")));
+    let mut window = Window;
+    assert!(prepare_vendor_update(&prior_digest, f.bound(), None, VendorRuntimeInput::ReuseReceivedRuntime { source: &f.host, source_sha256: &source_sha256 },
+        None, &AtomicBool::new(false), &mut window).unwrap().execute(None, &AtomicBool::new(false)).is_err());
+    let calls = TEST_NATIVE_CALLS.with(|value| value.get());
+    assert!(f.recover().is_err());
+    assert_eq!(TEST_NATIVE_CALLS.with(|value| value.get()), calls);
+    assert_eq!(f.current().0.mode, Mode::Pending);
 }
 
 /// Test composition only. The fixture state root is intentionally injected, so
@@ -245,7 +1147,6 @@ fn fixture(name: &str) -> Fixture {
     let state = root.join("state");
     create_private_dir(&state).unwrap();
     TEST_BASE.with(|value| *value.borrow_mut() = Some(state));
-    TEST_PRODUCER.with(|value| value.set(true));
     TEST_NATIVE_CALLS.with(|value| value.set(0));
     TEST_STOP_AFTER_RECEIPT.with(|value| value.set(None));
     TEST_LOSE_RECEIPT.with(|value| value.set(None));

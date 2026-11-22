@@ -176,9 +176,8 @@ pub fn dev_break_frame() {
 // The record of what this machine can run
 // ---------------------------------------------------------------------------
 
-#[cfg(not(target_os = "macos"))]
-fn record_path() -> std::path::PathBuf {
-    crate::dns_forwarder::log_dir().join("renderer.txt")
+fn record_path() -> Result<std::path::PathBuf, String> {
+    crate::dns_forwarder::checked_log_dir().map(|dir| dir.join("renderer.txt"))
 }
 
 /// `ok <kind> <version>` or `trying <kind> <version>`, one line.
@@ -188,21 +187,7 @@ fn record_path() -> std::path::PathBuf {
 /// the software renderer by one bad start long ago. A machine that really
 /// cannot run DirectX 12 pays one relaunch per version for that.
 fn read_record() -> Option<(bool, Kind)> {
-    #[cfg(not(target_os = "macos"))]
-    let text = std::fs::read_to_string(record_path()).ok()?;
-    #[cfg(target_os = "macos")]
-    let text = {
-        let state = match crate::user_state_location::macos_state_paths() {
-            Ok(state) => state, Err(error) => { eprintln!("renderer record unavailable: {error}"); return None; }
-        };
-        match state.read_file("renderer.txt", crate::user_state_location::MacStateFile::Public) {
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => text, Err(error) => { eprintln!("renderer record encoding: {error}"); return None; }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(error) => { eprintln!("renderer record read: {error}"); return None; }
-        }
-    };
+    let text = std::fs::read_to_string(record_path().ok()?).ok()?;
     let mut parts = text.split_whitespace();
     let (state, kind, version) = (parts.next()?, parts.next()?, parts.next()?);
     if version != crate::update::current_version() {
@@ -212,9 +197,7 @@ fn read_record() -> Option<(bool, Kind)> {
 }
 
 fn write_record(ok: bool, kind: Kind) {
-    #[cfg(not(target_os = "macos"))]
-    {
-    let path = record_path();
+    let Ok(path) = record_path() else { return; };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
     }
@@ -223,29 +206,11 @@ fn write_record(ok: bool, kind: Kind) {
     // and the panic relaunch, which carries its answer in the environment.
     let version = crate::update::current_version();
     std::fs::write(&path, format!("{state} {} {version}\n", kind.name())).ok();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let state = match crate::user_state_location::macos_state_paths() {
-            Ok(state) => state, Err(error) => { eprintln!("renderer record unavailable: {error}"); return; }
-        };
-        let label = if ok { "ok" } else { "trying" };
-        let text = format!("{label} {} {}\n", kind.name(), crate::update::current_version());
-        if let Err(error) = state.replace_file("renderer.txt", text.as_bytes(), crate::user_state_location::MacStateFile::Public) {
-            eprintln!("renderer record write: {error}");
-        }
-    }
 }
 
 pub fn forget() {
-    #[cfg(not(target_os = "macos"))]
-    std::fs::remove_file(record_path()).ok();
-    #[cfg(target_os = "macos")]
-    match crate::user_state_location::macos_state_paths() {
-        Ok(state) => if let Err(error) = state.remove_file("renderer.txt", crate::user_state_location::MacStateFile::Public) {
-            eprintln!("renderer record removal: {error}");
-        },
-        Err(error) => eprintln!("renderer record unavailable: {error}"),
+    if let Ok(path) = record_path() {
+        std::fs::remove_file(path).ok();
     }
 }
 
@@ -327,9 +292,7 @@ pub fn install() {
         // renderer's, and moving down the chain for it would only downgrade the
         // next start (and, in a debug build that unwinds, open a second window).
         let drawing = std::thread::current().name() == Some("main");
-        // A macOS settings-writer lease must remain held until this process
-        // exits. Leave the recorded attempt for the next normal launch.
-        if !cfg!(target_os = "macos") && drawing && !CONFIRMED.load(Ordering::SeqCst) {
+        if drawing && !CONFIRMED.load(Ordering::SeqCst) {
             // The record already says `trying` for the active one (`attempting`),
             // which is what makes the start after this one skip it too.
             if let Some(next) = active().and_then(Kind::next) {

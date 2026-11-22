@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "ag_unlocker"
-version = "2.28.2"
+version = "2.34.0"
 dependencies = [
  "aes-gcm",
  "arboard",
@@ -188,6 +188,7 @@ dependencies = [
  "obfstr",
  "ratatui",
  "regex",
+ "ress",
  "ring",
  "rustix 1.1.4",
  "rustls",
@@ -195,12 +196,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2",
+ "subprocess",
  "url",
  "webpki-roots",
  "wgpu",
  "windows",
  "windows-sys 0.61.2",
  "winit",
+ "winreg",
  "winres",
 ]
 
@@ -3163,6 +3166,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "ress"
+version = "0.11.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d77111a94ef694bb2fe9867a93e21007e2151943c9a48b2ed72734bde41875a"
+dependencies = [
+ "log",
+ "unicode-xid",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3613,6 +3626,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "subprocess"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357bfac1d7af31600c3d45744ac453a4a25fc0f8b2ebe22db07d147745711cff"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3920,6 +3943,12 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+
+[[package]]
+name = "unicode-xid"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "universal-hash"
@@ -4730,6 +4759,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winreg"
+version = "0.56.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
+dependencies = [
+ "cfg-if",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -22,6 +22,19 @@
 //!   socket. The fix is an exception for our exe in that software.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use crate::utils::{CommandOutcome, CommandObservation, PreparedExec};
+
+#[cfg(windows)]
+fn received_probe(outcome: &CommandOutcome, observation: CommandObservation) -> Result<(), String> {
+    match observation {
+        CommandObservation::Complete if outcome.complete() && outcome.releasable() && outcome.exit().is_some_and(|status| status.success()) => Ok(()),
+        CommandObservation::NotStarted => Err("port helper did not start; actual failure retained".into()),
+        CommandObservation::Complete => Err("port helper failed or status is unknown".into()),
+        CommandObservation::Deadline => Err("port helper deadline expired; outcome retained".into()),
+        CommandObservation::Failed => Err("port helper failed; outcome retained".into()),
+        CommandObservation::Pending => Err("port helper remains pending".into()),
+    }
+}
 
 /// Which transport a failed bind was on. The listener tables and Windows'
 /// excluded-port ranges are kept per protocol, so a diagnosis has to ask about
@@ -92,29 +105,29 @@ impl Cause {
 }
 
 /// Classifies a failed bind of `addr` on TCP.
-pub fn diagnose(addr: SocketAddr, err: &std::io::Error) -> Cause {
-    diagnose_on(addr, err, Proto::Tcp)
+pub fn diagnose(outcome: &mut CommandOutcome, addr: SocketAddr, err: &std::io::Error) -> Result<Cause, String> {
+    diagnose_on(outcome, addr, err, Proto::Tcp)
 }
 
 /// Classifies a failed bind of `addr` on `proto`. Costs a table read and, only
 /// when that finds no holder, one `netsh` call: once per failed bind, which
 /// while a blocker lasts is the listener's one retry a minute.
-pub fn diagnose_on(addr: SocketAddr, err: &std::io::Error, proto: Proto) -> Cause {
+pub fn diagnose_on(outcome: &mut CommandOutcome, addr: SocketAddr, err: &std::io::Error, proto: Proto) -> Result<Cause, String> {
     let port = addr.port();
-    if let Some(pid) = listener_pid(addr, proto) {
-        return Cause::Held(process_name(pid));
+    if let Some(pid) = listener_pid(addr, proto)? {
+        return Ok(Cause::Held(process_name(outcome, pid)?));
     }
-    if excluded_ranges(proto)
+    if excluded_ranges(outcome, proto)?
         .iter()
         .any(|(lo, hi)| (*lo..=*hi).contains(&port))
     {
-        return Cause::Reserved;
+        return Ok(Cause::Reserved);
     }
     // 10013 on Windows, EACCES elsewhere.
     if err.kind() == std::io::ErrorKind::PermissionDenied {
-        return Cause::Denied;
+        return Ok(Cause::Denied);
     }
-    Cause::Other
+    Ok(Cause::Other)
 }
 
 // ---------------------------------------------------------------------------
@@ -124,8 +137,8 @@ pub fn diagnose_on(addr: SocketAddr, err: &std::io::Error, proto: Proto) -> Caus
 /// The image name of the program listening where `addr` points, when it can be
 /// read. What tells our own proxy from somebody else's program answering on the
 /// same port (`proxy::wait_for_our_listener`).
-pub fn listener_image(addr: SocketAddr) -> Option<String> {
-    listener_pid(addr, Proto::Tcp).and_then(process_name)
+pub fn listener_image(outcome: &mut CommandOutcome, addr: SocketAddr) -> Result<Option<String>, String> {
+    match listener_pid(addr, Proto::Tcp)? { Some(pid) => process_name(outcome, pid), None => Ok(None) }
 }
 
 /// The PID holding `addr` itself, or on the wildcard for its port - the two
@@ -133,18 +146,15 @@ pub fn listener_image(addr: SocketAddr) -> Option<String> {
 /// same port does not, and blaming it would send the user after the wrong
 /// program (a dev server on 127.0.0.1:443 while the door wants 127.65.71.1:443).
 #[cfg(windows)]
-fn listener_pid(addr: SocketAddr, proto: Proto) -> Option<u32> {
-    match proto {
-        Proto::Tcp => tcp_listener_pid(addr),
-        Proto::Udp => udp_listener_pid(addr),
-    }
+fn listener_pid(addr: SocketAddr, proto: Proto) -> Result<Option<u32>, String> {
+    Ok(listener_owners(addr, proto)?.into_iter().next().map(|(_, pid)| pid))
 }
 
 #[cfg(windows)]
-fn tcp_listener_pid(addr: SocketAddr) -> Option<u32> {
+pub(crate) fn listener_owners(addr: SocketAddr, proto: Proto) -> Result<Vec<(Ipv4Addr, u32)>, String> {
     let (port, want) = match addr {
         SocketAddr::V4(a) => (a.port(), *a.ip()),
-        SocketAddr::V6(_) => return None,
+        SocketAddr::V6(_) => return Err("listener observation requires an IPv4 address".into()),
     };
     use std::ffi::c_void;
     #[link(name = "iphlpapi")]
@@ -157,61 +167,6 @@ fn tcp_listener_pid(addr: SocketAddr) -> Option<u32> {
             class: u32,
             reserved: u32,
         ) -> u32;
-    }
-    const AF_INET: u32 = 2;
-    const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
-    const NO_ERROR: u32 = 0;
-    // MIB_TCPROW_OWNER_PID: state, local addr, local port, remote addr, remote
-    // port, pid - six u32s, after the table's one-u32 count.
-    const ROW: usize = 6;
-
-    let mut size = 0u32;
-    unsafe {
-        GetExtendedTcpTable(
-            std::ptr::null_mut(),
-            &mut size,
-            0,
-            AF_INET,
-            TCP_TABLE_OWNER_PID_LISTENER,
-            0,
-        );
-    }
-    // A little slack: the table can grow between the two calls.
-    let mut buf = vec![0u32; (size as usize / 4) + 64];
-    let mut size = (buf.len() * 4) as u32;
-    let rc = unsafe {
-        GetExtendedTcpTable(
-            buf.as_mut_ptr() as *mut c_void,
-            &mut size,
-            0,
-            AF_INET,
-            TCP_TABLE_OWNER_PID_LISTENER,
-            0,
-        )
-    };
-    if rc != NO_ERROR {
-        return None;
-    }
-    let count = (buf[0] as usize).min((buf.len() - 1) / ROW);
-    (0..count).find_map(|i| {
-        let row = &buf[1 + i * ROW..1 + (i + 1) * ROW];
-        // The port sits in the low 16 bits, in network byte order; the address
-        // is an `in_addr`, i.e. its bytes are already in network order.
-        let local_port = u16::from_be((row[2] & 0xFFFF) as u16);
-        let local = Ipv4Addr::from(row[1].to_ne_bytes());
-        (local_port == port && (local == want || local.is_unspecified())).then_some(row[5])
-    })
-}
-
-#[cfg(windows)]
-fn udp_listener_pid(addr: SocketAddr) -> Option<u32> {
-    let (port, want) = match addr {
-        SocketAddr::V4(a) => (a.port(), *a.ip()),
-        SocketAddr::V6(_) => return None,
-    };
-    use std::ffi::c_void;
-    #[link(name = "iphlpapi")]
-    extern "system" {
         fn GetExtendedUdpTable(
             table: *mut c_void,
             size: *mut u32,
@@ -222,57 +177,52 @@ fn udp_listener_pid(addr: SocketAddr) -> Option<u32> {
         ) -> u32;
     }
     const AF_INET: u32 = 2;
-    const UDP_TABLE_OWNER_PID: u32 = 1;
-    const NO_ERROR: u32 = 0;
-    // MIB_UDPROW_OWNER_PID: dwLocalAddr, dwLocalPort, dwOwningPid -
-    // three u32s, after the table's one-u32 count.
-    const ROW: usize = 3;
-
-    let mut size = 0u32;
-    unsafe {
-        GetExtendedUdpTable(
-            std::ptr::null_mut(),
-            &mut size,
-            0,
-            AF_INET,
-            UDP_TABLE_OWNER_PID,
-            0,
-        );
-    }
-    // A little slack: the table can grow between the two calls.
-    let mut buf = vec![0u32; (size as usize / 4) + 64];
-    let mut size = (buf.len() * 4) as u32;
-    let rc = unsafe {
-        GetExtendedUdpTable(
-            buf.as_mut_ptr() as *mut c_void,
-            &mut size,
-            0,
-            AF_INET,
-            UDP_TABLE_OWNER_PID,
-            0,
-        )
+    const INSUFFICIENT_BUFFER: u32 = 122;
+    let (width, address_index, port_index, pid_index) = match proto {
+        Proto::Tcp => (6, 1, 2, 5),
+        Proto::Udp => (3, 0, 1, 2),
     };
-    if rc != NO_ERROR {
-        return None;
+    let query = |ptr: *mut c_void, size: &mut u32| unsafe {
+        match proto {
+            Proto::Tcp => GetExtendedTcpTable(ptr, size, 0, AF_INET, 3, 0),
+            Proto::Udp => GetExtendedUdpTable(ptr, size, 0, AF_INET, 1, 0),
+        }
+    };
+    let mut size = 0u32;
+    let rc = query(std::ptr::null_mut(), &mut size);
+    if rc != INSUFFICIENT_BUFFER || size < 4 {
+        return Err(format!("listener table sizing failed: {rc}, bytes={size}"));
     }
-    let count = (buf[0] as usize).min((buf.len() - 1) / ROW);
-    // Note: UDP has no LISTEN state, so every bound UDP socket is in this table.
-    // That is what we want, since an exclusive bind on 0.0.0.0:53 (Windows'
-    // Internet Connection Sharing does exactly this) is precisely the holder
-    // we need to name.
-    (0..count).find_map(|i| {
-        let row = &buf[1 + i * ROW..1 + (i + 1) * ROW];
-        let local_port = u16::from_be((row[1] & 0xFFFF) as u16);
-        let local = Ipv4Addr::from(row[0].to_ne_bytes());
-        (local_port == port && (local == want || local.is_unspecified())).then_some(row[2])
-    })
+    let buf = loop {
+        let mut words = vec![0u32; (size as usize).div_ceil(4)];
+        let capacity = u32::try_from(words.len().checked_mul(4).ok_or("listener table size overflow")?)
+            .map_err(|_| "listener table size overflow")?;
+        let mut supplied = capacity;
+        let rc = query(words.as_mut_ptr().cast(), &mut supplied);
+        if rc == 0 { break words; }
+        if rc != INSUFFICIENT_BUFFER || supplied <= capacity {
+            return Err(format!("listener table receiving failed: {rc}, bytes={supplied}"));
+        }
+        size = supplied;
+    };
+    let count = buf[0] as usize;
+    if count > (buf.len() - 1) / width { return Err("listener table truncated".into()); }
+    let mut owners = Vec::new();
+    for row in buf[1..1 + count * width].chunks_exact(width) {
+        let local_port = u16::from_be((row[port_index] & 0xffff) as u16);
+        let local = Ipv4Addr::from(row[address_index].to_ne_bytes());
+        if local_port == port && (local == want || local.is_unspecified()) {
+            owners.push((local, row[pid_index]));
+        }
+    }
+    Ok(owners)
 }
 
 /// The image name of `pid`: the kernel's answer when this process may open the
 /// other one, `tasklist`'s otherwise (it reads names across sessions and
 /// privilege levels without elevation).
 #[cfg(windows)]
-fn process_name(pid: u32) -> Option<String> {
+fn process_name(outcome: &mut CommandOutcome, pid: u32) -> Result<Option<String>, String> {
     use std::ffi::c_void;
     #[link(name = "kernel32")]
     extern "system" {
@@ -290,7 +240,7 @@ fn process_name(pid: u32) -> Option<String> {
     // PID 4 is the kernel: a listener it owns is HTTP.sys, i.e. IIS or a
     // service that registered a URL with it. Its name would say nothing.
     if pid == 4 {
-        return Some("служба Windows HTTP (IIS или похожая)".to_string());
+        return Ok(Some("служба Windows HTTP (IIS или похожая)".to_string()));
     }
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -301,46 +251,53 @@ fn process_name(pid: u32) -> Option<String> {
             CloseHandle(h);
             if ok {
                 let full = String::from_utf16_lossy(&buf[..len as usize]);
-                return full.rsplit('\\').next().map(str::to_string);
+                return Ok(full.rsplit('\\').next().map(str::to_string));
             }
         }
     }
-    let mut cmd = std::process::Command::new("tasklist");
-    cmd.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
-    let out = crate::utils::bounded_output(
-        crate::utils::no_window(&mut cmd),
+    let command = PreparedExec::system(std::path::Path::new("tasklist.exe"))?
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+    let observation = crate::utils::bounded_output(
+        outcome,
+        command,
         std::time::Duration::from_secs(5),
-    )?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    );
+    received_probe(outcome, observation)?;
+    let text = String::from_utf8_lossy(outcome.stdout());
     let name = text
         .lines()
-        .next()?
+        .next().unwrap_or("")
         .split(',')
-        .next()?
+        .next().unwrap_or("")
         .trim_matches('"')
         .trim();
     // An image name, not tasklist's "INFO: No tasks are running…" for a PID
     // that exited between the two reads (that line has a dot too).
-    name.to_ascii_lowercase()
+    let result = name.to_ascii_lowercase()
         .ends_with(".exe")
-        .then(|| name.to_string())
+        .then(|| name.to_string());
+    drop(std::mem::take(outcome));
+    Ok(result)
 }
 
 /// The port ranges Windows keeps from use for `proto`.
 #[cfg(windows)]
-fn excluded_ranges(proto: Proto) -> Vec<(u16, u16)> {
+fn excluded_ranges(outcome: &mut CommandOutcome, proto: Proto) -> Result<Vec<(u16, u16)>, String> {
     let proto_arg = match proto {
         Proto::Tcp => "protocol=tcp",
         Proto::Udp => "protocol=udp",
     };
-    let mut cmd = std::process::Command::new("netsh");
-    cmd.args(["int", "ipv4", "show", "excludedportrange", proto_arg]);
-    crate::utils::bounded_output(
-        crate::utils::no_window(&mut cmd),
+    let command = PreparedExec::system(std::path::Path::new("netsh.exe"))?
+        .args(["int", "ipv4", "show", "excludedportrange", proto_arg]);
+    let observation = crate::utils::bounded_output(
+        outcome,
+        command,
         std::time::Duration::from_secs(5),
-    )
-    .map(|out| parse_excluded_ranges(&String::from_utf8_lossy(&out.stdout)))
-    .unwrap_or_default()
+    );
+    received_probe(outcome, observation)?;
+    let result = parse_excluded_ranges(&String::from_utf8_lossy(outcome.stdout()));
+    drop(std::mem::take(outcome));
+    Ok(result)
 }
 
 /// `netsh`'s table, in whatever language Windows speaks: every line that opens
@@ -362,18 +319,18 @@ fn parse_excluded_ranges(text: &str) -> Vec<(u16, u16)> {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(windows))]
-fn listener_pid(_addr: SocketAddr, _proto: Proto) -> Option<u32> {
-    None
+fn listener_pid(_addr: SocketAddr, _proto: Proto) -> Result<Option<u32>, String> {
+    Ok(None)
 }
 
 #[cfg(not(windows))]
-fn process_name(_pid: u32) -> Option<String> {
-    None
+fn process_name(_outcome: &mut CommandOutcome, _pid: u32) -> Result<Option<String>, String> {
+    Ok(None)
 }
 
 #[cfg(not(windows))]
-fn excluded_ranges(_proto: Proto) -> Vec<(u16, u16)> {
-    Vec::new()
+fn excluded_ranges(_outcome: &mut CommandOutcome, _proto: Proto) -> Result<Vec<(u16, u16)>, String> {
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
@@ -403,13 +360,14 @@ mod tests {
     fn a_port_we_listen_on_is_held_by_us() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let here = l.local_addr().unwrap();
-        let pid = listener_pid(here, Proto::Tcp).expect("our own listener in the table");
+        let pid = listener_pid(here, Proto::Tcp).unwrap().expect("our own listener in the table");
         assert_eq!(pid, std::process::id());
-        let name = process_name(pid).unwrap_or_default().to_ascii_lowercase();
+        let mut owner = CommandOutcome::default();
+        let name = process_name(&mut owner, pid).unwrap().unwrap_or_default().to_ascii_lowercase();
         assert!(name.ends_with(".exe"), "{name}");
         // The same port on another loopback address is not in its way.
         let elsewhere = SocketAddr::from(([127, 65, 71, 9], here.port()));
-        assert_eq!(listener_pid(elsewhere, Proto::Tcp), None);
+        assert_eq!(listener_pid(elsewhere, Proto::Tcp).unwrap(), None);
     }
 
     #[test]
@@ -417,13 +375,14 @@ mod tests {
     fn a_udp_port_we_hold_is_found() {
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let here = s.local_addr().unwrap();
-        let pid = listener_pid(here, Proto::Udp).expect("our own UDP socket in the table");
+        let pid = listener_pid(here, Proto::Udp).unwrap().expect("our own UDP socket in the table");
         assert_eq!(pid, std::process::id());
-        let name = process_name(pid).unwrap_or_default().to_ascii_lowercase();
+        let mut owner = CommandOutcome::default();
+        let name = process_name(&mut owner, pid).unwrap().unwrap_or_default().to_ascii_lowercase();
         assert!(name.ends_with(".exe"), "{name}");
         // The same port on another loopback address is not matched.
         let elsewhere = SocketAddr::from(([127, 65, 71, 9], here.port()));
-        assert_eq!(listener_pid(elsewhere, Proto::Udp), None);
+        assert_eq!(listener_pid(elsewhere, Proto::Udp).unwrap(), None);
     }
 
     #[test]
@@ -431,10 +390,10 @@ mod tests {
     fn tcp_and_udp_tables_are_asked_separately() {
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp_addr = tcp.local_addr().unwrap();
-        assert_eq!(listener_pid(tcp_addr, Proto::Udp), None);
+        assert_eq!(listener_pid(tcp_addr, Proto::Udp).unwrap(), None);
 
         let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let udp_addr = udp.local_addr().unwrap();
-        assert_eq!(listener_pid(udp_addr, Proto::Tcp), None);
+        assert_eq!(listener_pid(udp_addr, Proto::Tcp).unwrap(), None);
     }
 }

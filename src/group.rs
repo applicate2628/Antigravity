@@ -335,7 +335,6 @@ fn scrub(msg: &str) -> String {
     out
 }
 
-#[cfg(not(target_os = "macos"))]
 pub fn get_active_key() -> Option<GroupKey> {
     let mut state = group_state().lock().unwrap();
     let settings_key = settings::group_key();
@@ -344,7 +343,6 @@ pub fn get_active_key() -> Option<GroupKey> {
 
 /// Serialize profile capture with pool admission, so an older request cannot
 /// later replace the pool selected by a newer settings snapshot.
-#[cfg(not(target_os = "macos"))]
 pub(crate) fn capture_route_profile() -> (settings::Settings, Option<GroupKey>) {
     let mut state = group_state().lock().unwrap();
     let settings = settings::routing_snapshot();
@@ -356,18 +354,6 @@ pub(crate) fn capture_route_profile() -> (settings::Settings, Option<GroupKey>) 
     (settings, key)
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn capture_route_profile<T>(receive: impl FnOnce(&settings::Settings) -> Result<T, String>, allowed: &dyn Fn() -> bool)
-    -> Result<(settings::Settings, Option<GroupKey>, T), String> {
-    let mut state = group_state().lock().map_err(|_| "group state lock unavailable".to_owned())?;
-    let settings = settings::routing_snapshot_checked()?;
-    let received = receive(&settings)?;
-    if !allowed() { return Err("получение настроек отменено".into()); }
-    let key = if settings.group_proxy { receive_key_locked_checked(&mut state, &settings.group_key, allowed)? } else { None };
-    Ok((settings, key, received))
-}
-
-#[cfg(not(target_os = "macos"))]
 fn receive_key_locked(state: &mut GroupState, settings_key: &str) -> Option<GroupKey> {
     if settings_key.is_empty() {
         state.key_string.clear();
@@ -379,44 +365,17 @@ fn receive_key_locked(state: &mut GroupState, settings_key: &str) -> Option<Grou
     if state.key_string == settings_key {
         return state.parsed.clone();
     }
+    #[cfg(target_os = "macos")]
+    let parsed = match crate::group_key::parse_key(&settings_key) {
+        Ok(key) => Some(key),
+        Err(crate::group_key::KeyError::IdentityUnavailable(error)) => {
+            eprintln!("Код устройства недоступен: {error}");
+            return None;
+        }
+        Err(_) => None,
+    };
+    #[cfg(not(target_os = "macos"))]
     let parsed = crate::group_key::parse_key(&settings_key).ok();
-    replace_key_locked(state, settings_key, parsed)
-}
-
-#[cfg(target_os = "macos")]
-fn receive_key_locked_checked(state: &mut GroupState, settings_key: &str, allowed: &dyn Fn() -> bool) -> Result<Option<GroupKey>, String> {
-    receive_key_locked_with(state, settings_key, allowed,
-        || crate::hwid::pc_code().map(|_| ()).map_err(|error| format!("Код устройства недоступен: {error}")),
-        |text| match crate::group_key::parse_key_with_allowed(text, allowed) {
-            Ok(key) => Ok(Some(key)),
-            Err(crate::group_key::KeyError::IdentityUnavailable(error)) => Err(format!("Код устройства недоступен: {error}")),
-            Err(crate::group_key::KeyError::Cancelled) => Err("получение ключа отменено".into()),
-            Err(_) => Ok(None),
-        })
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn receive_key_locked_with(state: &mut GroupState, settings_key: &str, allowed: &dyn Fn() -> bool,
-    identity: impl FnOnce() -> Result<(), String>, parse: impl FnOnce(&str) -> Result<Option<GroupKey>, String>) -> Result<Option<GroupKey>, String> {
-    if !allowed() { return Err("получение ключа отменено".into()); }
-    if settings_key.is_empty() {
-        return Ok(replace_key_locked(state, settings_key, None));
-    }
-    if state.key_string == settings_key && state.parsed.is_some() {
-        let received = identity();
-        let still_allowed = allowed();
-        received?;
-        if !still_allowed { return Err("получение ключа отменено".into()); }
-        return Ok(state.parsed.clone());
-    }
-    let received = parse(settings_key);
-    let still_allowed = allowed();
-    let parsed = received?;
-    if !still_allowed { return Err("получение ключа отменено".into()); }
-    Ok(replace_key_locked(state, settings_key, parsed))
-}
-
-fn replace_key_locked(state: &mut GroupState, settings_key: &str, parsed: Option<GroupKey>) -> Option<GroupKey> {
     let servers = parsed.as_ref().map(initial_servers).unwrap_or_default();
     state.key_string = settings_key.to_owned();
     state.parsed = parsed;
@@ -440,7 +399,6 @@ pub(crate) fn bound_key_usable(key: Option<&GroupKey>) -> bool {
     key.is_some() && state.parsed.as_ref() == key && group_route().usable()
 }
 
-#[cfg(not(target_os = "macos"))]
 pub fn available() -> bool {
     get_active_key().is_some() && group_route().usable()
 }
@@ -595,17 +553,6 @@ fn fresh_nonce() -> Result<String, String> {
     Ok(hex::encode(nonce))
 }
 
-#[cfg(target_os = "macos")]
-fn group_identity_with<'a>(allowed: &dyn Fn() -> bool,
-    acquire: impl FnOnce() -> Result<&'a str, crate::hwid::HwidError>) -> Result<&'a str, String> {
-    if !allowed() { return Err("операция отменена".into()); }
-    let received = acquire();
-    let still_allowed = allowed();
-    let code = received.map_err(|error| format!("Код устройства недоступен: {error}"))?;
-    if !still_allowed { return Err("операция отменена".into()); }
-    Ok(code)
-}
-
 fn open_agu2(
     key: &GroupKey,
     server: &str,
@@ -623,12 +570,20 @@ fn open_agu2_with_budget(
     budget: Duration,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(ClientConnection, TcpStream, Vec<u8>), String> {
-    #[cfg(target_os = "macos")]
-    let own_code = group_identity_with(&|| !cancelled.is_some_and(|cancel| cancel.load(Ordering::Acquire)), crate::hwid::pc_code)?;
-    #[cfg(target_os = "macos")]
-    if key.code != own_code { return Err("Ключ выдан для другого устройства".into()); }
     let deadline = Instant::now() + budget;
-    let (mut tls, mut sock) = open_tls(key, server, force_refresh, budget, cancelled)?;
+    #[cfg(target_os = "macos")]
+    let own_code = {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) { return Err("операция отменена".into()); }
+        let code = crate::hwid::pc_code().map_err(|error| format!("Код устройства недоступен: {error}"))?;
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) || Instant::now() >= deadline { return Err("операция отменена или время вышло".into()); }
+        if key.code != code { return Err("Ключ выдан для другого устройства".into()); }
+        code
+    };
+    #[cfg(target_os = "macos")]
+    let open_budget = deadline.saturating_duration_since(Instant::now());
+    #[cfg(not(target_os = "macos"))]
+    let open_budget = budget;
+    let (mut tls, mut sock) = open_tls(key, server, force_refresh, open_budget, cancelled)?;
     if cancelled.is_some_and(|c| c.load(Ordering::Acquire)) || !server_authorized(key, server) {
         return Err("группа изменилась".to_string());
     }
@@ -642,8 +597,6 @@ fn open_agu2_with_budget(
     // Signed with this PC's own code, never the one inside the key text.
     #[cfg(not(target_os = "macos"))]
     let own_code = crate::hwid::pc_code();
-    #[cfg(target_os = "macos")]
-    if cancelled.is_some_and(|cancel| cancel.load(Ordering::Acquire)) { return Err("операция отменена".into()); }
     let auth_header = crate::group_key::auth_header(key, own_code, ts, &nonce_hex, target_host);
 
     let req = format!(
@@ -1091,19 +1044,7 @@ fn walk_group_attempts<T>(deadline: Instant, cancelled: &std::sync::atomic::Atom
     None
 }
 
-#[cfg(not(target_os = "macos"))]
 pub(crate) fn open_group(target: &crate::proxy::GateTarget443<'_>, key: &GroupKey, deadline: Instant, cancelled: &std::sync::atomic::AtomicBool) -> Option<OpenedGroup> {
-    open_group_effect(target, key, deadline, cancelled)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn open_group(target: &crate::proxy::GateTarget443<'_>, key: &GroupKey, deadline: Instant, cancelled: &std::sync::atomic::AtomicBool) -> Result<Option<OpenedGroup>, String> {
-    let code = group_identity_with(&|| !cancelled.load(Ordering::Acquire) && Instant::now() < deadline, crate::hwid::pc_code)?;
-    if key.code != code { return Err("Ключ выдан для другого устройства".into()); }
-    Ok(open_group_effect(target, key, deadline, cancelled))
-}
-
-fn open_group_effect(target: &crate::proxy::GateTarget443<'_>, key: &GroupKey, deadline: Instant, cancelled: &std::sync::atomic::AtomicBool) -> Option<OpenedGroup> {
     if !group_route().usable() {
         return None;
     }
@@ -1159,107 +1100,47 @@ fn open_group_effect(target: &crate::proxy::GateTarget443<'_>, key: &GroupKey, d
     None
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn tunnel(client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
+pub fn tunnel(mut client: TcpStream, host: &str, port: u16) -> Result<(), TcpStream> {
     let Some(target) = crate::proxy::GateTarget443::new(host, port) else {
         return Err(client);
     };
     let Some(key) = get_active_key() else {
         return Err(client);
     };
-    tunnel_with_key(client, &target, &key)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) enum MacGroupTunnelError { Unavailable(TcpStream), Configuration(TcpStream, String) }
-
-#[cfg(target_os = "macos")]
-pub(crate) fn tunnel_captured(mut client: TcpStream, host: &str, port: u16, key: &GroupKey) -> Result<(), MacGroupTunnelError> {
-    let Some(target) = crate::proxy::GateTarget443::new(host, port) else { return Err(MacGroupTunnelError::Unavailable(client)); };
     let cancelled = std::sync::atomic::AtomicBool::new(false);
-    let opened = match open_group(&target, key, Instant::now() + 2 * upstream::LIVE_OPEN_BUDGET, &cancelled) {
-        Ok(Some(opened)) => opened,
-        Ok(None) => return Err(MacGroupTunnelError::Unavailable(client)),
-        Err(error) => return Err(MacGroupTunnelError::Configuration(client, error)),
-    };
-    if client.write_all(crate::proxy::RESP_ESTABLISHED).is_err() { return Ok(()); }
-    opened.note_committed(target.host());
-    opened.transfer(client);
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn tunnel_with_key(mut client: TcpStream, target: &crate::proxy::GateTarget443<'_>, key: &GroupKey) -> Result<(), TcpStream> {
-    let cancelled = std::sync::atomic::AtomicBool::new(false);
-    let Some(opened) = open_group(target, key, Instant::now() + 2 * upstream::LIVE_OPEN_BUDGET, &cancelled) else {
+    let Some(opened) = open_group(&target, &key, Instant::now() + 2 * upstream::LIVE_OPEN_BUDGET, &cancelled) else {
         return Err(client);
     };
     if client.write_all(crate::proxy::RESP_ESTABLISHED).is_err() {
         return Ok(());
     }
-    opened.note_committed(target.host());
+    opened.note_committed(host);
     opened.transfer(client);
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
 pub fn probe_health() {
     let key = match get_active_key() {
         Some(k) => k,
         None => return,
     };
 
-    probe_health_for(&key);
+    let _ = probe_health_for(&key);
 }
 
-fn probe_health_for(key: &GroupKey) {
+pub(crate) fn probe_health_for(key: &GroupKey) -> Result<(), String> {
     poll_pool(key);
     let started = Instant::now();
     let result = probe_once(key, true);
     let state = group_state().lock().unwrap();
     record_if_current(&state, key, || {
-        group_route().record_probe(result, started.elapsed());
+        group_route().record_probe(result.clone(), started.elapsed());
     });
+    result
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn captured_key_is_current(key: &GroupKey) -> Result<bool, String> {
-    group_state().lock().map(|state| state.parsed.as_ref() == Some(key)).map_err(|_| "group state lock unavailable".into())
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn stumble_if_current(key: &GroupKey) -> Result<bool, String> {
-    match group_state().lock() {
-        Ok(state) => Ok(record_if_current(&state, key, || crate::routes::stumble(crate::routes::Kind::Group))),
-        Err(_) => Err("group state lock unavailable".into()),
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn probe_health_captured(key: &GroupKey) -> Result<(), String> {
-    if !captured_key_is_current(key)? { return Ok(()); }
-    let code = group_identity_with(&|| true, crate::hwid::pc_code)?;
-    if key.code != code { return Err("Ключ выдан для другого устройства".into()); }
-    run_captured_probe(key, captured_key_is_current, poll_pool, |key| probe_once(key, true), |key, result, elapsed| {
-        let state = group_state().lock().map_err(|_| "group state lock unavailable".to_owned())?;
-        record_if_current(&state, key, || group_route().record_probe(result, elapsed));
-        Ok(())
-    })
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn run_captured_probe<K, R>(key: &K, mut current: impl FnMut(&K) -> Result<bool, String>,
-    poll: impl FnOnce(&K), probe: impl FnOnce(&K) -> R, record: impl FnOnce(&K, R, Duration) -> Result<(), String>) -> Result<(), String> {
-    if !current(key)? { return Ok(()); }
-    poll(key);
-    if !current(key)? { return Ok(()); }
-    let started = Instant::now();
-    let result = probe(key);
-    record(key, result, started.elapsed())
-}
-
-fn record_if_current(state: &GroupState, key: &GroupKey, record: impl FnOnce()) -> bool {
-    if state.parsed.as_ref() == Some(key) { record(); true } else { false }
+fn record_if_current(state: &GroupState, key: &GroupKey, record: impl FnOnce()) {
+    if state.parsed.as_ref() == Some(key) { record(); }
 }
 
 /// What a server says about itself, signed with this user's key.
@@ -1273,7 +1154,7 @@ struct Status {
 
 fn fetch_status(key: &GroupKey, server: &str) -> Result<Status, String> {
     #[cfg(target_os = "macos")]
-    let own_code = group_identity_with(&|| true, crate::hwid::pc_code)?;
+    let own_code = crate::hwid::pc_code().map_err(|error| format!("Код устройства недоступен: {error}"))?;
     #[cfg(target_os = "macos")]
     if key.code != own_code { return Err("Ключ выдан для другого устройства".into()); }
     obfstr::obfstr! {
@@ -1566,78 +1447,6 @@ mod tls_test_fixture;
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn identity_failure_and_cancellation_precede_pool_and_group_effects() {
-        use std::cell::Cell;
-        let old = GroupKey { host: "synthetic.invalid".into(), port: 443, tg: 7,
-            code: "synthetic".into(), issued: 9, user_key: [1; 32] };
-        let mut state = GroupState { key_string: "old-key".into(), parsed: Some(old.clone()),
-            servers: initial_servers(&old), current: Some(0) };
-        let calls = Cell::new(0);
-        let cancelled = Cell::new(false);
-        let result = receive_key_locked_with(&mut state, "new-key", &|| !cancelled.get(),
-            || { calls.set(calls.get() + 1); Ok(()) }, |_| { calls.set(calls.get() + 1); Err("identity unavailable".into()) });
-        assert!(result.is_err());
-        assert_eq!(state.key_string, "old-key");
-        assert!(state.parsed.as_ref() == Some(&old));
-        assert_eq!(state.servers.len(), 1);
-        assert_eq!(state.current, Some(0));
-        assert_eq!(calls.get(), 1);
-
-        let mut empty = GroupState { key_string: String::new(), parsed: None, servers: Vec::new(), current: None };
-        receive_key_locked_with(&mut empty, "", &|| true,
-            || panic!("empty group must not query identity"), |_| panic!("empty group must not parse")) .unwrap();
-        cancelled.set(true);
-        assert!(receive_key_locked_with(&mut state, "new-key", &|| !cancelled.get(),
-            || panic!("pre-cancel must not query identity"), |_| panic!("pre-cancel must not parse")) .is_err());
-        let effects = Cell::new(0);
-        let result = group_identity_with(&|| true, || Err(crate::hwid::HwidError::RegistryExit))
-            .and_then(|_| { effects.set(effects.get() + 1); Ok(()) });
-        assert!(result.is_err());
-        assert_eq!(effects.get(), 0, "socket and header effects must not start");
-        cancelled.set(false);
-        let result = group_identity_with(&|| !cancelled.get(), || {
-            cancelled.set(true);
-            Ok("synthetic")
-        }).and_then(|_| { effects.set(effects.get() + 1); Ok(()) });
-        assert!(result.is_err());
-        assert_eq!(effects.get(), 0);
-        cancelled.set(false);
-        let checks = Cell::new(0);
-        let result = group_identity_with(&|| { checks.set(checks.get() + 1); !cancelled.get() }, || {
-            cancelled.set(true);
-            Err(crate::hwid::HwidError::RegistryExit)
-        });
-        assert!(result.unwrap_err().contains("Код устройства недоступен"));
-        assert_eq!(checks.get(), 2);
-    }
-
-    #[test]
-    fn captured_probe_stops_if_key_changes_and_never_recaptures_settings() {
-        use std::cell::{Cell, RefCell};
-        let current = Cell::new(true);
-        let events = RefCell::new(Vec::new());
-        run_captured_probe(&7u8, |_| Ok(current.get()), |_| {
-            events.borrow_mut().push("poll");
-            current.set(false);
-        }, |_| { events.borrow_mut().push("probe"); Ok::<(), ()>(()) },
-        |_, _, _| { events.borrow_mut().push("record"); Ok(()) }).unwrap();
-        assert_eq!(*events.borrow(), ["poll"]);
-        events.borrow_mut().clear();
-        current.set(true);
-        run_captured_probe(&7u8, |_| Ok(current.get()), |_| events.borrow_mut().push("poll"),
-            |_| { events.borrow_mut().push("probe"); Ok::<(), ()>(()) },
-            |_, _, _| { events.borrow_mut().push("record"); Ok(()) }).unwrap();
-        assert_eq!(*events.borrow(), ["poll", "probe", "record"]);
-        events.borrow_mut().clear();
-        let error = run_captured_probe(&7u8, |_| Err("group state unavailable".into()),
-            |_| events.borrow_mut().push("poll"), |_| events.borrow_mut().push("probe"),
-            |_, _, _| { events.borrow_mut().push("record"); Ok(()) }).unwrap_err();
-        assert_eq!(error, "group state unavailable");
-        assert!(events.borrow().is_empty());
-    }
-
     #[test]
     fn group_cancellation_between_attempts_prevents_second_open() {
         let cancelled = std::sync::atomic::AtomicBool::new(false);
@@ -1679,9 +1488,9 @@ mod tests {
         assert_eq!(state.servers.len(), 1);
         assert!(state.servers[0].cpu.is_none());
         let recorded = std::cell::Cell::new(0);
-        assert!(!record_if_current(&state, &old, || recorded.set(recorded.get() + 1)));
+        record_if_current(&state, &old, || recorded.set(recorded.get() + 1));
         assert_eq!(recorded.get(), 0);
-        assert!(record_if_current(&state, &current, || recorded.set(recorded.get() + 1)));
+        record_if_current(&state, &current, || recorded.set(recorded.get() + 1));
         assert_eq!(recorded.get(), 1);
         assert!(apply_status_results(&mut state, &current, &names, vec![Ok(status())]).is_some());
         assert_eq!(state.servers.len(), 2);
@@ -1905,13 +1714,15 @@ mod tests {
     /// the dialled address can differ (an SSH-forwarded port).
     ///   AGU2_E2E_MASTER=<64 hex> AGU2_E2E_HOST=<cert name> AGU2_E2E_ADDR=127.0.0.1:18443
     ///   cargo test group::tests::live_tunnel_reaches_google -- --ignored
-    #[cfg(not(target_os = "macos"))]
     #[test]
     #[ignore]
     fn live_tunnel_reaches_google() {
         let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{} not set", k));
         let master = hex::decode(env("AGU2_E2E_MASTER")).unwrap();
         let addr: SocketAddr = env("AGU2_E2E_ADDR").parse().unwrap();
+        #[cfg(target_os = "macos")]
+        let code = crate::hwid::pc_code().expect("device identity").to_string();
+        #[cfg(not(target_os = "macos"))]
         let code = crate::hwid::pc_code().to_string();
         let issued = SystemTime::now()
             .duration_since(UNIX_EPOCH)

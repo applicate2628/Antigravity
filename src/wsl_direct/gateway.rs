@@ -377,6 +377,8 @@ impl PreparedOpen {
         cancelled: &AtomicBool,
         committed: &AtomicBool,
         supervisor: &thread::Thread,
+        transport: crate::settings::TransportIntent,
+        resolver: Option<&crate::resolvers::ResolverWork>,
     ) -> OpeningOutcome {
         use crate::proxy::route_session::{self, DirectChecks, FrontendEof, OpenFailure, WslTransfer};
         let host = match &self.host {
@@ -390,7 +392,28 @@ impl PreparedOpen {
         let address = |literal| self.check_direct_address(literal).is_ok();
         let peer = |literal, actual| self.check_direct_peer(literal, actual).is_ok();
         let checks = DirectChecks { address: &address, peer: &peer };
-        let opened = match route_session::open_selected_route(&target, deadline, cancelled, Some(&checks)) {
+        let opening = match transport {
+            crate::settings::TransportIntent::Explicit { settings, requirements } => {
+                if requirements.active_config.profile == crate::settings::TransportProfile::ExistingConfigured && resolver.is_none() {
+                    return OpeningOutcome::Failed(OpeningFailure {
+                        error: Failure::ConnectFailed, io_error: Some(io::Error::other("configured resolver owner unavailable")),
+                        origin_shutdown: None, prior_connect_failures: Vec::new(),
+                    });
+                }
+                crate::proxy::DesiredRouteProfile::capture_explicit(settings, requirements.active_config)
+                    .and_then(|profile| route_session::open_captured_route(&target, deadline, cancelled, Some(&checks), &profile, resolver))
+            }
+            crate::settings::TransportIntent::Legacy(_) => route_session::open_selected_route(&target, deadline, cancelled, Some(&checks)),
+            crate::settings::TransportIntent::Missing | crate::settings::TransportIntent::Broken(_) => {
+                return OpeningOutcome::Failed(OpeningFailure {
+                    error: Failure::ConnectFailed,
+                    io_error: Some(io::Error::other("transport settings unavailable or invalid")),
+                    origin_shutdown: None,
+                    prior_connect_failures: Vec::new(),
+                });
+            }
+        };
+        let opened = match opening {
             Ok(opened) => opened,
             Err(error) => return OpeningOutcome::Failed(match error {
                 OpenFailure::Cancelled => Failure::Cancelled.into(),
@@ -403,6 +426,18 @@ impl PreparedOpen {
                     prior_connect_failures: Vec::new(),
                 },
                 OpenFailure::UnsupportedPrivateRoutes => Failure::ConnectFailed.into(),
+                OpenFailure::Resolution(error) => OpeningFailure {
+                    error: Failure::ConnectFailed,
+                    io_error: Some(error),
+                    origin_shutdown: None,
+                    prior_connect_failures: Vec::new(),
+                },
+                OpenFailure::ResolutionLate { cancelled, error } => OpeningFailure {
+                    error: if cancelled { Failure::Cancelled } else { Failure::OpeningDeadline },
+                    io_error: Some(error),
+                    origin_shutdown: None,
+                    prior_connect_failures: Vec::new(),
+                },
             }),
         };
         let session = match route_session::commit(opened, client, prefetched, host, FrontendEof::WslSymmetricFin, deadline, cancelled) {

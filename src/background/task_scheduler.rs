@@ -1,6 +1,6 @@
 // The existing Background owner's thread-confined Task Scheduler adapter.
 // Public Microsoft-generated interfaces own every COM reference and ABI.
-use super::{BackgroundDesired, TaskReceipt, FORWARDER_FLAG, WATCHDOG_FLAG, TASK_NAME, WATCHDOG_TASK_NAME};
+use super::{BackgroundChanges, BackgroundDesired, TaskReceipt, FORWARDER_FLAG, WATCHDOG_FLAG, TASK_NAME, WATCHDOG_TASK_NAME};
 use crate::windows_coordinator::{process_identity::ProcessIdentity, windows_installation::{self, CheckedPath, LegacyBackgroundInput}};
 use serde::Serialize;
 use std::{os::windows::ffi::OsStrExt, path::{Path, PathBuf}, thread, time::Duration};
@@ -34,18 +34,19 @@ pub(crate) struct Call {
     pub output_returned: bool,
     pub error_info: ErrorInfo,
 }
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct InstanceView { pub guid: String, pub path: String, pub action_name: Result<String>, pub state: i32, pub image: &'static str }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct InstanceView { pub guid: String, pub path: String, pub action_name: Result<String>, pub state: i32, pub image: &'static str, pub engine_pid: Result<u32> }
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct DefinitionView {
     pub role: String, pub program: PathBuf, pub origin: Origin, pub xml: String, pub security: String,
     pub principal: String, pub logon: i32, pub instances: Vec<InstanceView>,
 }
 #[derive(Clone, Debug, Serialize)]
-pub(crate) enum Event { Call(Call), Definition(DefinitionView), DefinitionsReadyForRetirement, InstanceRetired(InstanceView), RoleRunning { role: String, instance: InstanceView } }
+pub(crate) enum Event { Call(Call), Definition(DefinitionView), DefinitionsReadyForRetirement, InstanceRetired(InstanceView), RoleRunning { role: String, instance: InstanceView },
+    StoppedTaskObservation { phase: &'static str, role: &'static str, definition: Result<DefinitionView> } }
 pub(crate) trait Receiving {
     fn check_cancel(&mut self) -> Result<()>;
-    fn before_retirement(&mut self) -> Result<()>;
+    fn before_retirement(&mut self, participants: &TransitionParticipants<'_>) -> Result<()>;
     fn receive(&mut self, event: Event) -> Result<()>;
 }
 
@@ -73,12 +74,12 @@ fn require_clean(call: &Call) -> Result<()> {
     Err(format!("{} {} returned HRESULT {:?}/ErrorInfo {:?}; no readiness or next retirement grant", call.operation, call.role, call.returned_hresult, call.error_info))
 }
 fn invoke<T>(receiving: &mut impl Receiving, operation: &'static str, role: &str, instance: Option<String>,
-    stop: bool, action: impl FnOnce() -> (HRESULT, T, bool)) -> Result<T> {
+    participants: Option<&TransitionParticipants<'_>>, action: impl FnOnce() -> (HRESULT, T, bool)) -> Result<T> {
     receiving.check_cancel()?;
     let pending = Call { operation, role: role.into(), instance, returned_hresult: None, output_returned: false, error_info: ErrorInfo::NotQueried };
     receiving.receive(Event::Call(pending.clone()))?;
+    if let Some(participants) = participants { receiving.before_retirement(participants)?; }
     clear_error_info()?;
-    if stop { receiving.before_retirement()?; }
     let (hr, output, output_returned) = action();
     let info = capture_error_info();
     let actual = Call { returned_hresult: Some(hr.0), output_returned, error_info: info, ..pending };
@@ -115,9 +116,22 @@ impl Programs<'_> {
 }
 struct Instance { native: IRunningTask, view: InstanceView }
 struct Qualified {
-    native: IRegisteredTask, definition: ITaskDefinition, view: DefinitionView, retained: Vec<Instance>,
+    native: IRegisteredTask, definition: ITaskDefinition, original: DefinitionView, view: DefinitionView,
+    update_acknowledged: bool, retained: Vec<Instance>, has_logon_trigger: bool,
 }
-pub(crate) struct TaskSet<'a> { scheduler: &'a Scheduler, tasks: Vec<Qualified>, migration_ready: bool }
+pub(crate) struct TaskSet<'a> { scheduler: &'a Scheduler, tasks: Vec<Qualified>, selected_roles: Vec<String>, migration_ready: bool }
+pub(crate) type StoppedManagedTasks = [DefinitionView; 2];
+pub(crate) struct TransitionParticipants<'a> { tasks: &'a [Qualified], current: Vec<DefinitionView> }
+fn transition_association_paths<'a>(associations: impl Iterator<Item = (&'a DefinitionView, &'a DefinitionView)>)
+    -> impl Iterator<Item = &'a Path> {
+    associations.flat_map(|(original, current)| [original.program.as_path(), current.program.as_path()])
+}
+impl TransitionParticipants<'_> {
+    pub(crate) fn program_paths(&self) -> impl Iterator<Item = &Path> {
+        transition_association_paths(self.tasks.iter().map(|task| (&task.original, &task.view)))
+    }
+    pub(crate) fn current(&self) -> &[DefinitionView] { &self.current }
+}
 /// Only a current independently qualified Managed definition can construct
 /// this occupied-program binding. A path, ACL or matching bytes cannot.
 pub(crate) struct ManagedBinding<'a> {
@@ -125,7 +139,9 @@ pub(crate) struct ManagedBinding<'a> {
     program: &'a CheckedPath,
     definitions: Vec<(IRegisteredTask, DefinitionView)>,
 }
-pub(crate) struct PreparedRestore { definitions: Vec<DefinitionView> }
+pub(crate) struct PreparedRestore { definitions: Vec<DefinitionView>, desired: BackgroundDesired,
+    keep_snapshots: Vec<(String, Option<Vec<(String, i32)>>)> }
+impl PreparedRestore { pub(crate) fn desired(&self) -> BackgroundDesired { self.desired } }
 pub(crate) struct ManagedRestore<'a> { program: Option<&'a CheckedPath>, roles: PreparedRestore }
 impl ManagedRestore<'_> {
     pub(crate) fn prepared_roles(&self) -> &PreparedRestore { &self.roles }
@@ -200,7 +216,32 @@ impl Scheduler {
                 tasks.push(qualified);
             }
         }
-        Ok(TaskSet { scheduler: self, tasks, migration_ready: false })
+        Ok(TaskSet { scheduler: self, tasks, selected_roles: roles.iter().map(|role| (*role).to_owned()).collect(), migration_ready: false })
+    }
+    /// Receive both exact root task names independently. Only the existing
+    /// scheduler qualification can bind either definition to a managed image.
+    pub(crate) fn receive_stopped_managed(&self, program: &CheckedPath, expected: Option<&StoppedManagedTasks>,
+        mut observe: impl FnMut(&'static str, &Result<DefinitionView>)) -> Result<StoppedManagedTasks> {
+        let programs = Programs { managed: Some(program), legacy: None };
+        programs.revalidate()?;
+        let [relay, watchdog] = ["relay", "watchdog"].map(|role| {
+            let observation = (|| {
+                let task = self.find(role_name(role)?.0)?.ok_or_else(|| format!("OwnershipRequired: {role} task is absent"))?;
+                let qualified = self.qualify(role, task, &programs)?;
+                if !qualified.has_logon_trigger { return Err(format!("OwnershipRequired: {role} has no logon trigger")); }
+                Ok(qualified.view)
+            })();
+            observe(role, &observation);
+            observation
+        });
+        let actual = match (relay, watchdog) {
+            (Ok(relay), Ok(watchdog)) => [relay, watchdog],
+            (Err(relay), Err(watchdog)) => return Err(format!("{relay}; {watchdog}")),
+            (Err(error), _) | (_, Err(error)) => return Err(error),
+        };
+        require_stopped_managed(&actual, expected)?;
+        program.recheck()?;
+        Ok(actual)
     }
     fn qualify(&self, role: &str, task: IRegisteredTask, programs: &Programs<'_>) -> Result<Qualified> {
         let (name, flag) = role_name(role)?;
@@ -229,6 +270,7 @@ impl Scheduler {
             return Err("OwnershipRequired: unsupported selected task settings".into());
         }
         let triggers = unsafe { definition.Triggers() }.map_err(|error| err("task triggers", error))?;
+        let mut has_logon_trigger = false;
         for index in 1..=out(|value| unsafe { triggers.Count(value) })? {
             let trigger = unsafe { triggers.get_Item(index) }.map_err(|error| err("task trigger", error))?;
             let kind = out(|value| unsafe { trigger.Type(value) })?;
@@ -238,6 +280,7 @@ impl Scheduler {
                 return Err("OwnershipRequired: due-time trigger repetition is unsupported".into());
             }
             if kind == TASK_TRIGGER_LOGON {
+                has_logon_trigger = true;
                 let logon: ILogonTrigger = trigger.cast().map_err(|error| err("logon trigger", error))?;
                 let delay = bstr(|value| unsafe { logon.Delay(value) })?;
                 if !delay.is_empty() && delay != "PT0S" { return Err("OwnershipRequired: delayed logon trigger is not ready for migration".into()); }
@@ -253,7 +296,7 @@ impl Scheduler {
         }
         let view = DefinitionView { role: role.into(), program, origin, xml, security, principal: user, logon: logon.0,
             instances: retained.iter().map(|instance| instance.view.clone()).collect() };
-        Ok(Qualified { native: task, definition, view, retained })
+        Ok(Qualified { native: task, definition, original: view.clone(), view, update_acknowledged: false, retained, has_logon_trigger })
     }
     fn register(&self, role: &str, definition: &ITaskDefinition, flags: i32, principal: &str, logon: TASK_LOGON_TYPE,
         security: &str, receiving: &mut impl Receiving) -> Result<IRegisteredTask> {
@@ -261,7 +304,7 @@ impl Scheduler {
         let user = VARIANT::from(principal);
         let password = VARIANT::default();
         let sddl = VARIANT::from(security);
-        let task = invoke(receiving, "RegisterTaskDefinition", role, None, false, || {
+        let task = invoke(receiving, "RegisterTaskDefinition", role, None, None, || {
             let mut raw = std::ptr::null_mut();
             let hr = unsafe { (Interface::vtable(&self.folder).RegisterTaskDefinition)(
                 Interface::as_raw(&self.folder), name.as_ptr().cast_mut().cast(), Interface::as_raw(definition), flags,
@@ -305,7 +348,7 @@ impl Scheduler {
         if current.view.xml != task.view.xml || current.view.security != task.view.security { return Err("OwnershipRequired: selected definition changed before Run".into()); }
         if !current.retained.is_empty() { return Err("OwnershipRequired: Run requires positive zero-instance receiving".into()); }
         let parameters = VARIANT::default();
-        let instance = invoke(receiving, "Run", &task.view.role, None, false, || {
+        let instance = invoke(receiving, "Run", &task.view.role, None, None, || {
             let mut raw = std::ptr::null_mut();
             let hr = unsafe { (Interface::vtable(&current.native).Run)(Interface::as_raw(&current.native), std::mem::transmute_copy(&parameters), &mut raw) };
             let present = !raw.is_null();
@@ -327,7 +370,7 @@ impl Scheduler {
     fn initialize_definition(&self, role: &str, definition: &ITaskDefinition, program: &Path, receiving: &mut impl Receiving) -> Result<()> {
         macro_rules! set { ($object:expr,$method:ident,$value:expr) => {{
             let object = &$object; let value = $value;
-            invoke(receiving, stringify!($method), role, None, false, || {
+            invoke(receiving, stringify!($method), role, None, None, || {
                 let hr = unsafe { (Interface::vtable(object).$method)(Interface::as_raw(object), value) }; (hr, (), false)
             })?;
         }}; }
@@ -347,14 +390,14 @@ impl Scheduler {
         set!(settings, SetRestartCount, 3);
         set_text!(settings, SetRestartInterval, "PT1M");
         let triggers = unsafe { definition.Triggers() }.map_err(|error| err("fresh triggers", error))?;
-        let trigger = invoke(receiving, "CreateLogonTrigger", role, None, false, || {
+        let trigger = invoke(receiving, "CreateLogonTrigger", role, None, None, || {
             let mut raw = std::ptr::null_mut();
             let hr = unsafe { (Interface::vtable(&triggers).Create)(Interface::as_raw(&triggers), TASK_TRIGGER_LOGON, &mut raw) };
             let present = !raw.is_null(); (hr, if present { Some(unsafe { ITrigger::from_raw(raw) }) } else { None }, present)
         })?.ok_or("fresh logon trigger output absent")?;
         set!(trigger, SetEnabled, VARIANT_BOOL::from(true));
         let actions = unsafe { definition.Actions() }.map_err(|error| err("fresh actions", error))?;
-        let action = invoke(receiving, "CreateExecAction", role, None, false, || {
+        let action = invoke(receiving, "CreateExecAction", role, None, None, || {
             let mut raw = std::ptr::null_mut();
             let hr = unsafe { (Interface::vtable(&actions).Create)(Interface::as_raw(&actions), TASK_ACTION_EXEC, &mut raw) };
             let present = !raw.is_null(); (hr, if present { Some(unsafe { IAction::from_raw(raw) }) } else { None }, present)
@@ -368,6 +411,65 @@ impl Scheduler {
 }
 
 impl TaskSet<'_> {
+    /// Receive one exact selected relay instance's current engine PID. This
+    /// observation is not, by itself, authority over any process or listener.
+    pub(crate) fn relay_engine_pid(&self, programs: &Programs<'_>) -> Result<(String, u32)> {
+        self.transition_participants(programs)?;
+        let task = self.tasks.iter().find(|task| task.view.role == "relay").ok_or("relay task absent")?;
+        let mut running = task.retained.iter().filter(|instance| instance.view.state == TASK_STATE_RUNNING.0);
+        let instance = running.next().ok_or("relay task has no running instance")?;
+        if running.next().is_some() { return Err("multiple running relay instances".into()); }
+        let refreshed = instance_view(&instance.native, role_name("relay")?.0)?;
+        let current_instances = self.scheduler.qualify("relay", self.scheduler.find(role_name("relay")?.0)?.ok_or("relay task disappeared")?, programs)?;
+        let actual: Vec<_> = current_instances.view.instances.iter().filter(|view| view.state == TASK_STATE_RUNNING.0).collect();
+        if actual.len() != 1 || actual[0].guid != instance.view.guid || actual[0].path != instance.view.path
+            || actual[0].action_name != instance.view.action_name { return Err("relay instance set or action changed".into()); }
+        instance.view.action_name.as_ref().map_err(|error| format!("initial current action: {error}"))?;
+        refreshed.action_name.as_ref().map_err(|error| format!("current action: {error}"))?;
+        if refreshed.guid != instance.view.guid || refreshed.path != instance.view.path || refreshed.state != TASK_STATE_RUNNING.0
+            || refreshed.action_name != instance.view.action_name {
+            return Err("relay task instance or action changed".into());
+        }
+        let initial = instance.view.engine_pid.as_ref().map_err(|error| format!("initial EnginePID: {error}"))?;
+        let current = refreshed.engine_pid.map_err(|error| format!("current EnginePID: {error}"))?;
+        let requalified = actual[0].engine_pid.as_ref().map_err(|error| format!("requalified EnginePID: {error}"))?;
+        require_matching_engine_pid(*initial, current, *requalified)?;
+        Ok((refreshed.guid, current))
+    }
+    pub(crate) fn role_observation(&self, role: &str) -> super::RoleObservation {
+        match self.tasks.iter().find(|task| task.view.role == role) {
+            None => super::RoleObservation::Absent,
+            Some(task) if task.view.instances.iter().any(|instance| instance.state == TASK_STATE_RUNNING.0) => super::RoleObservation::Running,
+            Some(_) => super::RoleObservation::Registered,
+        }
+    }
+    pub(crate) fn transition_participants<'a>(&'a self, programs: &Programs<'_>) -> Result<TransitionParticipants<'a>> {
+        let mut current = Vec::with_capacity(self.tasks.len());
+        revalidate_selected_instances(self.scheduler, &self.tasks, &self.selected_roles, programs, |mut view| {
+            view.instances.sort_by(|first, second| first.guid.cmp(&second.guid));
+            current.push(view);
+        })?;
+        for task in &self.tasks {
+            if programs.classify(&task.original.program)? != task.original.origin ||
+                programs.classify(&task.view.program)? != task.view.origin ||
+                task.original.role != task.view.role || task.original.security != task.view.security ||
+                task.original.principal != task.view.principal || task.original.logon != task.view.logon {
+                return Err("OwnershipRequired: transition participant association changed".into());
+            }
+            if !task.update_acknowledged && (task.original.xml != task.view.xml || task.original.origin != task.view.origin) {
+                return Err("OwnershipRequired: transition definition changed without acknowledged update".into());
+            }
+            if task.update_acknowledged && (task.original.origin != Origin::Legacy || task.view.origin != Origin::Managed) {
+                return Err("OwnershipRequired: acknowledged transition origins differ".into());
+            }
+            for instance in &task.original.instances {
+                if !task.retained.iter().any(|held| held.view.guid == instance.guid && held.view.path == instance.path) {
+                    return Err("OwnershipRequired: original task instance association changed".into());
+                }
+            }
+        }
+        Ok(TransitionParticipants { tasks: &self.tasks, current })
+    }
     pub(crate) fn managed_binding<'a>(&'a self, program: &'a CheckedPath) -> Result<Option<ManagedBinding<'a>>> {
         let mut definitions = Vec::new();
         for task in &self.tasks {
@@ -391,20 +493,38 @@ impl TaskSet<'_> {
         Ok(())
     }
     pub(crate) fn has_legacy(&self) -> bool { self.tasks.iter().any(|task| task.view.origin == Origin::Legacy) }
-    pub(crate) fn prepare_managed_restore<'a>(&self, desired: BackgroundDesired, programs: &'a Programs<'_>) -> Result<ManagedRestore<'a>> {
+    pub(crate) fn prepare_managed_restore<'a>(&self, changes: BackgroundChanges, programs: &'a Programs<'_>) -> Result<ManagedRestore<'a>> {
+        let roles = self.prepare_restoration(changes, programs)?;
+        let desired = roles.desired;
         let has_duty = self.tasks.iter().any(|task| (task.view.role == "relay" && desired.relay) || (task.view.role == "watchdog" && desired.watchdog));
         let program = if has_duty { Some(programs.managed.ok_or("NeedsMigration: no received Managed restoration program; zero Stop/primary")?) } else { None };
         if let Some(program) = program { program.recheck()?; }
-        let roles = self.prepare_restoration(desired, programs)?;
         Ok(ManagedRestore { program, roles })
     }
     /// Shared pre-Stop prerequisite for temporary suspension and generation
     /// replacement. Definition receipts survive replacement; they do not pin or
     /// authorize a different executable. Restoration receives that actual image.
-    pub(crate) fn prepare_restoration(&self, desired: BackgroundDesired, programs: &Programs<'_>) -> Result<PreparedRestore> {
+    pub(crate) fn prepare_restoration(&self, changes: BackgroundChanges, programs: &Programs<'_>) -> Result<PreparedRestore> {
         programs.revalidate()?;
+        self.transition_participants(programs)?;
+        let keep = |role: &str, change: Option<bool>| -> Result<bool> {
+            if let Some(value) = change { return Ok(value); }
+            let Some(task) = self.tasks.iter().find(|task| task.view.role == role) else { return Ok(false); };
+            let current = self.scheduler.qualify(role, self.scheduler.find(role_name(role)?.0)?.ok_or("Keep task disappeared")?, programs)?;
+            if current.view.xml != task.view.xml || current.view.security != task.view.security
+                || current.view.origin != task.view.origin || current.view.principal != task.view.principal
+                || current.view.logon != task.view.logon {
+                return Err("Keep task definition changed before restoration preparation".into());
+            }
+            let mut before = task.view.instances.iter().map(|i| (i.guid.clone(), i.state)).collect::<Vec<_>>();
+            let mut after = current.view.instances.iter().map(|i| (i.guid.clone(), i.state)).collect::<Vec<_>>();
+            before.sort(); after.sort();
+            if before != after { return Err("Keep task instances changed before restoration preparation".into()); }
+            keep_restore_wanted(&before.iter().map(|(_, state)| *state).collect::<Vec<_>>())
+        };
+        let desired = BackgroundDesired { relay: keep("relay", changes.relay)?, watchdog: keep("watchdog", changes.watchdog)? };
         let definitions = self.tasks.iter().map(|task| task.view.clone()).collect::<Vec<_>>();
-        receive_restore_prerequisites(&definitions, desired, |expected| {
+        let mut prepared = receive_restore_prerequisites(&definitions, desired, |expected| {
             let current = self.scheduler.qualify(&expected.role,
                 self.scheduler.find(role_name(&expected.role)?.0)?.ok_or("restoration definition absent before Stop")?, programs)?;
             let settings = unsafe { current.definition.Settings() }.map_err(|error| err("restore eligibility settings", error))?;
@@ -412,7 +532,17 @@ impl TaskSet<'_> {
                 out(|value| unsafe { settings.RunOnlyIfIdle(value) })?.as_bool(),
                 out(|value| unsafe { settings.RunOnlyIfNetworkAvailable(value) })?.as_bool())?;
             Ok(current.view)
-        })
+        })?;
+        for (role, change) in [("relay", changes.relay), ("watchdog", changes.watchdog)] {
+            if change.is_none() && self.selected_roles.iter().any(|selected| selected == role) {
+                let snapshot = self.tasks.iter().find(|task| task.view.role == role).map(|task| {
+                    let mut states = task.view.instances.iter().map(|i| (i.guid.clone(), i.state)).collect::<Vec<_>>();
+                    states.sort(); states
+                });
+                prepared.keep_snapshots.push((role.to_owned(), snapshot));
+            }
+        }
+        Ok(prepared)
     }
     pub(crate) fn restore_prepared(&self, capability: &ManagedRestore<'_>, desired: BackgroundDesired,
         programs: &Programs<'_>, receiving: &mut impl Receiving) -> Result<()> {
@@ -429,14 +559,16 @@ impl TaskSet<'_> {
             let actual = programs.managed.ok_or("managed restoration input disappeared")?;
             if program.native_id() != actual.native_id() { return Err("managed restoration image identity changed".into()); }
         }
-        self.restore_received(&capability.roles, desired, programs, migration, receiving)
+        let _ = desired;
+        self.restore_received(&capability.roles, capability.roles.desired, programs, migration, receiving)
     }
     /// Used after the same owner's guarded replacement has received the current
     /// image. The retained definitions still need individual fresh validation.
     pub(crate) fn restore_replaced(&self, roles: &PreparedRestore, desired: BackgroundDesired,
         programs: &Programs<'_>, migration: bool, receiving: &mut impl Receiving) -> Result<()> {
         programs.managed.ok_or("managed replacement restoration image absent")?.recheck()?;
-        self.restore_received(roles, desired, programs, migration, receiving)
+        let _ = desired;
+        self.restore_received(roles, roles.desired, programs, migration, receiving)
     }
     fn restore_received(&self, roles: &PreparedRestore, desired: BackgroundDesired,
         programs: &Programs<'_>, migration: bool, receiving: &mut impl Receiving) -> Result<()> {
@@ -487,18 +619,20 @@ impl TaskSet<'_> {
                 // Preserve the OLD retained instances and their original
                 // image association; only registered definition facts change.
                 task.view = DefinitionView { instances: task.retained.iter().map(|instance| instance.view.clone()).collect(), ..after.view };
+                task.update_acknowledged = true;
             }
             Ok(())
-        }, |tasks| revalidate_selected_instances(scheduler, tasks, programs))?;
+        }, |tasks| revalidate_selected_instances(scheduler, tasks, &self.selected_roles, programs, |_| ()))?;
         self.migration_ready = true;
         Ok(())
     }
     fn revalidate_instances(&self, programs: &Programs<'_>) -> Result<()> {
-        revalidate_selected_instances(self.scheduler, &self.tasks, programs)
+        revalidate_selected_instances(self.scheduler, &self.tasks, &self.selected_roles, programs, |_| ())
     }
-    pub(crate) fn retire(&mut self, programs: &Programs<'_>, migration: bool, receiving: &mut impl Receiving) -> Result<Vec<String>> {
+    pub(crate) fn retire(&mut self, programs: &Programs<'_>, migration: bool, prepared: Option<&PreparedRestore>, receiving: &mut impl Receiving) -> Result<Vec<String>> {
         if migration && !self.migration_ready { return Err("OwnershipRequired: all definitions have not reached ReadyForRetirement".into()); }
         self.revalidate_instances(programs)?;
+        if let Some(prepared) = prepared { self.verify_keep_snapshots(prepared, programs, &[])?; }
         // Re-receive all native task-owned instances. CurrentAction is only an
         // action-name observation; it cannot select or exempt an image.
         for task in &mut self.tasks {
@@ -508,7 +642,7 @@ impl TaskSet<'_> {
             }
         }
         let mut retired = Vec::new();
-        for task in &mut self.tasks {
+        for task in &self.tasks {
             for old in &task.retained {
                 let active = running(&task.native)?.into_iter().map(|instance|
                     text(unsafe { instance.InstanceGuid() }.map_err(|error| err("retained instance lookup", error))?))
@@ -517,7 +651,9 @@ impl TaskSet<'_> {
                 unsafe { old.native.Refresh() }.map_err(|error| err("refresh retained old instance", error))?;
                 let observed = instance_view(&old.native, role_name(&task.view.role)?.0)?;
                 if observed.guid != old.view.guid || observed.path != old.view.path { return Err("OwnershipRequired: retained native task-instance identity changed".into()); }
-                invoke(receiving, "StopExactInstance", &task.view.role, Some(old.view.guid.clone()), true, || {
+                if let Some(prepared) = prepared { self.verify_keep_snapshots(prepared, programs, &retired)?; }
+                let participants = self.transition_participants(programs)?;
+                invoke(receiving, "StopExactInstance", &task.view.role, Some(old.view.guid.clone()), Some(&participants), || {
                     let hr = unsafe { (Interface::vtable(&old.native).Stop)(Interface::as_raw(&old.native)) }; (hr, (), false)
                 })?;
                 loop {
@@ -532,14 +668,28 @@ impl TaskSet<'_> {
         }
         Ok(retired)
     }
+    fn verify_keep_snapshots(&self, prepared: &PreparedRestore, programs: &Programs<'_>, retired: &[String]) -> Result<()> {
+        for (role, expected) in &prepared.keep_snapshots {
+            let current = match self.scheduler.find(role_name(role)?.0)? {
+                Some(task) => {
+                    let qualified = self.scheduler.qualify(role, task, programs)?;
+                    let mut states = qualified.view.instances.iter().map(|i| (i.guid.clone(), i.state)).collect::<Vec<_>>();
+                    states.sort(); Some(states)
+                }
+                None => None,
+            };
+            if !keep_snapshot_matches(expected, &current, retired) { return Err(format!("Keep {role} state changed before retirement")); }
+        }
+        Ok(())
+    }
     pub(crate) fn remove(self, programs: &Programs<'_>, receiving: &mut impl Receiving) -> Result<TaskReceipt> {
         let mut this = self;
-        let retired = this.retire(programs, false, receiving)?;
+        let retired = this.retire(programs, false, None, receiving)?;
         for task in &this.tasks {
             let current = this.scheduler.qualify(&task.view.role, this.scheduler.find(role_name(&task.view.role)?.0)?.ok_or("definition absent before removal")?, programs)?;
             if current.view.xml != task.view.xml || current.view.security != task.view.security || !current.retained.is_empty() { return Err("OwnershipRequired: changed/running task before removal".into()); }
             let name = BSTR::from(role_name(&task.view.role)?.0);
-            invoke(receiving, "DeleteQualifiedTask", &task.view.role, None, false, || {
+            invoke(receiving, "DeleteQualifiedTask", &task.view.role, None, None, || {
                 let hr = unsafe { (Interface::vtable(&this.scheduler.folder).DeleteTask)(Interface::as_raw(&this.scheduler.folder), name.as_ptr().cast_mut().cast(), 0) }; (hr, (), false)
             })?;
             if this.scheduler.find(role_name(&task.view.role)?.0)?.is_some() { return Err("PreparationIncomplete: removed task still exists".into()); }
@@ -548,17 +698,50 @@ impl TaskSet<'_> {
     }
 }
 
+fn require_stopped_managed(actual: &StoppedManagedTasks, expected: Option<&StoppedManagedTasks>) -> Result<()> {
+    for (task, role) in actual.iter().zip(["relay", "watchdog"]) {
+        if task.role != role || task.origin != Origin::Managed {
+            return Err(format!("OwnershipRequired: {role} is not the qualified managed definition"));
+        }
+        if !task.instances.is_empty() {
+            return Err(format!("UpdatePending: {role} has a native task instance"));
+        }
+    }
+    if expected.is_some_and(|before| before != actual) {
+        return Err("ChangedInput: stopped task definitions, principals or security changed".into());
+    }
+    Ok(())
+}
+
+fn require_matching_engine_pid(initial: u32, current: u32, requalified: u32) -> Result<()> {
+    if initial == 0 || current == 0 || initial != current || requalified != current {
+        Err("relay EnginePID missing or changed".into())
+    } else { Ok(()) }
+}
+
+fn keep_restore_wanted(states: &[i32]) -> Result<bool> {
+    if states.iter().any(|state| *state != TASK_STATE_RUNNING.0) {
+        return Err("Keep task has queued or unreceived instance state".into());
+    }
+    Ok(!states.is_empty())
+}
+
+fn keep_snapshot_matches(expected: &Option<Vec<(String, i32)>>, current: &Option<Vec<(String, i32)>>, retired: &[String]) -> bool {
+    let remaining = expected.as_ref().map(|states| states.iter().filter(|(guid, _)| !retired.contains(guid)).cloned().collect::<Vec<_>>());
+    *current == remaining
+}
+
 fn prepare_action_update(definition: &ITaskDefinition, target: &Path, security: &str,
     role: &str, receiving: &mut impl Receiving) -> Result<String> {
     let actions = unsafe { definition.Actions() }.map_err(|error| err("update actions", error))?;
     let action: IExecAction = unsafe { actions.get_Item(1) }.map_err(|error| err("update Exec", error))?.cast().map_err(|error| err("update Exec interface", error))?;
     let path = BSTR::from_wide(&target.as_os_str().encode_wide().collect::<Vec<_>>());
-    invoke(receiving, "SetDetachedActionPath", role, None, false, || {
+    invoke(receiving, "SetDetachedActionPath", role, None, None, || {
         let hr = unsafe { (Interface::vtable(&action).SetPath)(Interface::as_raw(&action), path.as_ptr().cast_mut().cast()) }; (hr, (), false)
     })?;
     let registration = unsafe { definition.RegistrationInfo() }.map_err(|error| err("update registration info", error))?;
     let descriptor = VARIANT::from(security);
-    invoke(receiving, "SetDetachedRegistrationSecurityDescriptor", role, None, false, || {
+    invoke(receiving, "SetDetachedRegistrationSecurityDescriptor", role, None, None, || {
         let hr = unsafe { (Interface::vtable(&registration).SetSecurityDescriptor)(Interface::as_raw(&registration), std::mem::transmute_copy(&descriptor)) }; (hr, (), false)
     })?;
     bstr(|value| unsafe { definition.XmlText(value) })
@@ -579,13 +762,20 @@ fn receive_task_update_batch<T, R: Receiving>(tasks: &mut [T], receiving: &mut R
     receiving.check_cancel()?;
     receiving.receive(Event::DefinitionsReadyForRetirement)
 }
-fn revalidate_selected_instances(scheduler: &Scheduler, tasks: &[Qualified], programs: &Programs<'_>) -> Result<()> {
+fn revalidate_selected_instances(scheduler: &Scheduler, tasks: &[Qualified], selected_roles: &[String], programs: &Programs<'_>,
+    mut receive: impl FnMut(DefinitionView)) -> Result<()> {
     programs.revalidate()?;
+    for role in selected_roles {
+        if !tasks.iter().any(|task| task.view.role == *role) && scheduler.find(role_name(role)?.0)?.is_some() {
+            return Err("OwnershipRequired: previously absent selected task appeared".into());
+        }
+    }
     for task in tasks {
         let current = scheduler.qualify(&task.view.role, scheduler.find(role_name(&task.view.role)?.0)?.ok_or("definition absent before retirement")?, programs)?;
         if current.view.xml != task.view.xml || current.view.security != task.view.security { return Err("OwnershipRequired: current definition changed after update".into()); }
         // Every current instance came from this freshly qualified task's native
         // GetInstances collection. Its image/generation remains Unknown.
+        receive(current.view);
     }
     Ok(())
 }
@@ -602,13 +792,15 @@ fn instance_view(instance: &IRunningTask, name: &str) -> Result<InstanceView> {
     let path = text(unsafe { instance.Path() }.map_err(|error| err("instance task path", error))?)?;
     let action_name = unsafe { instance.CurrentAction() }.map_err(|error| err("instance action name", error)).and_then(text);
     let state = unsafe { instance.State() }.map_err(|error| err("instance state", error))?.0;
-    task_instance_observation(guid, path, action_name, state, name)
+    let mut view = task_instance_observation(guid, path, action_name, state, name)?;
+    view.engine_pid = unsafe { instance.EnginePID() }.map_err(|error| err("instance EnginePID", error));
+    Ok(view)
 }
 fn task_instance_observation(guid: String, path: String, action_name: Result<String>, state: i32, name: &str) -> Result<InstanceView> {
     if guid.is_empty() { return Err("OwnershipRequired: empty native instance GUID".into()); }
     if path != format!("\\{name}") { return Err("OwnershipRequired: native instance task path differs".into()); }
     if state != TASK_STATE_RUNNING.0 && state != TASK_STATE_QUEUED.0 { return Err("OwnershipRequired: terminal/unknown native task instance".into()); }
-    Ok(InstanceView { guid, path, action_name, state, image: "Unknown" })
+    Ok(InstanceView { guid, path, action_name, state, image: "Unknown", engine_pid: Err("EnginePID not received".into()) })
 }
 fn require_managed_restore_origin(origin: Origin, wanted: bool) -> Result<()> {
     if wanted && origin != Origin::Managed { Err("NeedsMigration: wanted role has no Managed restore definition; zero Stop/primary".into()) }
@@ -636,7 +828,7 @@ fn receive_restore_prerequisites(definitions: &[DefinitionView], desired: Backgr
             prepared.push(current);
         }
     }
-    Ok(PreparedRestore { definitions: prepared })
+    Ok(PreparedRestore { definitions: prepared, desired, keep_snapshots: Vec::new() })
 }
 /// One changed role cannot veto another already-owed, independently safe role.
 /// The native closure performs its own complete qualification and Run receiving.
@@ -718,6 +910,56 @@ fn qualify_security(sddl: &str, current: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stopped_delivery_requires_both_exact_definitions_and_no_native_instances() {
+        let before = ["relay", "watchdog"].map(|role| DefinitionView { role: role.into(),
+            program: PathBuf::from("managed.exe"), origin: Origin::Managed, xml: format!("{role} XML"),
+            security: "owner security".into(), principal: "owner".into(), logon: TASK_LOGON_S4U.0, instances: Vec::new() });
+        assert!(require_stopped_managed(&before, Some(&before)).is_ok());
+        let mut after = before.clone();
+        after[0].origin = Origin::Legacy;
+        assert!(require_stopped_managed(&after, None).is_err());
+        let mut after = before.clone();
+        after[1].security.push_str("changed");
+        assert!(require_stopped_managed(&after, Some(&before)).is_err());
+        let mut after = before.clone();
+        after[0].xml.push_str("changed");
+        assert!(require_stopped_managed(&after, Some(&before)).is_err());
+        for (index, state) in [TASK_STATE_RUNNING.0, TASK_STATE_QUEUED.0].into_iter().enumerate() {
+            let (name, _) = role_name(&before[index].role).unwrap();
+            let mut after = before.clone();
+            after[index].instances.push(task_instance_observation("synthetic".into(), format!("\\{name}"), Ok("action".into()), state, name).unwrap());
+            assert!(require_stopped_managed(&after, Some(&before)).is_err());
+        }
+    }
+    #[test]
+    fn engine_pid_receiving_rejects_zero_and_changed_values() {
+        assert!(require_matching_engine_pid(42, 42, 42).is_ok());
+        assert!(require_matching_engine_pid(0, 0, 0).is_err());
+        assert!(require_matching_engine_pid(42, 43, 42).is_err());
+        assert!(require_matching_engine_pid(42, 42, 43).is_err());
+    }
+    #[test]
+    fn keep_restoration_uses_running_instances_not_task_presence() {
+        assert!(!keep_restore_wanted(&[]).unwrap(), "absent or registered-stopped has no Run duty");
+        assert!(keep_restore_wanted(&[TASK_STATE_RUNNING.0]).unwrap());
+        assert!(keep_restore_wanted(&[TASK_STATE_QUEUED.0]).is_err(), "queued state cannot be guessed");
+        for desired in [BackgroundDesired { relay: true, watchdog: false }, BackgroundDesired { relay: false, watchdog: true }] {
+            let prepared = PreparedRestore { definitions: Vec::new(), desired, keep_snapshots: Vec::new() };
+            let mut calls = Vec::new();
+            receive_prepared_restoration(&prepared, prepared.desired, true, |role, _| { calls.push(role.to_owned()); Ok(()) }).unwrap();
+            assert_eq!(calls, if desired.relay { vec!["relay".to_owned()] } else { vec!["watchdog".to_owned()] });
+        }
+    }
+    #[test]
+    fn keep_snapshot_rejects_new_task_or_unowned_started_instance() {
+        let absent = None;
+        let stopped = Some(Vec::new());
+        let running = Some(vec![("owned-guid".to_owned(), TASK_STATE_RUNNING.0)]);
+        assert!(!keep_snapshot_matches(&absent, &stopped, &[]), "absent is not registered-stopped");
+        assert!(!keep_snapshot_matches(&stopped, &running, &[]), "new instance cannot be retired without captured restoration duty");
+        assert!(keep_snapshot_matches(&running, &stopped, &["owned-guid".to_owned()]), "actual owned retirement is received");
+    }
     #[test]
     fn positive_hresult_warning_and_error_info_are_not_success() {
         let mut value = Call { operation: "syntheticRegister", role: "synthetic".into(), instance: None,
@@ -810,7 +1052,7 @@ mod tests {
         struct Fixture { cancelled: bool, ready: bool, stops: usize, trace: Rc<RefCell<Vec<String>>> }
         impl Receiving for Fixture {
             fn check_cancel(&mut self) -> Result<()> { if self.cancelled { Err("synthetic cancellation".into()) } else { Ok(()) } }
-            fn before_retirement(&mut self) -> Result<()> {
+            fn before_retirement(&mut self, _: &TransitionParticipants<'_>) -> Result<()> {
                 if !self.ready { return Err("not ReadyForRetirement".into()); }
                 self.stops += 1;
                 self.trace.borrow_mut().push("stop".into());
@@ -850,7 +1092,7 @@ mod tests {
                 if case == "association-mismatch" { Err("synthetic old-instance association changed".into()) } else { Ok(()) }
             });
             assert!(callbacks.iter().all(|count| *count <= 1), "one update/readback callback per selected role");
-            if result.is_ok() { fixture.before_retirement().unwrap(); }
+            if result.is_ok() { fixture.before_retirement(&TransitionParticipants { tasks: &[], current: Vec::new() }).unwrap(); }
             if case == "success" {
                 assert_eq!(callbacks, [1, 1]);
                 assert_eq!(&*trace.borrow(), &["update:relay", "readback:relay", "update:watchdog", "readback:watchdog", "associations", "ready", "stop"]);
@@ -859,10 +1101,58 @@ mod tests {
                 assert!(result.is_err(), "{case}");
                 assert!(!fixture.ready, "{case}: incomplete update batch cannot authorize retirement");
                 assert_eq!(fixture.stops, 0, "{case}: zero Stop");
-                assert!(fixture.before_retirement().is_err(), "{case}: native retirement guard remains closed");
+                assert!(fixture.before_retirement(&TransitionParticipants { tasks: &[], current: Vec::new() }).is_err(), "{case}: native retirement guard remains closed");
             }
             if case == "first-error" || case == "cancel-between" { assert_eq!(callbacks, [1, 0]); }
         }
+        // Pure common-owner projection: real task qualification and native Stop
+        // are intentionally outside this fixture's authority.
+        let original = DefinitionView { role: "relay".into(), program: PathBuf::from("synthetic-legacy-A"), origin: Origin::Legacy,
+            xml: "legacy-definition".into(), security: "same-security".into(), principal: "same-principal".into(),
+            logon: TASK_LOGON_S4U.0, instances: vec![task_instance_observation("synthetic-guid".into(),
+                format!("\\{TASK_NAME}"), Ok("action".into()), TASK_STATE_RUNNING.0, TASK_NAME).unwrap()] };
+        let mut current = [original.clone()];
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut fixture = Fixture { cancelled: false, ready: false, stops: 0, trace: trace.clone() };
+        receive_task_update_batch(&mut current, &mut fixture, |view, _| {
+            trace.borrow_mut().push("update".into());
+            view.program = PathBuf::from("synthetic-managed-B");
+            view.origin = Origin::Managed;
+            view.xml = "received-managed-definition".into();
+            trace.borrow_mut().push("readback".into());
+            Ok(())
+        }, |_| { trace.borrow_mut().push("associations".into()); Ok(()) }).unwrap();
+        assert_eq!(current[0].origin, Origin::Managed);
+        assert_eq!(original.instances[0].image, "Unknown");
+        let projection = || transition_association_paths(std::iter::once((&original, &current[0])));
+        assert_eq!(projection().collect::<Vec<_>>(), [original.program.as_path(), current[0].program.as_path()]);
+        let classify = |path: &Path| if path == original.program.as_path() {
+            super::super::ActualGeneration::Bound(crate::dns_forwarder::RELAY_VERSION + 1)
+        } else { super::super::ActualGeneration::SameCurrentImage };
+        let guard = super::super::selected_retirement_decision(projection().map(classify), |_| Ok(()));
+        if guard.is_ok() { fixture.before_retirement(&TransitionParticipants { tasks: &[], current: Vec::new() }).unwrap(); }
+        assert!(guard.unwrap_err().contains("newer"));
+        assert_eq!(fixture.stops, 0);
+        assert_eq!(&*trace.borrow(), &["update", "readback", "associations", "ready"]);
+        let mut replaced = original.clone();
+        replaced.program = PathBuf::from("different-original");
+        let lost_original = transition_association_paths(std::iter::once((&replaced, &current[0])));
+        assert!(super::super::selected_retirement_decision(lost_original.map(classify), |_| Ok(())).is_ok());
+        let fresh = || transition_association_paths(std::iter::once((&current[0], &current[0])));
+        assert!(!fresh().any(|path| path == original.program.as_path()));
+        for prior_stops in [0, 1] {
+            let mut effects = Vec::new();
+            let mut primary_calls = 0;
+            let fresh_check = super::super::selected_retirement_decision(projection().map(classify),
+                |proof| { effects.push(proof.clone()); Ok(()) });
+            if fresh_check.is_ok() { primary_calls += 1; }
+            assert!(fresh_check.unwrap_err().contains("newer"));
+            assert_eq!(primary_calls, 0, "{prior_stops} earlier Stops must not grant primary");
+            assert_eq!(effects, [super::super::ActualGeneration::Bound(crate::dns_forwarder::RELAY_VERSION + 1)]);
+        }
+        let failed_retention = super::super::selected_retirement_decision(projection().map(classify),
+            |_| Err("synthetic evidence retention failure".into()));
+        assert_eq!(failed_retention.unwrap_err(), "synthetic evidence retention failure");
     }
     #[test]
     #[ignore = "controlled in-memory native SDK definitions only; never registers/runs/stops a task or writes task files"]
@@ -871,7 +1161,7 @@ mod tests {
         struct Capture { events: Vec<Event> }
         impl Receiving for Capture {
             fn check_cancel(&mut self) -> Result<()> { Ok(()) }
-            fn before_retirement(&mut self) -> Result<()> { panic!("detached definition fixture cannot grant Stop") }
+            fn before_retirement(&mut self, _: &TransitionParticipants<'_>) -> Result<()> { panic!("detached definition fixture cannot grant Stop") }
             fn receive(&mut self, event: Event) -> Result<()> { self.events.push(event); Ok(()) }
         }
         let scheduler = Scheduler::connect().unwrap();
@@ -883,7 +1173,7 @@ mod tests {
         let captured_security = "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
         let mut prepared_xml = Vec::new();
         for embedded in [false, true] {
-            let definition = invoke(&mut capture, "FixtureNewDetachedDefinition", "relay", None, false, || {
+            let definition = invoke(&mut capture, "FixtureNewDetachedDefinition", "relay", None, None, || {
                 let mut raw = std::ptr::null_mut();
                 let hr = unsafe { (Interface::vtable(&scheduler.service).NewTask)(Interface::as_raw(&scheduler.service), 0, &mut raw) };
                 let present = !raw.is_null();
@@ -893,7 +1183,7 @@ mod tests {
             let registration = unsafe { definition.RegistrationInfo() }.unwrap();
             if embedded {
                 let descriptor = VARIANT::from(captured_security);
-                invoke(&mut capture, "FixtureEmbedCapturedSecurityDescriptor", "relay", None, false, || {
+                invoke(&mut capture, "FixtureEmbedCapturedSecurityDescriptor", "relay", None, None, || {
                     let hr = unsafe { (Interface::vtable(&registration).SetSecurityDescriptor)(Interface::as_raw(&registration), std::mem::transmute_copy(&descriptor)) };
                     (hr, (), false)
                 }).unwrap();

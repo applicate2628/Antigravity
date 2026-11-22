@@ -26,8 +26,10 @@ pub(crate) enum OpenFailure {
     Unavailable(Option<String>),
     DeniedTarget,
     UnsupportedPrivateRoutes,
-    #[cfg(target_os = "macos")]
-    Configuration(String),
+    Resolution(io::Error),
+    /// The actual resolver error is retained when the same lookup also
+    /// returned after cancellation or its original deadline.
+    ResolutionLate { cancelled: bool, error: io::Error },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,15 +114,14 @@ impl CommittedRoute {
         })
     }
 
-    pub(crate) fn transfer_native(self) -> io::Result<()> {
+    pub(crate) fn transfer_native(self) -> io::Result<super::ConnectionSuccess> {
         if self.eof != FrontendEof::NativeCompatible {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "wrong frontend EOF contract"));
         }
         match self.transport {
             CommittedTransport::Tcp(mut socket) => {
                 socket.write_all(&self.prefetched)?;
-                splice(self.client, socket);
-                Ok(())
+                super::splice_received(self.client, socket).map(super::ConnectionSuccess::Tcp)
             }
             CommittedTransport::Group(opened) => {
                 // The native CONNECT parser reads one byte at a time, so it has
@@ -129,7 +130,7 @@ impl CommittedRoute {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput, "unexpected native prefetch"));
                 }
                 opened.transfer(self.client);
-                Ok(())
+                Ok(super::ConnectionSuccess::LegacyPrivate)
             }
         }
     }
@@ -147,6 +148,11 @@ pub(crate) fn commit<'a>(
     cancelled: &AtomicBool,
 ) -> Result<CommittedRoute, CommitFailure> {
     let mut count = 0;
+    if let OpenedRoute::Tcp { socket, kind: Some(routes::Kind::Direct), .. } = &opened {
+        if let Err(error) = routes::validate_serving_dns(socket) {
+            return Err(commit_failed(&opened, &client, 0, CommitCause::Io(io::Error::other(error))));
+        }
+    }
     if let OpenedRoute::Tcp { socket, direct_proof: Some((literal, checks)), .. } = &opened {
         let peer = socket.peer_addr().map_err(|error| commit_failed(&opened, &client, 0, CommitCause::Io(error)))?;
         if !(checks.address)(*literal) || !(checks.peer)(*literal, peer) {
@@ -174,7 +180,10 @@ pub(crate) fn commit<'a>(
             let left = remaining(deadline, cancelled).map_err(CommitCause::Boundary)?;
             client.set_write_timeout(Some(left)).map_err(CommitCause::Io)
         },
-        |client| client.set_write_timeout(None).map_err(CommitCause::Io),
+        |client| {
+            remaining(deadline, cancelled).map_err(CommitCause::Boundary)?;
+            client.set_write_timeout(None).map_err(CommitCause::Io)
+        },
         CommitCause::Io,
     );
     if let Err(error) = result {
@@ -202,19 +211,84 @@ fn remaining(deadline: Instant, cancelled: &AtomicBool) -> Result<Duration, Open
         .ok_or(OpenFailure::Deadline)
 }
 
+pub(super) fn resolve_system_with(
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    lookup: impl FnOnce() -> io::Result<Vec<std::net::SocketAddr>>,
+) -> Result<Vec<std::net::SocketAddr>, OpenFailure> {
+    remaining(deadline, cancelled)?;
+    let result = lookup();
+    match (result, remaining(deadline, cancelled)) {
+        (Ok(addresses), Ok(_)) => Ok(addresses),
+        (Ok(_), Err(boundary)) => Err(boundary),
+        (Err(error), Err(boundary)) => Err(OpenFailure::ResolutionLate {
+            cancelled: matches!(boundary, OpenFailure::Cancelled), error,
+        }),
+        (Err(error), Ok(_)) => Err(OpenFailure::Resolution(error)),
+    }
+}
+
+/// Synchronous OS resolution is cooperative: cancellation/deadline cannot
+/// interrupt the provider, but late addresses are never opened or committed.
+pub(crate) fn open_system<'a>(
+    host: &str, port: u16, deadline: Instant, cancelled: &AtomicBool,
+    checks: Option<&'a DirectChecks<'a>>,
+) -> Result<TcpStream, OpenFailure> {
+    open_os_with_budget(host, port, deadline, cancelled, checks, DIRECT_OPEN_BUDGET)
+}
+
+pub(super) fn open_os_with_budget<'a>(
+    host: &str, port: u16, deadline: Instant, cancelled: &AtomicBool,
+    checks: Option<&'a DirectChecks<'a>>, maximum: Duration,
+) -> Result<TcpStream, OpenFailure> {
+    open_os_with_lookup(deadline, cancelled, checks, maximum, || {
+        (host, port).to_socket_addrs().map(|items| items.collect())
+    })
+}
+
+pub(super) fn open_os_with_lookup<'a>(deadline: Instant, cancelled: &AtomicBool,
+    checks: Option<&'a DirectChecks<'a>>, maximum: Duration,
+    lookup: impl FnOnce() -> io::Result<Vec<std::net::SocketAddr>>,
+) -> Result<TcpStream, OpenFailure> {
+    let mut addresses = resolve_system_with(deadline, cancelled, lookup)?;
+    let original = addresses.len();
+    addresses.retain(|address| {
+        !recursive_target(*address) && checks.is_none_or(|checks| (checks.address)(*address))
+    });
+    if original != 0 && addresses.is_empty() { return Err(OpenFailure::DeniedTarget); }
+    let budget = remaining(deadline, cancelled)?.min(maximum);
+    let opened = connect_addrs_checked(addresses, budget, 0,
+        |address| !cancelled.load(Ordering::Acquire) && Instant::now() < deadline
+            && checks.is_none_or(|checks| (checks.address)(address)),
+        |address, socket| !cancelled.load(Ordering::Acquire) && Instant::now() < deadline
+            && socket.peer_addr().is_ok_and(|peer| peer == address && !recursive_target(peer)
+                && checks.is_none_or(|checks| (checks.peer)(address, peer))));
+    remaining(deadline, cancelled)?;
+    opened.map_err(|error| OpenFailure::Unavailable(Some(error)))
+}
+
+fn recursive_target(address: std::net::SocketAddr) -> bool {
+    let ipv4 = match address.ip() {
+        std::net::IpAddr::V4(value) => Some(value),
+        std::net::IpAddr::V6(value) => value.to_ipv4_mapped(),
+    };
+    (address.port() == super::port() && ipv4 == Some(std::net::Ipv4Addr::LOCALHOST))
+        || (address.port() == 443 && crate::loopback::HOSTS.iter().any(|(_, ip)| Some(*ip) == ipv4))
+}
+
 fn walk_routes<T>(
     order: impl IntoIterator<Item = routes::Kind>,
     deadline: Instant,
     cancelled: &AtomicBool,
     mut attempt: impl FnMut(routes::Kind, Duration) -> Option<T>,
-    mut failed: impl FnMut(routes::Kind) -> Result<(), OpenFailure>,
+    mut failed: impl FnMut(routes::Kind),
 ) -> Result<Option<T>, OpenFailure> {
     for kind in order {
         let budget = remaining(deadline, cancelled)?;
         let opened = attempt(kind, budget);
         remaining(deadline, cancelled)?;
         if opened.is_some() { return Ok(opened); }
-        failed(kind)?;
+        failed(kind);
     }
     Ok(None)
 }
@@ -230,13 +304,21 @@ fn direct(
     cancelled: &AtomicBool,
     checks: Option<&DirectChecks<'_>>,
     vpn: bool,
+    _resolver: Option<&crate::resolvers::ResolverWork>,
+    allow_missing_defaults: bool,
 ) -> Result<TcpStream, DirectFailure> {
-    let (mut addrs, pin) = if vpn {
-        (crate::resolvers::genuine_a(target.host()).into_iter()
-            .map(|a| std::net::SocketAddr::from((a, 443))).collect(), 0)
-    } else {
-        gate_direct_addrs(target.host(), 443).map_err(DirectFailure::Open)?
-    };
+    if !vpn {
+        let opened = super::open_qualified_dns(target.host(), deadline, cancelled, checks, allow_missing_defaults, DIRECT_OPEN_BUDGET)
+            .map_err(|error| match error { super::CandidateOpenError::Denied => DirectFailure::Denied,
+                super::CandidateOpenError::Failure(error) => DirectFailure::Open(error) })?;
+        if !routes::bind_serving_dns(opened.admission, opened.candidate, opened.witness, opened.allow_missing_defaults) {
+            return Err(DirectFailure::Open("DNS serving context missing".into()));
+        }
+        return Ok(opened.socket);
+    }
+    let mut addrs: Vec<_> = crate::resolvers::genuine_a(target.host()).into_iter()
+        .map(|a| std::net::SocketAddr::from((a, 443))).collect();
+    let pin = 0;
     if let Some(checks) = checks {
         addrs.retain(|address| (checks.address)(*address));
         if addrs.is_empty() { return Err(DirectFailure::Denied); }
@@ -252,6 +334,23 @@ fn direct(
         })).map_err(DirectFailure::Open)
 }
 
+pub(super) fn open_configured_direct<'a>(
+    target: &GateTarget443<'_>, deadline: Instant, cancelled: &AtomicBool,
+    checks: Option<&'a DirectChecks<'a>>, vpn: bool,
+    resolver: Option<&crate::resolvers::ResolverWork>,
+    allow_missing_defaults: bool,
+) -> Result<OpenedRoute<'a>, OpenFailure> {
+    remaining(deadline, cancelled)?;
+    let result = direct(target, deadline, cancelled, checks, vpn, resolver, allow_missing_defaults);
+    remaining(deadline, cancelled)?;
+    match result {
+        Ok(socket) => tcp_direct(socket, Some(if vpn { routes::Kind::Vpn } else { routes::Kind::Direct }), checks)
+            .ok_or(OpenFailure::DeniedTarget),
+        Err(DirectFailure::Denied) => Err(OpenFailure::DeniedTarget),
+        Err(DirectFailure::Open(error)) => Err(OpenFailure::Unavailable(Some(error))),
+    }
+}
+
 /// Returns an owned transport, never a client response. A late successful leaf
 /// is dropped after the deadline/cancellation check and cannot be committed.
 pub(crate) fn open_selected_route<'a>(
@@ -260,50 +359,59 @@ pub(crate) fn open_selected_route<'a>(
     cancelled: &AtomicBool,
     checks: Option<&'a DirectChecks<'a>>,
 ) -> Result<OpenedRoute<'a>, OpenFailure> {
-    if cfg!(any(relay, exits)) {
-        return Err(OpenFailure::UnsupportedPrivateRoutes);
-    }
+    open_selected_route_with_profile(target, deadline, cancelled, checks, None, None)
+}
+
+pub(crate) fn open_selected_route_with_profile<'a>(
+    target: &GateTarget443<'_>, deadline: Instant, cancelled: &AtomicBool,
+    checks: Option<&'a DirectChecks<'a>>, active: Option<crate::settings::ActiveTransportConfig>,
+    resolver: Option<&crate::resolvers::ResolverWork>,
+) -> Result<OpenedRoute<'a>, OpenFailure> {
     remaining(deadline, cancelled)?;
-    #[cfg(not(target_os = "macos"))]
-    let profile = DesiredRouteProfile::capture(target);
-    #[cfg(target_os = "macos")]
-    let profile = match DesiredRouteProfile::capture(target, &|| !cancelled.load(Ordering::Acquire) && Instant::now() < deadline) {
-        Ok(profile) => profile,
-        Err(error) => { remaining(deadline, cancelled)?; return Err(OpenFailure::Configuration(error)); }
-    };
+    let profile = DesiredRouteProfile::capture(active)?;
+    if active.is_some_and(|config| config.profile == crate::settings::TransportProfile::ExistingConfigured) && resolver.is_none() {
+        return Err(OpenFailure::Unavailable(Some("configured route resolver owner was not received".into())));
+    }
+    open_captured_route(target, deadline, cancelled, checks, &profile, resolver)
+}
+
+pub(crate) fn open_captured_route<'a>(
+    target: &GateTarget443<'_>, deadline: Instant, cancelled: &AtomicBool,
+    checks: Option<&'a DirectChecks<'a>>, profile: &DesiredRouteProfile,
+    resolver: Option<&crate::resolvers::ResolverWork>,
+) -> Result<OpenedRoute<'a>, OpenFailure> {
+    if matches!(profile, DesiredRouteProfile::System) {
+        let socket = open_system(target.host(), 443, deadline, cancelled, checks)?;
+        // Do not write system-network outcomes into the configured-DNS route
+        // health bucket: it represents a different resolution purpose.
+        return tcp_direct(socket, None, checks).ok_or(OpenFailure::DeniedTarget);
+    }
+    let DesiredRouteProfile::Configured { own, group, .. } = profile else { unreachable!() };
     let mut tried_direct = false;
     let mut denied_direct = false;
     let mut last_error = None;
-    #[cfg(target_os = "macos")]
-    let group_error = std::cell::RefCell::new(None::<String>);
     let opened = walk_routes(profile.order(target.host()), deadline, cancelled, |kind, budget| {
         match kind {
-            routes::Kind::Own => profile.own.as_ref().and_then(|up| {
-                match upstream::open_with_cancellation(up, target.host(), 443, budget.min(upstream::LIVE_OPEN_BUDGET), Some(cancelled)) {
-                    Ok(socket) => Some(OpenedRoute::Tcp { socket, kind: Some(kind), direct_proof: None }),
+            routes::Kind::Own => own.as_ref().and_then(|up| {
+                match upstream::open_with_cancellation(up.endpoint(), target.host(), 443, budget.min(upstream::LIVE_OPEN_BUDGET), Some(cancelled)) {
+                    Ok(socket) => {
+                        routes::bind_serving_own(std::sync::Arc::clone(up));
+                        Some(OpenedRoute::Tcp { socket, kind: Some(kind), direct_proof: None })
+                    },
                     Err(why) => {
                         crate::dns_forwarder::log_proxy(&format!("свой прокси: {}", why));
-                        upstream::OWN.health.note(false);
+                        up.note_open_failure();
                         last_error = Some(why);
                         None
                     }
                 }
             }),
-            #[cfg(not(target_os = "macos"))]
-            routes::Kind::Group => profile.group.as_ref()
+            routes::Kind::Group => group.as_ref()
                 .and_then(|key| crate::group::open_group(target, key, deadline, cancelled))
                 .map(OpenedRoute::Group),
-            #[cfg(target_os = "macos")]
-            routes::Kind::Group => match profile.group.as_ref() {
-                Some(key) => match crate::group::open_group(target, key, deadline, cancelled) {
-                    Ok(opened) => opened.map(OpenedRoute::Group),
-                    Err(error) => { *group_error.borrow_mut() = Some(error); None },
-                },
-                None => None,
-            },
             routes::Kind::Direct => {
                 tried_direct = true;
-                match direct(target, deadline, cancelled, checks, false) {
+                match direct(target, deadline, cancelled, checks, false, resolver, profile.dns_allow_missing_defaults()) {
                     Ok(socket) => tcp_direct(socket, Some(kind), checks),
                     Err(DirectFailure::Denied) => { denied_direct = true; None }
                     Err(DirectFailure::Open(why)) => {
@@ -313,7 +421,7 @@ pub(crate) fn open_selected_route<'a>(
                     }
                 }
             }
-            routes::Kind::Vpn => match direct(target, deadline, cancelled, checks, true) {
+            routes::Kind::Vpn => match direct(target, deadline, cancelled, checks, true, resolver, profile.dns_allow_missing_defaults()) {
                 Ok(socket) => tcp_direct(socket, Some(kind), checks),
                 Err(DirectFailure::Denied) => { denied_direct = true; None }
                 Err(DirectFailure::Open(why)) => {
@@ -326,25 +434,14 @@ pub(crate) fn open_selected_route<'a>(
             routes::Kind::Relay | routes::Kind::Exits => None,
         }
     }, |kind| {
-        #[cfg(target_os = "macos")]
-        if kind == routes::Kind::Group {
-            if let Some(error) = group_error.borrow_mut().take() { return Err(OpenFailure::Configuration(error)); }
-            let received = match profile.group.as_ref() {
-                Some(key) => crate::group::stumble_if_current(key), None => Ok(false),
-            };
-            return match received {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(OpenFailure::Configuration("group configuration changed during route attempt".into())),
-                Err(error) => Err(OpenFailure::Configuration(error)),
-            };
-        }
-        routes::stumble(kind);
-        Ok(())
+        if kind == routes::Kind::Own {
+            if let Some(own) = own.as_ref() { own.if_current(|| routes::stumble(kind)); }
+        } else { routes::stumble(kind); }
     })?;
     if let Some(opened) = opened { return Ok(opened); }
-    if !tried_direct {
+    if !tried_direct && profile.allows_direct() {
         remaining(deadline, cancelled)?;
-        let opened = match direct(target, deadline, cancelled, checks, false) {
+        let opened = match direct(target, deadline, cancelled, checks, false, resolver, profile.dns_allow_missing_defaults()) {
             Ok(socket) => Some(socket),
             Err(DirectFailure::Denied) => { denied_direct = true; None }
             Err(DirectFailure::Open(why)) => { last_error = Some(why); None }
@@ -367,33 +464,69 @@ pub(crate) fn tcp_direct<'a>(socket: TcpStream, kind: Option<routes::Kind>, chec
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn configuration_failure_stops_route_walk_before_fallback_or_penalty() {
-        use super::*;
-        use std::cell::RefCell;
-        let cancelled = AtomicBool::new(false);
-        let attempted = RefCell::new(Vec::new());
-        let result: Result<Option<()>, OpenFailure> = walk_routes(
-            [routes::Kind::Group, routes::Kind::Direct], Instant::now() + Duration::from_secs(2), &cancelled,
-            |kind, _| { attempted.borrow_mut().push(kind); None },
-            |_| Err(OpenFailure::Configuration("captured group changed".into())),
-        );
-        assert!(matches!(result, Err(OpenFailure::Configuration(_))));
-        assert_eq!(*attempted.borrow(), [routes::Kind::Group]);
-    }
     use super::*;
     use std::net::{Shutdown, TcpListener};
+
+    #[test]
+    fn response_write_keeps_partial_zero_and_io_failure() {
+        struct FailingWriter { mode: u8, bytes: Vec<u8> }
+        impl Write for FailingWriter {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                if self.mode == 0 { return Ok(0); }
+                if self.mode == 1 || !self.bytes.is_empty() {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "fixture write failure"));
+                }
+                self.bytes.extend_from_slice(&data[..2]);
+                Ok(2)
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        for mode in 0..3 {
+            let mut writer = FailingWriter { mode, bytes: Vec::new() };
+            let mut written = 0;
+            let mut completed = false;
+            let result = write_response(&mut writer, b"hello", &mut written,
+                |_| Ok::<(), io::Error>(()), |_| { completed = true; Ok(()) }, |error| error);
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), if mode == 0 { io::ErrorKind::WriteZero } else { io::ErrorKind::BrokenPipe });
+            assert_eq!(written, if mode == 2 { 2 } else { 0 });
+            assert_eq!(writer.bytes, if mode == 2 { b"he".to_vec() } else { Vec::new() });
+            assert!(!completed);
+        }
+    }
+
+    #[test]
+    fn system_lookup_discards_late_results_and_keeps_late_error() {
+        let cancelled = AtomicBool::new(false);
+        let result = resolve_system_with(Instant::now() + Duration::from_secs(1), &cancelled, || {
+            cancelled.store(true, Ordering::Release);
+            Ok(vec!["192.0.2.1:443".parse().unwrap()])
+        });
+        assert!(matches!(result, Err(OpenFailure::Cancelled)));
+        cancelled.store(false, Ordering::Release);
+        let result = resolve_system_with(Instant::now() + Duration::from_secs(1), &cancelled, || {
+            cancelled.store(true, Ordering::Release);
+            Err(io::Error::new(io::ErrorKind::Other, "synthetic lookup error"))
+        });
+        assert!(matches!(result, Err(OpenFailure::ResolutionLate { cancelled: true, error }) if error.to_string() == "synthetic lookup error"));
+        cancelled.store(false, Ordering::Release);
+        let result = resolve_system_with(Instant::now() + Duration::from_secs(1), &cancelled,
+            || Err(io::Error::from_raw_os_error(11001)));
+        assert!(matches!(result, Err(OpenFailure::Resolution(error)) if error.raw_os_error() == Some(11001)));
+        assert!(recursive_target("127.65.71.1:443".parse().unwrap()));
+        assert!(recursive_target("[::ffff:127.65.71.1]:443".parse().unwrap()));
+        assert!(!recursive_target("192.0.2.1:443".parse().unwrap()));
+    }
 
     // Exercise the selection/walk shared by both fronts without reading the
     // user's settings or invoking DNS, a real hop, or a credential store.
     #[test]
     fn disabled_own_endpoint_never_enters_shared_route_walk() {
         let host = "cloudcode-pa.googleapis.com";
-        let endpoint = upstream::parse("synthetic:credential@192.0.2.1:8080").unwrap();
-        assert!(upstream::OWN.usable(), "the retained endpoint must be healthy for this guard");
+        let endpoint = upstream::OwnContext::fixture(upstream::parse("synthetic:credential@192.0.2.1:8080").unwrap());
+        assert!(endpoint.usable(), "the retained endpoint must be healthy for this guard");
         for eof in [FrontendEof::NativeCompatible, FrontendEof::WslSymmetricFin] {
-            let profile = DesiredRouteProfile {
+            let profile = DesiredRouteProfile::Configured {
                 settings: crate::settings::Settings { own_proxy_enabled: false,
                     own_proxy_at: 1, ..Default::default() },
                 own: Some(endpoint.clone()), group: None,
@@ -405,29 +538,66 @@ mod tests {
                 &cancelled, |kind, _| {
                     attempts.borrow_mut().push(kind);
                     if kind == routes::Kind::Own {
-                        assert!(profile.own.as_ref().unwrap().auth.is_some());
+                        assert!(matches!(&profile, DesiredRouteProfile::Configured { own: Some(own), .. } if own.endpoint().auth.is_some()));
                         credentials.set(credentials.get() + 1);
                     }
                     (kind == routes::Kind::Direct).then_some(eof)
-                }, |_| Ok(()));
+                }, |_| {});
             assert!(!attempts.borrow().contains(&routes::Kind::Own), "disabled Own was attempted");
             assert_eq!(credentials.get(), 0, "disabled Own credentials were used");
             assert!(matches!(selected, Ok(Some(selected)) if selected == eof), "selected Direct fallback was lost");
-            assert!(!profile.settings.own_proxy_enabled);
-            assert_eq!(profile.own.as_ref(), Some(&endpoint));
+            assert!(matches!(&profile, DesiredRouteProfile::Configured { settings, own: Some(own), .. } if !settings.own_proxy_enabled && std::sync::Arc::ptr_eq(own, &endpoint)));
         }
     }
 
     #[test]
     fn enabled_own_endpoint_remains_selected_by_shared_profile() {
-        let profile = DesiredRouteProfile {
+        let profile = DesiredRouteProfile::Configured {
             settings: crate::settings::Settings { own_proxy_enabled: true,
                 debug_route: "own".into(), ..Default::default() },
-            own: Some(upstream::parse("synthetic:credential@192.0.2.1:8080").unwrap()), group: None,
+            own: Some(upstream::OwnContext::fixture(upstream::parse("synthetic:credential@192.0.2.1:8080").unwrap())), group: None,
         };
         assert_eq!(profile.order("cloudcode-pa.googleapis.com"), [routes::Kind::Own]);
-        let missing = DesiredRouteProfile { own: None, ..profile };
+        let DesiredRouteProfile::Configured { settings, group, .. } = profile else { unreachable!() };
+        let missing = DesiredRouteProfile::Configured { settings, own: None, group };
         assert!(missing.order("cloudcode-pa.googleapis.com").is_empty());
+        assert!(!missing.allows_direct());
+    }
+
+    #[test]
+    fn invalid_or_forced_route_does_not_add_direct_fallback() {
+        for forced in ["own", "not-a-route"] {
+            let profile = DesiredRouteProfile::Configured {
+                settings: crate::settings::Settings { debug_route: forced.into(), ..Default::default() },
+                own: None, group: None,
+            };
+            assert!(profile.order("cloudcode-pa.googleapis.com").is_empty());
+            assert!(!profile.allows_direct());
+        }
+        let profile = DesiredRouteProfile::System;
+        assert_eq!(profile.order("cloudcode-pa.googleapis.com"), [routes::Kind::Direct]);
+    }
+
+    #[test]
+    fn configured_public_opener_does_not_blanket_reject_private_cfg() {
+        let mut settings = crate::settings::Settings::default();
+        settings.select_existing_configured(false, false, false, true, false).unwrap();
+        settings.debug_route = "own".into();
+        let profile = DesiredRouteProfile::Configured { settings, own: None, group: None };
+        let target = GateTarget443::new("cloudcode-pa.googleapis.com", 443).unwrap();
+        let cancelled = AtomicBool::new(false);
+        assert!(matches!(open_captured_route(&target, Instant::now() + Duration::from_secs(1), &cancelled, None, &profile, None), Err(OpenFailure::Unavailable(_))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_profile_capture_uses_only_active_tuple() {
+        let active = crate::settings::ActiveTransportConfig {
+            profile: crate::settings::TransportProfile::SystemTcp,
+            dns: false, client_proxy: true, tcp_proxy: true, dns_alias: false,
+        };
+        assert!(matches!(DesiredRouteProfile::capture(Some(active)), Ok(DesiredRouteProfile::System)));
+        assert!(DesiredRouteProfile::capture(Some(crate::settings::ActiveTransportConfig { dns: true, ..active })).is_err());
     }
 
     #[test]
@@ -438,7 +608,7 @@ mod tests {
         let result = walk_routes([routes::Kind::Own, routes::Kind::Group, routes::Kind::Direct],
             Instant::now() + Duration::from_secs(2), &cancelled,
             |kind, _| { attempted.borrow_mut().push(kind); (kind == routes::Kind::Group).then_some(7) },
-            |kind| { failed.borrow_mut().push(kind); Ok(()) });
+            |kind| failed.borrow_mut().push(kind));
         assert!(matches!(result, Ok(Some(7))));
         assert_eq!(*attempted.borrow(), [routes::Kind::Own, routes::Kind::Group]);
         assert_eq!(*failed.borrow(), [routes::Kind::Own]);

@@ -15,25 +15,32 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection};
 use serde::{Deserialize, Serialize};
 
-pub const RELEASES_LATEST_URL: &str = "https://github.com/confeden/Antigravity/releases/latest";
+pub const RELEASES_LATEST_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
 const API_HOST: &str = "api.github.com";
-const API_PATH: &str = "/repos/confeden/Antigravity/releases/latest";
 const CHECK_INTERVAL: Duration = Duration::from_secs(8 * 60 * 60);
+
+fn repository_api_path(repository: &str) -> Result<String, String> {
+    let url = url::Url::parse(repository)
+        .map_err(|e| format!("invalid update repository URL: {}", e))?;
+    let segments: Vec<_> = url.path_segments().map(|s| s.collect()).unwrap_or_default();
+    if url.scheme() != "https" || url.host_str() != Some("github.com")
+        || !url.username().is_empty() || url.password().is_some() || url.port().is_some()
+        || url.query().is_some() || url.fragment().is_some() || segments.len() != 2
+        || segments.iter().any(|s| s.is_empty() || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
+        || segments.iter().any(|s| *s == "." || *s == "..")
+    {
+        return Err("update repository must be an HTTPS GitHub owner/repository URL".to_string());
+    }
+    Ok(format!("/repos/{}/{}/releases/latest", segments[0], segments[1]))
+}
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BODY: usize = 256 * 1024;
 
-/// The version this binary shipped as, in the form the release tags use.
-///
-/// `CARGO_PKG_VERSION` only ever holds the three-digit part (`2.12.2`) because
-/// `build_rust.py` deliberately keeps the fourth digit out of Cargo.toml — a
-/// changed Cargo version re-salts every licence key (I2). So the full shipped
-/// name (`2.12.2_3`) comes from build.rs instead. Without it a `_3` build would
-/// compare itself against tag `v2.12.2_3` as if it were `2.12.2`, and claim an
-/// update that does not exist.
+/// The exact Cargo package version validated by the build-time release owner.
 pub fn current_version() -> &'static str {
-    option_env!("AG_FULL_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+    env!("AG_FULL_VERSION")
 }
 
 /// Information about a GitHub release asset.
@@ -81,8 +88,20 @@ impl ReleaseInfo {
 /// Cached check payload stored on disk.
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedCheck {
+    repository: String,
     checked_at_unix: u64,
     release: ReleaseInfo,
+}
+
+fn cached_release(data: &str, repository: &str, now_unix: u64) -> Option<ReleaseInfo> {
+    let cached: CachedCheck = serde_json::from_str(data).ok()?;
+    if cached.repository == repository && now_unix >= cached.checked_at_unix
+        && Duration::from_secs(now_unix - cached.checked_at_unix) < CHECK_INTERVAL
+    {
+        Some(cached.release)
+    } else {
+        None
+    }
 }
 
 /// Returns the path to the update check cache file in the system temp directory.
@@ -196,6 +215,7 @@ fn decode_chunked(raw: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Synchronously fetches the latest release from the GitHub API over HTTPS.
 pub fn fetch_latest_release() -> Result<ReleaseInfo, String> {
+    let api_path = repository_api_path(env!("CARGO_PKG_REPOSITORY"))?;
     let mut sock = connect_tcp(API_HOST, 443)?;
 
     let server_name = ServerName::try_from(API_HOST)
@@ -210,7 +230,7 @@ pub fn fetch_latest_release() -> Result<ReleaseInfo, String> {
          User-Agent: ag_unlocker/{}\r\n\
          Accept: application/vnd.github.v3+json\r\n\
          Connection: close\r\n\r\n",
-        API_PATH,
+        api_path,
         API_HOST,
         current_version()
     );
@@ -285,6 +305,8 @@ pub fn fetch_latest_release() -> Result<ReleaseInfo, String> {
 /// If `force` is false, it uses the cached result if available and fresh.
 /// If an update is available, returns `Ok(Some(release))`.
 pub fn check_update_cached(force: bool) -> Result<Option<ReleaseInfo>, String> {
+    let repository = env!("CARGO_PKG_REPOSITORY");
+    repository_api_path(repository)?;
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -293,22 +315,15 @@ pub fn check_update_cached(force: bool) -> Result<Option<ReleaseInfo>, String> {
     let path = cache_path();
     if !force {
         if let Ok(data) = fs::read_to_string(&path) {
-            if let Ok(cached) = serde_json::from_str::<CachedCheck>(&data) {
-                if now_unix >= cached.checked_at_unix
-                    && Duration::from_secs(now_unix - cached.checked_at_unix) < CHECK_INTERVAL
-                {
-                    return if cached.release.is_newer_than_current() {
-                        Ok(Some(cached.release))
-                    } else {
-                        Ok(None)
-                    };
-                }
+            if let Some(release) = cached_release(&data, repository, now_unix) {
+                return if release.is_newer_than_current() { Ok(Some(release)) } else { Ok(None) };
             }
         }
     }
 
     let release = fetch_latest_release()?;
     let cache_entry = CachedCheck {
+        repository: repository.to_string(),
         checked_at_unix: now_unix,
         release: release.clone(),
     };
@@ -366,6 +381,33 @@ pub fn spawn_watch(tx: std::sync::mpsc::Sender<ReleaseInfo>, wake: Box<dyn Fn() 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_routes_and_validation() {
+        let repository = env!("CARGO_PKG_REPOSITORY");
+        assert_eq!(repository, "https://github.com/applicate2628/Antigravity");
+        assert_eq!(RELEASES_LATEST_URL, format!("{}/releases/latest", repository));
+        assert_eq!(repository_api_path(repository).unwrap(), "/repos/applicate2628/Antigravity/releases/latest");
+        for invalid in ["", "not a url", "http://github.com/a/b", "https://example.com/a/b", "https://github.com/a", "https://github.com/a/b/", "https://github.com/a/b?x=1", "https://github.com/a/%0d%0a"] {
+            assert!(repository_api_path(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn cache_requires_matching_repository_and_fresh_timestamp() {
+        let repository = env!("CARGO_PKG_REPOSITORY");
+        let release = ReleaseInfo { tag_name: "v99.0.0".into(), html_url: "https://example.com".into(), name: None, body: None, published_at: None, prerelease: false, draft: false, assets: vec![] };
+        let entry = CachedCheck { repository: repository.into(), checked_at_unix: 100, release };
+        let mut value = serde_json::to_value(entry).unwrap();
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert_eq!(cached_release(&serialized, repository, 100).unwrap().tag_name, "v99.0.0");
+        assert!(cached_release(&serialized, repository, 100 + CHECK_INTERVAL.as_secs()).is_none());
+        assert!(cached_release(&serialized, repository, 99).is_none());
+        value["repository"] = "https://github.com/confeden/Antigravity".into();
+        assert!(cached_release(&value.to_string(), repository, 100).is_none());
+        value.as_object_mut().unwrap().remove("repository");
+        assert!(cached_release(&value.to_string(), repository, 100).is_none());
+    }
 
     #[test]
     fn test_current_version_not_empty() {

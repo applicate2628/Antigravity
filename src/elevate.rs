@@ -113,7 +113,7 @@ fn revert_files_run(inst: &Path, stop_on_failure: bool) -> Reverted {
         }
     }
     }
-    if let Err(e) = crate::restore_pristine_asar(&crate::installation_resources(inst)) {
+    if let Err(e) = crate::restore_pristine_asar(&inst.join("resources")) {
         if stop_on_failure { out.errors.push(format!("app.asar не восстановлен: {e}")); }
         else { out.warnings.push(format!("app.asar не восстановлен: {e}")); }
     }
@@ -153,7 +153,7 @@ fn written_dirs(inst: &Path) -> Vec<PathBuf> {
         .filter(|t| t.is_file())
         .filter_map(|t| t.parent().map(Path::to_path_buf))
         .collect();
-    let app = crate::installation_resources(inst).join("app");
+    let app = inst.join("resources").join("app");
     for js in [
         app.join("out").join("main.js"),
         app.join("dist").join("main.js"),
@@ -261,30 +261,76 @@ pub fn patch_as_root(_inst: &Path) -> Result<Elevated, String> {
 /// The helper's side, run as root: patch one install, report in lines of
 /// `KEY<TAB>value`, exit 0 on success.
 pub fn run_helper(arg: Option<String>) -> ! {
-    let Some(inst) = arg
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_absolute() && p.is_dir())
-    else {
-        println!("ERR\tне указана папка установки");
-        std::process::exit(2);
-    };
-    match crate::process_install(&inst) {
-        Ok(o) => {
-            println!("OK\t{}", one_line(o.label));
-            for w in o.warnings {
-                println!("WARN\t{}", one_line(&w));
+    let (wire, code) = run_helper_root(arg, crate::process_install, &mut crate::command_lifetime::receive_failure, #[cfg(test)] None);
+    print!("{wire}");
+    std::process::exit(code);
+}
+
+fn run_helper_root(arg: Option<String>,
+    action: impl FnOnce(&mut crate::utils::CommandOutcome, &std::path::Path) -> Result<crate::InstallOutcome, String>,
+    receive: &mut impl FnMut(&crate::utils::CommandOutcome, &mut Option<String>) -> Result<(), String>,
+    #[cfg(test)] on_hold: Option<&mut dyn FnMut()>) -> (String, i32) {
+    run_helper_root_with_writer(arg, action, receive, &mut std::io::stderr(), #[cfg(test)] on_hold)
+}
+
+fn run_helper_root_with_writer(arg: Option<String>,
+    action: impl FnOnce(&mut crate::utils::CommandOutcome, &std::path::Path) -> Result<crate::InstallOutcome, String>,
+    receive: &mut impl FnMut(&crate::utils::CommandOutcome, &mut Option<String>) -> Result<(), String>,
+    diagnostic: &mut impl std::io::Write,
+    #[cfg(test)] mut on_hold: Option<&mut dyn FnMut()>) -> (String, i32) {
+    let Some(inst) = arg.map(std::path::PathBuf::from).filter(|p| p.is_absolute() && p.is_dir())
+    else { return ("ERR\tне указана папка установки\n".into(), 2); };
+    let mut saved = crate::command_lifetime::SavedCommand::new();
+    saved.run(|outcome| action(outcome, &inst));
+    let mut held_reported = false;
+    loop {
+        match saved.receive_with(receive) {
+            Ok(true) => break,
+            Ok(false) => {
+                if !held_reported {
+                    if let Err(error) = writeln!(diagnostic, "helper command outcome remains pending") {
+                        saved.diagnostic_errors.push(error);
+                    }
+                    #[cfg(test)]
+                    if let Some(callback) = on_hold.as_mut() { callback(); }
+                    held_reported = true;
+                }
             }
-            println!(
-                "PROXYVAR\t{}\t{}",
-                u8::from(o.summary.proxy_var > 0),
-                u8::from(o.summary.proxy_var_retryable)
-            );
-            std::process::exit(0);
+            Err(error) => {
+                if let Err(diagnostic_error) = writeln!(diagnostic, "helper result receiving held: {error}") {
+                    saved.diagnostic_errors.push(diagnostic_error);
+                }
+                // Re-enter only the saved receiving step. The action is never
+                // run again, and a failed projection has not been committed.
+                match saved.receive_with(receive) {
+                    Ok(true) => break,
+                    Ok(false) => {},
+                    Err(recovery) => {
+                        // The production receiver has no external prerequisite.
+                        // If receiving-only recovery itself violates that
+                        // invariant, retain both failures without a panic loop.
+                        if let Err(error) = writeln!(diagnostic, "helper receiving recovery remains held: {recovery}") {
+                            saved.diagnostic_errors.push(error);
+                        }
+                        loop { std::thread::park_timeout(std::time::Duration::from_millis(10)); }
+                    }
+                }
+            }
         }
-        Err(e) => {
-            println!("ERR\t{}", one_line(&e));
-            std::process::exit(1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    helper_wire(&saved.finish())
+}
+
+fn helper_wire(result: &Result<crate::InstallOutcome, String>) -> (String, i32) {
+    match result {
+        Ok(outcome) => {
+            let mut wire = format!("OK\t{}\n", one_line(outcome.label));
+            for warning in &outcome.warnings { wire.push_str(&format!("WARN\t{}\n", one_line(warning))); }
+            wire.push_str(&format!("PROXYVAR\t{}\t{}\n", u8::from(outcome.summary.proxy_var > 0), u8::from(outcome.summary.proxy_var_retryable)));
+            (wire, 0)
         }
+        Err(error) => (format!("ERR\t{}\n", one_line(error)), 1),
     }
 }
 
@@ -409,6 +455,100 @@ fn parse_reverted(stdout: &str) -> Option<Reverted> {
 
 #[cfg(test)]
 mod tests {
+    struct BrokenDiagnostic(usize);
+    impl std::io::Write for BrokenDiagnostic {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.0 += 1;
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    #[test]
+    fn helper_fail_once_receiving_recovers_without_replaying_action() {
+        let mut actions = 0;
+        let mut receipts = 0;
+        let mut diagnostic = BrokenDiagnostic(0);
+        let (wire, code) = super::run_helper_root_with_writer(Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            |_, _| { actions += 1; Err("original helper error".into()) },
+            &mut |command, failure| {
+                receipts += 1;
+                if receipts == 1 {
+                    *failure = Some("unreceived candidate".into());
+                    return Err("repairable receiving failure".into());
+                }
+                crate::command_lifetime::receive_failure(command, failure)
+            }, &mut diagnostic, None);
+        assert_eq!((actions, receipts), (1, 2));
+        assert_eq!(diagnostic.0, 1);
+        assert_eq!((wire.as_str(), code), ("ERR\toriginal helper error\n", 1));
+    }
+    #[test]
+    fn helper_fail_once_receiver_unwind_resumes_the_same_original_box() {
+        let original: Box<dyn std::any::Any + Send> = Box::new(43u64);
+        let address = original.as_ref() as *const _ as *const () as usize;
+        let mut receipts = 0;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::run_helper_root(Some(std::env::temp_dir().to_string_lossy().into_owned()),
+                |_, _| std::panic::resume_unwind(original),
+                &mut |command, failure| {
+                    receipts += 1;
+                    if receipts == 1 {
+                        *failure = Some("unreceived receiver panic projection".into());
+                        panic!("secondary helper receiver panic");
+                    }
+                    crate::command_lifetime::receive_failure(command, failure)
+                }, None)
+        })).unwrap_err();
+        assert_eq!(receipts, 2);
+        assert_eq!(panic.as_ref() as *const _ as *const () as usize, address);
+        assert_eq!(panic.downcast_ref::<u64>(), Some(&43));
+    }
+    #[test]
+    fn helper_receiving_preserves_original_and_secondary_panics() {
+        let mut saved = crate::command_lifetime::SavedCommand::<()>::new();
+        saved.run(|_| panic!("original helper panic"));
+        assert!(saved.receive_with(&mut |_, _| panic!("receiver panic")).is_err());
+        assert_eq!(saved.receiving_panics.len(), 1);
+        assert!(saved.receive().unwrap());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| saved.finish()));
+        assert_eq!(result.unwrap_err().downcast_ref::<&str>(), Some(&"original helper panic"));
+    }
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires creator-owned Windows Job and private U04_FIXTURE_EXE/U04_FIXTURE_DIR"]
+    fn helper_receives_inherited_writer_before_final_wire() {
+        let executable = std::path::PathBuf::from(std::env::var_os("U04_FIXTURE_EXE").expect("absolute actor"));
+        let parent = std::path::PathBuf::from(std::env::var_os("U04_FIXTURE_DIR").expect("qualified fixture directory"));
+        let directory = parent.join("helper-crate-inherited-writer");
+        std::fs::create_dir(&directory).unwrap();
+        let release = directory.join("release");
+        let (send, receive) = std::sync::mpsc::channel();
+        let releaser = std::thread::spawn(move || {
+            use std::io::Write;
+            receive.recv().unwrap();
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(release).unwrap();
+            file.write_all(b"release").unwrap();
+            file.sync_all().unwrap();
+        });
+        let mut held = || send.send(()).unwrap();
+        let mut diagnostic = BrokenDiagnostic(0);
+        let mut actions = 0;
+        let (wire, code) = super::run_helper_root_with_writer(Some(directory.to_string_lossy().into_owned()), |outcome, path| {
+            actions += 1;
+            let prepared = crate::utils::PreparedExec::fixture_absolute(&executable).unwrap()
+                .args(["--fixture", "parent"]).arg(path.as_os_str());
+            assert_eq!(crate::utils::bounded_output(outcome, prepared, std::time::Duration::from_millis(400)),
+                crate::utils::CommandObservation::Deadline);
+            assert!(!outcome.releasable());
+            Err("original helper failure".into())
+        }, &mut crate::command_lifetime::receive_failure, &mut diagnostic, Some(&mut held));
+        releaser.join().unwrap();
+        assert_eq!(actions, 1);
+        assert_eq!(diagnostic.0, 1);
+        assert_eq!(code, 1);
+        assert!(wire.starts_with("ERR\toriginal helper failure; "));
+        assert!(wire.contains("capture_eof=true"));
+    }
     #[test]
     fn the_unpatch_report_reads_back_and_needs_its_last_line() {
         let done = super::parse_reverted("FILES\t2\nBAD\tlanguage_server: отказано\nWARN\tapp.asar\nDONE\n")

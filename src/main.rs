@@ -55,6 +55,9 @@ mod upstream;
 mod user_state_location;
 pub mod group;
 mod utils;
+#[cfg(windows)]
+mod passive_registry_helper;
+mod command_lifetime;
 mod watchdog;
 #[path = "wsl_direct/api.rs"]
 mod wsl_api;
@@ -100,31 +103,71 @@ pub fn clean_input_path(input: &str) -> String {
     s.to_string()
 }
 
-/// Project a selected root to candidate resource paths; this grants no write authority.
-pub(crate) fn installation_resources(root: &Path) -> PathBuf {
-    installation_resources_for(root, cfg!(target_os = "macos"))
-}
-
-fn installation_resources_for(root: &Path, is_macos: bool) -> PathBuf {
-    if is_macos && root.extension().and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
-    {
-        root.join("Contents").join("Resources")
-    } else {
-        root.join("resources")
-    }
-}
-
 fn is_install_root(path: &Path) -> bool {
     is_install_root_checked(path).unwrap_or(false)
 }
 
 fn discovery_metadata(path: &Path) -> Result<Option<fs::Metadata>, String> {
-    match fs::metadata(path) {
+    receive_discovery_metadata(fs::metadata(path))
+}
+
+fn receive_discovery_metadata(result: std::io::Result<fs::Metadata>) -> Result<Option<fs::Metadata>, String> {
+    match result {
         Ok(value) => Ok(Some(value)),
         Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Ok(None),
         Err(error) => Err(format!("installation discovery metadata: {error}")),
     }
+}
+
+#[cfg(windows)]
+fn discovery_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn unpacked_backup_residue(app: &Path) -> Result<bool, String> {
+    use windows_coordinator::windows_installation::{self as owner, CheckedPath, PathKind, PathPurpose};
+
+    // Exclusion needs positive ordinary-path evidence. An unknown or reparse
+    // path remains a candidate for the existing checked layout receiver.
+    let Ok(application) = CheckedPath::open(app, PathKind::Directory, PathPurpose::Review) else { return Ok(false); };
+    let app = application.as_path().to_path_buf();
+    let Some(root) = app.ancestors().nth(2) else { return Ok(false); };
+    let [ide, desktop, extension] = patch_ide::js_targets(root).into_paths();
+    let mut backups = vec![patch_ide::backup_path(&ide), patch_ide::backup_path(&desktop), patch_ide::backup_path(&extension)];
+    for entry in [ide, desktop] {
+        let mut legacy = entry.into_os_string();
+        legacy.push(".bak");
+        backups.push(PathBuf::from(legacy));
+    }
+    let backup_names: Vec<_> = backups.iter().map(PathBuf::as_path).collect();
+    let backup_parents: Vec<_> = backups.iter().flat_map(|file| file.ancestors().skip(1).take_while(|dir| *dir != app.as_path())).collect();
+    let matches_any = |candidate: &Path, known: &[&Path]| -> Result<bool, String> {
+        for path in known { if owner::same_windows_path(candidate, path)? { return Ok(true); } }
+        Ok(false)
+    };
+    let io = |error| format!("installation discovery backup observation: {error}");
+    let mut directories = vec![application];
+    let mut observed_backups = Vec::new();
+    while let Some(directory) = directories.pop() {
+        for child in fs::read_dir(directory.as_path()).map_err(io)? {
+            let path = child.map_err(io)?.path();
+            let metadata = fs::symlink_metadata(&path).map_err(io)?;
+            if discovery_reparse_point(&metadata) { return Ok(false); }
+            if metadata.is_dir() && matches_any(&path, &backup_parents)? {
+                let Ok(pin) = CheckedPath::open(&path, PathKind::Directory, PathPurpose::Review) else { return Ok(false); };
+                directories.push(pin);
+            } else if metadata.is_file() && matches_any(&path, &backup_names)? {
+                let Ok(pin) = CheckedPath::open(&path, PathKind::File, PathPurpose::Review) else { return Ok(false); };
+                observed_backups.push(pin);
+            } else {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(!observed_backups.is_empty())
 }
 
 fn is_install_root_checked(path: &Path) -> Result<bool, String> {
@@ -139,10 +182,36 @@ fn is_install_root_checked(path: &Path) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let resources = installation_resources(path);
-    if discovery_metadata(&resources)?.is_some_and(|value| value.is_dir()) {
+    let resources = path.join("resources");
+    #[cfg(windows)]
+    let resources_metadata = receive_discovery_metadata(fs::symlink_metadata(&resources))?;
+    #[cfg(not(windows))]
+    let resources_metadata = discovery_metadata(&resources)?;
+    #[cfg(windows)]
+    if resources_metadata.as_ref().is_some_and(discovery_reparse_point) { return Ok(true); }
+    if resources_metadata.is_some_and(|value| value.is_dir()) {
         for child in ["app.asar", "app", "bin"] {
-            if discovery_metadata(&resources.join(child))?.is_some() { return Ok(true); }
+            let child_path = resources.join(child);
+            #[cfg(windows)]
+            if child == "app" {
+                let Some(metadata) = receive_discovery_metadata(fs::symlink_metadata(&child_path))? else { continue; };
+                if discovery_reparse_point(&metadata) || !unpacked_backup_residue(&child_path)? { return Ok(true); }
+                continue;
+            }
+            if discovery_metadata(&child_path)?.is_some() { return Ok(true); }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS .app bundle layout: Contents/Resources/app[.asar] or Contents/MacOS.
+        let mac_resources = path.join("Contents").join("Resources");
+        if discovery_metadata(&mac_resources)?.is_some_and(|value| value.is_dir()) {
+            for child in ["app.asar", "app", "bin"] {
+                if discovery_metadata(&mac_resources.join(child))?.is_some() { return Ok(true); }
+            }
+        }
+        if discovery_metadata(&path.join("Contents").join("MacOS"))?.is_some_and(|value| value.is_dir()) {
+            return Ok(true);
         }
     }
     // `is_file`, not `exists`: `%LOCALAPPDATA%\agy` is the CLI's *directory*, and
@@ -192,6 +261,9 @@ fn resolve_install_root_checked(raw: &Path) -> Result<Option<PathBuf>, String> {
     }
 
     let subfolder_candidates = [
+        "Antigravity IDE.app",
+        "Antigravity Tools.app",
+        "Antigravity.app",
         "Antigravity IDE",
         "Antigravity",
         "agy",
@@ -241,6 +313,35 @@ fn windows_standard_candidates(local: Option<PathBuf>, program: Option<PathBuf>,
     candidates
 }
 
+#[cfg(windows)]
+fn observe_standard_install_kinds(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Vec<InstallationKind> {
+    use std::sync::atomic::Ordering;
+    use windows_coordinator::windows_installation::{CheckedPath, PathKind, PathPurpose};
+
+    let mut kinds = Vec::new();
+    for candidate in candidates {
+        if cancelled.load(Ordering::SeqCst) { break; }
+        // Exact ordinary standard entries only. This fallback never resolves
+        // parents, searches alternate directories or returns an effect path.
+        let Ok(root) = CheckedPath::open(&candidate, PathKind::Directory, PathPurpose::Review) else {
+            continue;
+        };
+        let Ok(layout) = receive_installation_layout(root.as_path()) else { continue; };
+        let Ok(anchor) = CheckedPath::open(&layout.anchor, PathKind::File, PathPurpose::Review) else {
+            continue;
+        };
+        if anchor.as_path().starts_with(root.as_path()) && root.recheck().is_ok()
+            && anchor.recheck().is_ok() && !kinds.contains(&layout.kind)
+        {
+            kinds.push(layout.kind);
+        }
+    }
+    if cancelled.load(Ordering::SeqCst) { Vec::new() } else { kinds }
+}
+
 /// The Linux equivalents. Antigravity ships as an Electron/VS Code fork, which on
 /// Linux lands in one of the system prefixes (`.deb` → `/usr/share` or `/opt`;
 /// tarball → `/opt` or under the home dir) with the language server at
@@ -251,6 +352,27 @@ fn windows_standard_candidates(local: Option<PathBuf>, program: Option<PathBuf>,
 fn standard_install_candidates() -> Vec<PathBuf> {
     let home = env::var("HOME").unwrap_or_default();
     let mut v: Vec<PathBuf> = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        for app in [
+            "/Applications/Antigravity IDE.app",
+            "/Applications/Antigravity Tools.app",
+            "/Applications/Antigravity.app",
+        ] {
+            v.push(PathBuf::from(app));
+        }
+        if !home.is_empty() {
+            let h = PathBuf::from(&home);
+            v.push(h.join("Applications/Antigravity IDE.app"));
+            v.push(h.join("Applications/Antigravity Tools.app"));
+            v.push(h.join("Applications/Antigravity.app"));
+            v.push(h.join(".gemini/bin"));
+        }
+        v.push(PathBuf::from("/opt/homebrew/bin"));
+        v.push(PathBuf::from("/usr/local/bin"));
+    }
+
     // System-wide install roots, both capitalisations the packaging might use.
     for base in ["/opt", "/usr/share", "/usr/lib", "/usr/local/share"] {
         for name in [
@@ -269,10 +391,9 @@ fn standard_install_candidates() -> Vec<PathBuf> {
         v.push(h.join(".local/share/Antigravity IDE"));
         v.push(h.join("Antigravity"));
         v.push(h.join("Antigravity IDE"));
-        // The `agy` CLI: measured at `~/.local/bin/agy` on a real install, so its
-        // bin dir is an install root in its own right (binary_targets scopes to
-        // `agy`/`language_server*`, so a shared bin dir patches only ours).
+        // The `agy` CLI: measured at `~/.local/bin/agy` or `~/.gemini/bin/agy`
         v.push(h.join(".local/bin"));
+        v.push(h.join(".gemini/bin"));
         v.push(h.join(".agy/bin"));
         v.push(h.join(".agy"));
         v.push(h.join(".local/share/agy/bin"));
@@ -291,8 +412,10 @@ fn find_agy_dir() -> Option<PathBuf> {
     if let Ok(path) = env::var("PATH") {
         dirs.extend(path.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
     }
+    dirs.push(PathBuf::from(format!("{}/.gemini/bin", home)));
     dirs.push(PathBuf::from(format!("{}/.local/bin", home)));
     dirs.push(PathBuf::from(format!("{}/.agy/bin", home)));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
     dirs.push(PathBuf::from("/usr/local/bin"));
     dirs.push(PathBuf::from("/usr/bin"));
     // Never a snap dir: `/snap/bin/agy` is a read-only wrapper, not the real
@@ -310,20 +433,25 @@ fn is_snap_path(p: &Path) -> bool {
     p.starts_with("/snap") || p.starts_with("/var/lib/snapd")
 }
 
-/// Scans the usual Linux prefixes for any `*antigravity*` directory, so an
+/// Scans the usual Linux/macOS prefixes for any `*antigravity*` directory, so an
 /// install whose name is not hardcoded is still found - the analogue of the
 /// Windows registry scan. Returns candidate roots to be resolved.
 #[cfg(not(target_os = "windows"))]
 fn scan_antigravity_dirs() -> Vec<PathBuf> {
     let home = env::var("HOME").unwrap_or_default();
     let mut out = Vec::new();
-    let bases = [
+    let mut bases = vec![
         "/opt".to_string(),
         "/usr/share".to_string(),
         "/usr/lib".to_string(),
         "/usr/local/share".to_string(),
         format!("{}/.local/share", home),
     ];
+    #[cfg(target_os = "macos")]
+    {
+        bases.push("/Applications".to_string());
+        bases.push(format!("{}/Applications", home));
+    }
     for base in bases {
         if let Ok(entries) = fs::read_dir(&base) {
             for e in entries.flatten() {
@@ -332,7 +460,7 @@ fn scan_antigravity_dirs() -> Vec<PathBuf> {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.to_lowercase().contains("antigravity"));
-                if hit && p.is_dir() {
+                if hit && (p.is_dir() || p.extension().is_some_and(|ext| ext == "app")) {
                     out.push(p);
                 }
             }
@@ -355,7 +483,7 @@ pub fn discover_installs_fast() -> Vec<PathBuf> {
     installs
 }
 
-pub fn find_all_installs() -> Vec<PathBuf> {
+pub fn find_all_installs(owner: &mut utils::CommandOutcome) -> Result<Vec<PathBuf>, String> {
     let mut installs = Vec::new();
     let mut candidates = standard_install_candidates();
 
@@ -374,7 +502,7 @@ pub fn find_all_installs() -> Vec<PathBuf> {
     {
         // This legacy presentation entry may retain a partial standard subset;
         // effect-capable AllTarget Apply uses checked discovery below instead.
-        if let Ok(found) = registry_install_candidates_checked() { candidates.extend(found); }
+        candidates.extend(registry_install_candidates_checked(owner)?);
     }
 
     for cand in candidates {
@@ -389,12 +517,90 @@ pub fn find_all_installs() -> Vec<PathBuf> {
     // as in the CLI search, so nothing snap-served reaches the results.
     #[cfg(not(target_os = "windows"))]
     installs.retain(|p| !is_snap_path(p));
-    installs
+    Ok(installs)
+}
+
+#[cfg(all(windows, ag_private_startup_scan_timing))]
+use ops::startup_scan_timing::{discovery_phase, DiscoveryPhase};
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum RegistryQueryPurpose { General, PassiveStatus }
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum RegistryScript { Provider, Managed }
+
+// IMAGE_FILE_MACHINE values from the Windows SDK.
+#[cfg(windows)]
+const MACHINE_UNKNOWN: u16 = 0;
+#[cfg(windows)]
+const MACHINE_AMD64: u16 = 0x8664;
+
+#[cfg(windows)]
+const fn select_registry_script(purpose: RegistryQueryPurpose, compiled_x64: bool, machine_pair: Option<(u16, u16)>) -> RegistryScript {
+    match (purpose, compiled_x64, machine_pair) {
+        (RegistryQueryPurpose::PassiveStatus, true, Some((MACHINE_UNKNOWN, MACHINE_AMD64))) => RegistryScript::Managed,
+        _ => RegistryScript::Provider,
+    }
 }
 
 #[cfg(windows)]
-fn registry_install_candidates_checked() -> Result<Vec<PathBuf>, String> {
-    let script = r#"& {
+const _: () = {
+    use RegistryQueryPurpose::{General, PassiveStatus};
+    use RegistryScript::{Managed, Provider};
+    let native = Some((MACHINE_UNKNOWN, MACHINE_AMD64));
+    assert!(matches!(select_registry_script(PassiveStatus, true, native), Managed));
+    assert!(matches!(select_registry_script(General, true, native), Provider));
+    assert!(matches!(select_registry_script(PassiveStatus, true, None), Provider));
+    assert!(matches!(select_registry_script(PassiveStatus, true, Some((0x014c, MACHINE_AMD64))), Provider));
+    assert!(matches!(select_registry_script(PassiveStatus, true, Some((MACHINE_AMD64, 0xaa64))), Provider));
+    assert!(matches!(select_registry_script(PassiveStatus, true, Some((MACHINE_UNKNOWN, 0xaa64))), Provider));
+    assert!(matches!(select_registry_script(PassiveStatus, false, native), Provider));
+};
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn current_registry_machine_pair() -> Option<(u16, u16)> {
+    use windows_sys::{core::{s, w, BOOL}, Win32::{Foundation::{FARPROC, HANDLE, HMODULE}, System::Threading::GetCurrentProcess}};
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> HMODULE;
+        fn GetProcAddress(module: HMODULE, name: *const u8) -> FARPROC;
+    }
+
+    type QueryMachinePair = unsafe extern "system" fn(HANDLE, *mut u16, *mut u16) -> BOOL;
+    // kernel32 is already loaded for the process lifetime. The module handle is borrowed.
+    let module = unsafe { GetModuleHandleW(w!("kernel32.dll")) };
+    if module.is_null() {
+        return None;
+    }
+    let address = unsafe { GetProcAddress(module, s!("IsWow64Process2")) }?;
+    // The optional export has the IsWow64Process2 ABI in the Windows SDK.
+    let query: QueryMachinePair = unsafe { std::mem::transmute(address) };
+    let mut process = MACHINE_UNKNOWN;
+    let mut native = MACHINE_UNKNOWN;
+    let ok = unsafe { query(GetCurrentProcess(), &mut process, &mut native) };
+    (ok != 0).then_some((process, native))
+}
+
+#[cfg(all(windows, not(target_arch = "x86_64")))]
+fn current_registry_machine_pair() -> Option<(u16, u16)> {
+    None
+}
+
+#[cfg(windows)]
+fn registry_install_candidates_checked(owner: &mut utils::CommandOutcome) -> Result<Vec<PathBuf>, String> {
+    registry_install_candidates_for(owner, RegistryQueryPurpose::General, None)
+}
+
+#[cfg(windows)]
+fn registry_install_candidates_for(
+    owner: &mut utils::CommandOutcome,
+    purpose: RegistryQueryPurpose,
+    passive_image: Option<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>>,
+) -> Result<Vec<PathBuf>, String> {
+    const PROVIDER_SCRIPT: &str = r#"& {
 $ErrorActionPreference='Stop'
 $roots=@('HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall','HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall')
 $locations=@(foreach($root in $roots) {
@@ -412,19 +618,142 @@ $locations=@(foreach($root in $roots) {
 ConvertTo-Json -InputObject $locations -Compress
 'AG_END'
 }"#;
-    let output = utils::powershell_within(script, Duration::from_secs(20)).ok_or("installation registry query unavailable")?;
-    if !output.status.success() { return Err("installation registry query failed or incomplete".into()); }
-    receive_registry_install_directories(&output.stdout)
+    const MANAGED_SCRIPT: &str = r#"& {
+    $ErrorActionPreference = 'Stop'
+    if (![Environment]::Is64BitProcess) {
+        throw 'Installation registry query requires the x64 PowerShell process'
+    }
+
+    $roots = @(
+        @{
+            Hive = [Microsoft.Win32.RegistryHive]::LocalMachine
+            Drive = 'HKLM:'
+            Name = 'Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        }
+        @{
+            Hive = [Microsoft.Win32.RegistryHive]::LocalMachine
+            Drive = 'HKLM:'
+            Name = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
+        }
+        @{
+            Hive = [Microsoft.Win32.RegistryHive]::CurrentUser
+            Drive = 'HKCU:'
+            Name = 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
+        }
+    )
+
+    try {
+        $locations = @(foreach ($root in $roots) {
+            $stage = 'open_base'
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                $root.Hive, [Microsoft.Win32.RegistryView]::Registry64)
+            try {
+                $stage = 'open_root'
+                $uninstall = $base.OpenSubKey($root.Name, $false)
+                if ($null -eq $uninstall) {
+                    # OpenSubKey can return null without exposing a native status.
+                    $stage = 'verify_missing_root'
+                    if (!(Test-Path -LiteralPath "$($root.Drive)\$($root.Name)" -ErrorAction Stop)) {
+                        continue
+                    }
+                    throw 'Expected uninstall root could not be opened'
+                }
+                try {
+                    $stage = 'enumerate_entries'
+                    $names = $uninstall.GetSubKeyNames()
+                    foreach ($name in $names) {
+                        $stage = 'open_entry'
+                        $entry = $uninstall.OpenSubKey($name, $false)
+                        if ($null -eq $entry) {
+                            throw 'Enumerated uninstall entry could not be opened'
+                        }
+                        try {
+                            $stage = 'read_fields'
+                            $value = @{
+                                DisplayName = $entry.GetValue('DisplayName')
+                                InstallLocation = $entry.GetValue('InstallLocation')
+                            }
+                            $stage = 'eligibility'
+                            if($value.DisplayName -like '*Antigravity*' -or $value.DisplayName -like '*agy*' -or $value.InstallLocation -like '*Antigravity*') {
+                                if($null -ne $value.InstallLocation) {
+                                    if($value.InstallLocation -isnot [string]){throw 'Installation location has invalid type'}
+                                    if(![string]::IsNullOrWhiteSpace($value.InstallLocation)){$value.InstallLocation}
+                                }
+                            }
+                        } finally {
+                            $entry.Dispose()
+                        }
+                    }
+                } finally {
+                    $uninstall.Dispose()
+                }
+            } finally {
+                $base.Dispose()
+            }
+        })
+        $stage = 'encode'
+        $json = ConvertTo-Json -InputObject $locations -Compress
+    } catch {
+        throw "Installation registry query failed at $stage"
+    }
+    $json
+    'AG_END'
+}
+"#;
+    let machines = match purpose {
+        RegistryQueryPurpose::General => None,
+        RegistryQueryPurpose::PassiveStatus => current_registry_machine_pair(),
+    };
+    let choice = select_registry_script(purpose, cfg!(target_arch = "x86_64"), machines);
+    let script = match choice {
+        RegistryScript::Provider => PROVIDER_SCRIPT,
+        RegistryScript::Managed => MANAGED_SCRIPT,
+    };
+    let helper_image = passive_image.filter(|_| {
+        matches!(choice, RegistryScript::Managed) && passive_registry_helper::ordinary_actor()
+    });
+    #[cfg(all(windows, ag_private_startup_scan_timing))]
+    ops::startup_scan_timing::record_registry_script(choice, helper_image.is_some());
+    #[cfg(all(windows, ag_private_startup_scan_timing))]
+    let helper = discovery_phase(DiscoveryPhase::RegistryHelper);
+    let limit = Duration::from_secs(20);
+    let observation = match helper_image {
+        Some(image) => utils::bounded_output(owner, utils::PreparedExec::passive_registry_helper(image), limit),
+        None => utils::powershell_within(owner, script, limit),
+    };
+    #[cfg(all(windows, ag_private_startup_scan_timing))]
+    helper.finish(matches!(&observation, utils::CommandObservation::Complete));
+    #[cfg(all(windows, ag_private_startup_scan_timing))]
+    let acceptance = discovery_phase(DiscoveryPhase::RegistryAcceptance);
+    if !matches!(observation, utils::CommandObservation::Complete) || !owner.complete() || !owner.releasable()
+        || !owner.exit().is_some_and(|status| status.success()) {
+        return Err("installation registry query failed, incomplete or status unknown; actual outcome retained".into());
+    }
+    #[cfg(all(windows, ag_private_startup_scan_timing))]
+    acceptance.finish(true);
+    let directories = receive_registry_install_directories(owner.stdout())
+        .map_err(|error| format!("installation registry query: {error}"))?;
+    drop(std::mem::take(owner));
+    Ok(directories)
 }
 
 #[cfg(windows)]
 fn receive_registry_install_directories(bytes: &[u8]) -> Result<Vec<PathBuf>, String> {
     let mut directories = Vec::new();
-    for path in receive_registry_install_candidates(bytes)? {
+    #[cfg(all(windows, ag_private_startup_scan_timing))]
+    let decode = discovery_phase(DiscoveryPhase::RegistryDecode);
+    let candidates = receive_registry_install_candidates(bytes)?;
+    #[cfg(all(windows, ag_private_startup_scan_timing))]
+    decode.finish(true);
+    #[cfg(all(windows, ag_private_startup_scan_timing))]
+    let directory_receiving = discovery_phase(DiscoveryPhase::RegistryDirectories);
+    for path in candidates {
         if let Some(directory) = windows_coordinator::windows_installation::CheckedPath::directory_locator_if_present(path.as_os_str())? {
             directories.push(directory.as_path().to_owned());
         }
     }
+    #[cfg(all(windows, ag_private_startup_scan_timing))]
+    directory_receiving.finish(true);
     Ok(directories)
 }
 
@@ -441,7 +770,26 @@ fn receive_registry_install_candidates(bytes: &[u8]) -> Result<Vec<PathBuf>, Str
 }
 
 #[cfg(windows)]
-pub(crate) fn find_all_installs_checked(cancel: &std::sync::atomic::AtomicBool) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn find_all_installs_checked(owner: &mut utils::CommandOutcome, cancel: &std::sync::atomic::AtomicBool) -> Result<Vec<PathBuf>, String> {
+    find_all_installs_with_registry(owner, cancel, RegistryQueryPurpose::General, None)
+}
+
+#[cfg(windows)]
+pub(crate) fn find_passive_status_installs_checked(
+    owner: &mut utils::CommandOutcome,
+    cancel: &std::sync::atomic::AtomicBool,
+    image: Option<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>>,
+) -> Result<Vec<PathBuf>, String> {
+    find_all_installs_with_registry(owner, cancel, RegistryQueryPurpose::PassiveStatus, image)
+}
+
+#[cfg(windows)]
+fn find_all_installs_with_registry(
+    owner: &mut utils::CommandOutcome,
+    cancel: &std::sync::atomic::AtomicBool,
+    purpose: RegistryQueryPurpose,
+    passive_image: Option<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>>,
+) -> Result<Vec<PathBuf>, String> {
     use std::sync::atomic::Ordering;
     let base = |name: &str, required: bool| -> Result<Option<PathBuf>, String> {
         match env::var_os(name) {
@@ -456,7 +804,9 @@ pub(crate) fn find_all_installs_checked(cancel: &std::sync::atomic::AtomicBool) 
     let mut candidates = windows_standard_candidates(base("LOCALAPPDATA", true)?, base("PROGRAMFILES", true)?,
         base("PROGRAMFILES(X86)", false)?, base("USERPROFILE", true)?);
     if cancel.load(Ordering::SeqCst) { return Err("installation discovery cancelled".into()); }
-    candidates.extend(registry_install_candidates_checked()?);
+    candidates.extend(registry_install_candidates_for(owner, purpose, passive_image)?);
+    #[cfg(all(windows, ag_private_startup_scan_timing))]
+    let root_resolution = discovery_phase(DiscoveryPhase::CandidateResolution);
     let mut installs = Vec::new();
     for candidate in candidates {
         if cancel.load(Ordering::SeqCst) { return Err("installation discovery cancelled".into()); }
@@ -464,6 +814,8 @@ pub(crate) fn find_all_installs_checked(cancel: &std::sync::atomic::AtomicBool) 
             if !installs.contains(&root) { installs.push(root); }
         }
     }
+    #[cfg(all(windows, ag_private_startup_scan_timing))]
+    root_resolution.finish(true);
     Ok(installs)
 }
 
@@ -515,6 +867,58 @@ pub struct InstallOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InstallationKind { Desktop, Ide, Cli }
 
+/// Project the install root to the existing platform's resources directory.
+pub(crate) fn installation_resources(install: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let resources = install.join("Contents").join("Resources");
+        if resources.exists() { return resources; }
+    }
+    install.join("resources")
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn observe_mac_installation_kind(root: &Path) -> Option<InstallationKind> {
+    let metadata = |path: &Path| {
+        let observed = receive_discovery_metadata(fs::symlink_metadata(path)).ok()?;
+        if observed.as_ref().is_some_and(|value| value.file_type().is_symlink()) { return None; }
+        Some(observed)
+    };
+    if !root.is_absolute() || root.components().any(|component| component == std::path::Component::ParentDir) {
+        return None;
+    }
+    let ancestors: Vec<_> = root.ancestors().collect();
+    for parent in ancestors.into_iter().rev() {
+        if !metadata(parent)?.is_some_and(|value| value.is_dir()) { return None; }
+    }
+    for cli in ["agy.exe", "agy"] {
+        if metadata(&root.join(cli))?.is_some_and(|value| value.is_file()) { return Some(InstallationKind::Cli); }
+    }
+
+    let contents = root.join("Contents");
+    if !metadata(&contents)?.is_some_and(|value| value.is_dir()) { return None; }
+    let resources = installation_resources(root);
+    if resources.parent() != Some(contents.as_path())
+        || !metadata(&resources)?.is_some_and(|value| value.is_dir())
+    {
+        return None;
+    }
+    let app = resources.join("app");
+    let unpacked = metadata(&app)?.is_some_and(|value| value.is_dir());
+    let archive = metadata(&resources.join("app.asar"))?.is_some_and(|value| value.is_file());
+    let targets = patch_ide::js_targets(root);
+    let out = unpacked && metadata(targets.ide_main.parent()?)?.is_some_and(|value| value.is_dir());
+    let dist = unpacked && metadata(targets.desktop_main.parent()?)?.is_some_and(|value| value.is_dir());
+    let standard_desktop = root.file_name().and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("Antigravity.app"));
+    match (out, dist, archive) {
+        (true, false, false) => Some(InstallationKind::Ide),
+        (false, true, _) => Some(InstallationKind::Desktop),
+        (false, false, true) if standard_desktop => Some(InstallationKind::Desktop),
+        _ => None,
+    }
+}
+
 #[cfg(windows)]
 pub(crate) struct InstallationLayout {
     pub(crate) kind: InstallationKind,
@@ -525,7 +929,11 @@ pub(crate) struct InstallationLayout {
 /// The effect branch owns classification; presentation labels cannot mint it.
 #[cfg(windows)]
 pub(crate) fn receive_installation_layout(root: &Path) -> Result<InstallationLayout, String> {
-    let archive = installation_resources(root).join("app.asar");
+    let resources = root.join("resources");
+    if receive_discovery_metadata(fs::symlink_metadata(&resources))?.as_ref().is_some_and(discovery_reparse_point) {
+        return Err("installation resources is a reparse point".into());
+    }
+    let archive = resources.join("app.asar");
     let scripts = patch_ide::js_targets(root);
     let archive_present = discovery_metadata(&archive)?.is_some();
     let (out, dist, new_desktop) = if archive_present {
@@ -539,6 +947,9 @@ pub(crate) fn receive_installation_layout(root: &Path) -> Result<InstallationLay
         };
         (asar::read_asar_entry_checked(&archive, "out/main.js")?.is_some(), dist.is_some(), new_desktop)
     } else {
+        if receive_discovery_metadata(fs::symlink_metadata(resources.join("app")))?.as_ref().is_some_and(discovery_reparse_point) {
+            return Err("unpacked installation app is a reparse point".into());
+        }
         (discovery_metadata(&scripts.ide_main)?.is_some_and(|value| value.is_file()),
          discovery_metadata(&scripts.desktop_main)?.is_some_and(|value| value.is_file()), false)
     };
@@ -566,11 +977,11 @@ pub(crate) fn receive_installation_layout(root: &Path) -> Result<InstallationLay
     Err("installation effect kind/anchor is unavailable".into())
 }
 
-pub fn process_install(install: &Path) -> Result<InstallOutcome, String> {
-    process_install_received(install, None)
+pub fn process_install(owner: &mut utils::CommandOutcome, install: &Path) -> Result<InstallOutcome, String> {
+    process_install_received(owner, install, None)
 }
 
-pub(crate) fn process_install_received(install: &Path, expected: Option<InstallationKind>) -> Result<InstallOutcome, String> {
+pub(crate) fn process_install_received(owner: &mut utils::CommandOutcome, install: &Path, expected: Option<InstallationKind>) -> Result<InstallOutcome, String> {
     #[cfg(windows)]
     let layout = receive_installation_layout(install)?;
     #[cfg(windows)]
@@ -699,7 +1110,11 @@ pub(crate) fn process_install_received(install: &Path, expected: Option<Installa
         // above; here the leftover is an environment variable rather than a
         // settings key, and it outlives a reinstall, so taking it back out
         // matters more, not less.
-        if let Err(e) = endpoint::remove_cli() {
+        #[cfg(windows)]
+        let removed = endpoint::remove_cli(owner);
+        #[cfg(not(windows))]
+        let removed = endpoint::remove_cli();
+        if let Err(e) = removed {
             if expected.is_some() { return Err(format!("Нативный CLI изменён, но прежняя переменная не снята: {e}")); }
             warnings.push(format!("Прежний {} не снят: {}", endpoint::CLI_ENV_VAR, e));
         }
@@ -730,18 +1145,20 @@ fn binary_failure_message(summary: &patch_binary::BinarySummary) -> String {
 /// is the common case, and pulling the root from under a relay that is still an
 /// older build makes every gate request die as `BadCertificate`. Returns whether
 /// anything was actually taken out.
-#[cfg(not(target_os = "macos"))]
-pub fn remove_legacy_ca_quiet() -> bool {
+pub fn remove_legacy_ca_quiet(owner: &mut utils::CommandOutcome) -> Result<bool, String> {
     let cert = proxy::ca_cert_path();
     if !cert.exists() {
-        return false;
+        return Ok(false);
     }
     if background::relay_is_outdated() {
-        return false;
+        return Ok(false);
     }
-    endpoint::clear_node_ca(&cert.to_string_lossy()).ok();
+    #[cfg(windows)]
+    endpoint::clear_node_ca(owner, &cert.to_string_lossy())?;
+    #[cfg(not(windows))]
+    { let _ = owner; endpoint::clear_node_ca(&cert.to_string_lossy())?; }
     proxy::untrust_ca();
-    true
+    Ok(true)
 }
 
 /// Which product an install directory is, for the progress line.
@@ -753,7 +1170,7 @@ pub fn install_label(install: &Path) -> &'static str {
     if install.join("agy.exe").is_file() || install.join("agy").is_file() {
         "Antigravity CLI"
     } else if install.join("Antigravity IDE.exe").exists()
-        || installation_resources(install).join("app").join("out").exists()
+        || install.join("resources").join("app").join("out").exists()
     {
         "Antigravity IDE"
     } else {
@@ -761,48 +1178,110 @@ pub fn install_label(install: &Path) -> &'static str {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn unsupported_macos_role(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
-    args.into_iter().any(|arg| [elevate::PATCH_ROOT_FLAG, elevate::UNPATCH_ROOT_FLAG,
-        background::FORWARDER_FLAG, background::WATCHDOG_FLAG].iter().any(|flag| arg == std::ffi::OsStr::new(flag)))
+fn receive_command_role<T>(root: &std::sync::Arc<command_lifetime::CommandLifetime>, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    receive_command_role_with_writer(root, action, &mut std::io::stderr())
+}
+
+fn receive_command_role_with_writer<T>(root: &std::sync::Arc<command_lifetime::CommandLifetime>,
+    action: impl FnOnce() -> Result<T, String>, diagnostic: &mut impl std::io::Write) -> Result<T, String> {
+    let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action));
+    root.close_admission();
+    let mut reported = false;
+    let mut receiving_panics = Vec::new();
+    let mut diagnostic_errors = Vec::new();
+    loop {
+        let receiving = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.receive()));
+        match receiving {
+            Ok(command_lifetime::Receiving::Ready) => break,
+            Ok(command_lifetime::Receiving::Pending(holds)) => {
+                if !reported {
+                    if let Err(error) = writeln!(diagnostic, "command resources remain held: {}", holds.join(", ")) {
+                        diagnostic_errors.push(error);
+                    }
+                    reported = true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(payload) => {
+                receiving_panics.push(payload);
+                // Keep the original role value and root outside this catch.
+                // A receiver defect is a hold, not a repeated-panic retry loop.
+                loop { std::thread::park_timeout(Duration::from_millis(10)); }
+            }
+        }
+    }
+    for error in root.take_failures() {
+        if let Ok(value) = &mut result {
+            *value = Err(match value.as_ref().err() { Some(original) => format!("{original}; {error}"), None => error });
+        }
+    }
+    let mut panics = root.take_panics();
+    receiving_panics.append(&mut panics);
+    if result.is_ok() && !receiving_panics.is_empty() {
+        std::panic::resume_unwind(receiving_panics.remove(0));
+    }
+    match result { Ok(value) => value, Err(payload) => std::panic::resume_unwind(payload) }
+}
+
+#[cfg(windows)]
+const STOPPED_BACKGROUND_MAINTENANCE: &str = "--update-stopped-background";
+#[cfg(windows)]
+const VENDOR_SUPERSESSION_MAINTENANCE: &str = "--record-vendor-supersession";
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaintenanceEntry { StoppedBackground, VendorSupersession }
+
+#[cfg(windows)]
+fn maintenance_entry(role: Option<&std::ffi::OsStr>, mut tail: impl Iterator<Item = std::ffi::OsString>) -> Result<Option<MaintenanceEntry>, &'static str> {
+    let entry = match role {
+        Some(role) if role == STOPPED_BACKGROUND_MAINTENANCE => Some(MaintenanceEntry::StoppedBackground),
+        Some(role) if role == VENDOR_SUPERSESSION_MAINTENANCE => Some(MaintenanceEntry::VendorSupersession),
+        _ => None,
+    };
+    if entry.is_some() {
+        if tail.next().is_none() { return Ok(entry); }
+    } else if !tail.any(|arg| arg == STOPPED_BACKGROUND_MAINTENANCE || arg == VENDOR_SUPERSESSION_MAINTENANCE) {
+        return Ok(None);
+    }
+    Err("Параметр обслуживания должен быть единственным аргументом.")
+}
+
+#[cfg(windows)]
+fn run_stopped_background_maintenance() -> Result<i32, String> {
+    let image = windows_coordinator::process_identity::CurrentImage::capture()?;
+    background::require_stopped_delivery_elevation(&image)?;
+    let _writer = instances::acquire_gui_writer()?;
+    let lifetime = std::sync::Arc::new(ops::GuiLifetime::with_image(Ok(std::sync::Arc::new(image))));
+    gui::run_stopped_delivery(lifetime)
+}
+
+#[cfg(windows)]
+fn run_vendor_supersession_maintenance() -> Result<i32, String> {
+    let image = windows_coordinator::process_identity::CurrentImage::capture()?;
+    background::require_vendor_supersession_actor(&image)?;
+    let _writer = instances::acquire_gui_writer()?;
+    let lifetime = std::sync::Arc::new(ops::GuiLifetime::with_image(Ok(std::sync::Arc::new(image))));
+    gui::run_vendor_supersession(lifetime)
 }
 
 fn main() {
-    #[cfg(target_os = "macos")]
-    if unsupported_macos_role(env::args_os().skip(1)) {
-        eprintln!("Этот служебный режим недоступен на macOS.");
-        std::process::exit(1);
-    }
-    // The informational CLI has no state; preserve the existing proxy-role
-    // precedence when mixed with an informational flag.
-    #[cfg(target_os = "macos")]
-    if !env::args_os().any(|arg| arg == std::ffi::OsStr::new(background::PROXY_FLAG)) {
-        canary::handle_cli_flags();
-    }
-    #[cfg(target_os = "macos")]
-    let _mac_state = {
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("Запуск macOS от имени root не поддерживается.");
-            std::process::exit(1);
-        }
-        let input = user_state_location::MacStateInput {
-            xdg_data_home: env::var_os("XDG_DATA_HOME"), home: env::var_os("HOME"),
-        };
-        match user_state_location::initialize_macos_state(input) {
-            Ok(state) => state,
-            Err(error) => { eprintln!("Не удалось подготовить каталог данных: {error}"); std::process::exit(1); }
-        }
-    };
     #[allow(unused_mut)]
     let mut gui_replacement = false;
     #[cfg(windows)]
     let mut replacement_action = None;
+    #[cfg(windows)]
+    let mut retirement_input = None;
     // Only the exact first role selects a host mode. In particular no argument
     // in an opaque language-server tail can enter console/GUI/service startup.
     #[cfg(windows)]
     {
         let mut args = env::args_os().skip(1);
         let role = args.next();
+        if role.as_deref() == Some(std::ffi::OsStr::new(passive_registry_helper::ROLE)) {
+            let code = if args.next().is_none() { passive_registry_helper::run() } else { 1 };
+            std::process::exit(code);
+        }
         if role.as_deref() == Some(std::ffi::OsStr::new("--wsl-gateway")) {
             let code = match wsl_direct_gateway_host::run(args.collect()) { Ok(()) => 0, Err(_) => 1 };
             std::process::exit(code);
@@ -819,6 +1298,43 @@ fn main() {
                 Err(_) => return,
             };
             gui_replacement = true;
+        } else {
+            let outcome = match maintenance_entry(role.as_deref(), args) {
+                Ok(None) => None,
+                Ok(Some(MaintenanceEntry::StoppedBackground)) => Some(run_stopped_background_maintenance()),
+                Ok(Some(MaintenanceEntry::VendorSupersession)) => Some(run_vendor_supersession_maintenance()),
+                Err(error) => Some(Err(error.into())),
+            };
+            if let Some(outcome) = outcome {
+                let code = match outcome {
+                    Ok(code) => code,
+                    Err(error) => {
+                        let title = if role.as_deref() == Some(std::ffi::OsStr::new(STOPPED_BACKGROUND_MAINTENANCE)) {
+                            "Обновление фонового файла Antigravity Unlocker"
+                        } else { "Обслуживание Antigravity Unlocker" };
+                        utils::message_box(title, &error);
+                        1
+                    }
+                };
+                std::process::exit(code);
+            }
+        }
+    }
+    #[cfg(windows)]
+    if !gui_replacement {
+        let args: Vec<_> = env::args_os().skip(1).collect();
+        let has_input = args.iter().any(|arg| arg == "--wsl-retirement-input" || arg == "--wsl-retirement-input-sha256");
+        if has_input {
+            if args.len() != 4 { return; }
+            let mut path = None;
+            let mut digest = None;
+            for pair in args.chunks_exact(2) {
+                if pair[0] == "--wsl-retirement-input" && path.is_none() { path = Some(std::path::PathBuf::from(&pair[1])); }
+                else if pair[0] == "--wsl-retirement-input-sha256" && digest.is_none() { digest = pair[1].to_str().map(str::to_owned); }
+                else { return; }
+            }
+            let (Some(path), Some(digest)) = (path, digest) else { return; };
+            retirement_input = match ops::retirement_input_ref(path, &digest) { Ok(value) => Some(value), Err(_) => return };
         }
     }
     if !gui_replacement {
@@ -833,8 +1349,22 @@ fn main() {
 
     if env::args().any(|a| a == background::FORWARDER_FLAG) {
         dns_forwarder::detach_console();
-        watchdog::start();
-        if let Err(e) = dns_forwarder::run() {
+        #[cfg(windows)]
+        {
+            let received = windows_coordinator::process_identity::CurrentImage::capture()
+                .map(std::sync::Arc::new).and_then(gate::receive_runtime_image);
+            if let Err(error) = received {
+                dns_forwarder::log_fatal(&format!("runtime image receiving failed: {error}"));
+                std::process::exit(1);
+            }
+        }
+        let root = std::sync::Arc::new(command_lifetime::CommandLifetime::default());
+        let result = receive_command_role(&root, || {
+            #[cfg(all(not(windows), not(target_os = "macos")))]
+            watchdog::start(root.clone());
+            dns_forwarder::run(root.clone())
+        });
+        if let Err(e) = result {
             dns_forwarder::log_fatal(&e);
             std::process::exit(1);
         }
@@ -843,17 +1373,62 @@ fn main() {
 
     if env::args().any(|a| a == background::WATCHDOG_FLAG) {
         dns_forwarder::detach_console();
-        watchdog::run_forever();
+        #[cfg(target_os = "macos")]
+        let _worker_lease = match instances::acquire_watchdog_worker() {
+            Ok(lease) => lease,
+            Err(error) => { eprintln!("watchdog: {error}"); std::process::exit(1); }
+        };
+        #[cfg(target_os = "macos")]
+        let (_worker_log, worker_log_alias) = {
+            use std::io::Write;
+            use std::os::fd::AsRawFd;
+            let mut log = match background::open_watchdog_log() {
+                Ok(log) => log,
+                Err(error) => { eprintln!("watchdog: {error}"); std::process::exit(1); }
+            };
+            if log.as_raw_fd() <= 2 {
+                eprintln!("watchdog: журнал не получил отдельный дескриптор"); std::process::exit(1);
+            }
+            if unsafe { libc::dup2(log.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+                eprintln!("watchdog: {}", std::io::Error::last_os_error());
+                std::process::exit(1);
+            }
+            let stamp = utils::local_clock().map_or_else(String::new, |clock| clock.hms());
+            if writeln!(log, "{stamp} watchdog: startup").is_err() { std::process::exit(1); }
+            let alias = match log.try_clone() {
+                Ok(alias) if alias.as_raw_fd() > 2 && alias.as_raw_fd() != log.as_raw_fd() => alias,
+                Ok(_) => { eprintln!("watchdog: неверный дескриптор журнала"); std::process::exit(1); }
+                Err(error) => { eprintln!("watchdog: {error}"); std::process::exit(1); }
+            };
+            (log, alias)
+        };
+        let root = std::sync::Arc::new(command_lifetime::CommandLifetime::default());
+        let result = receive_command_role(&root, || watchdog::run_forever(root.clone()));
+        #[cfg(target_os = "macos")]
+        drop(worker_log_alias);
+        if let Err(error) = result {
+            eprintln!("watchdog: {error}");
+            std::process::exit(1);
+        }
         return;
     }
 
     if env::args().any(|a| a == background::PROXY_FLAG) {
-        dns_forwarder::detach_console();
-        if let Err(e) = dns_forwarder::run_proxy_service() {
-            dns_forwarder::log_fatal(&e);
+        #[cfg(windows)]
+        {
+            dns_forwarder::log_fatal("Windows carrier requires the qualified managed forwarder role");
             std::process::exit(1);
         }
-        return;
+        #[cfg(not(windows))]
+        {
+            dns_forwarder::detach_console();
+            let root = std::sync::Arc::new(command_lifetime::CommandLifetime::default());
+            if let Err(e) = receive_command_role(&root, || dns_forwarder::run_proxy_service(root.clone())) {
+                dns_forwarder::log_fatal(&e);
+                std::process::exit(1);
+            }
+            return;
+        }
     }
 
     // Root's half of patching a root-owned install (`elevate`): started by
@@ -871,6 +1446,12 @@ fn main() {
     canary::handle_cli_flags();
     }
 
+    #[cfg(windows)]
+    let (selected_image, replacement_action) = match replacement_action {
+        Some(received) => (Ok(std::sync::Arc::new(received.image)), Some(received.action)),
+        None => (windows_coordinator::process_identity::CurrentImage::capture().map(std::sync::Arc::new), None),
+    };
+
     // A window of an older release left open would keep re-applying its own
     // state under this one.
     #[cfg(windows)]
@@ -882,15 +1463,18 @@ fn main() {
         }
     };
     #[cfg(target_os = "macos")]
-    let _settings_writer = match instances::acquire_gui_writer(&_mac_state) {
+    let _settings_writer = match instances::acquire_gui_writer() {
         Ok(lease) => lease,
-        Err(error) => { eprintln!("Не удалось получить доступ к настройкам: {error}"); return; }
+        Err(error) => {
+            utils::message_box("Antigravity Unlocker", &format!("Окно не запущено: {error}"));
+            return;
+        }
     };
     #[cfg(all(not(windows), not(target_os = "macos")))]
     instances::close_others();
 
     if !gui_replacement && tui::requested() {
-        run_tui(None, None);
+        run_tui(None, None, #[cfg(windows)] selected_image.clone());
         return;
     }
     // A server over SSH: a terminal, and nothing to draw a window into.
@@ -900,7 +1484,14 @@ fn main() {
         return;
     }
 
+    #[cfg(windows)]
+    let lifetime = std::sync::Arc::new(ops::GuiLifetime::with_image(selected_image));
+    #[cfg(not(windows))]
     let lifetime = std::sync::Arc::new(ops::GuiLifetime::default());
+    #[cfg(windows)]
+    if let Some(input) = retirement_input {
+        if lifetime.receive_retirement_input(input).is_err() { return; }
+    }
     #[cfg(windows)]
     if let Some(action) = replacement_action {
         if lifetime.receive_action(action).is_err() { return; }
@@ -913,7 +1504,7 @@ fn main() {
         // double-clicked launcher has none, and gets the message instead).
         let note = format!("Окно не открылось ({e}) — работаю в терминале.");
         #[cfg(target_os = "windows")]
-        if lifetime.can_start_fallback() { run_tui(Some(note), None); return; }
+        if lifetime.can_start_fallback() { run_tui(Some(note), None, lifetime.retained_image()); return; }
         #[cfg(not(target_os = "windows"))]
         {
             use std::io::IsTerminal;
@@ -924,12 +1515,17 @@ fn main() {
         }
         utils::message_box("Antigravity Unlocker", &format!("{e}\nПовторный интерфейс не запускается. Ожидается завершение собственных операций."));
     }
-    settle_gui_lifetime(&lifetime);
+    let command_results = settle_gui_lifetime(&lifetime);
+    let _command_reporting = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report_final_command_results(&command_results)));
     if lifetime.replacement_committed() { return; }
     if result.is_err() { std::process::exit(1); }
 }
 
-fn run_tui(note: Option<String>, hold: Option<String>) {
+fn run_tui(note: Option<String>, hold: Option<String>,
+    #[cfg(windows)] image: Result<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>, String>) {
+    #[cfg(windows)]
+    let lifetime = std::sync::Arc::new(ops::GuiLifetime::with_image(image));
+    #[cfg(not(windows))]
     let lifetime = std::sync::Arc::new(ops::GuiLifetime::default());
     if let Some(reason) = hold {
         if let Err(error) = lifetime.hold_automatic_effects(reason) {
@@ -938,7 +1534,8 @@ fn run_tui(note: Option<String>, hold: Option<String>) {
         }
     }
     let result = tui::run(note, lifetime.clone());
-    settle_gui_lifetime(&lifetime);
+    let command_results = settle_gui_lifetime(&lifetime);
+    let _command_reporting = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report_final_command_results(&command_results)));
     if lifetime.replacement_committed() { return; }
     if let Err(e) = result {
         utils::message_box("Antigravity Unlocker", &e);
@@ -946,12 +1543,28 @@ fn run_tui(note: Option<String>, hold: Option<String>) {
     }
 }
 
-fn settle_gui_lifetime(lifetime: &std::sync::Arc<ops::GuiLifetime>) {
+fn report_final_command_results(results: &[String]) -> Vec<std::io::Error> {
+    use std::io::Write;
+    let mut errors = Vec::new();
+    for result in results {
+        if let Err(error) = writeln!(std::io::stderr(), "{result}") { errors.push(error); }
+    }
+    errors
+}
+
+fn settle_gui_lifetime(lifetime: &std::sync::Arc<ops::GuiLifetime>) -> Vec<String> {
     lifetime.request_final_retirement();
     let mut last_error = None;
     loop {
         match lifetime.finalize_exit() {
-            Ok(true) => return,
+            Ok(true) => match lifetime.take_final_command_results() {
+                Ok(results) => {
+                    let mut panics = lifetime.take_command_panics();
+                    if !panics.is_empty() { std::panic::resume_unwind(panics.remove(0)); }
+                    return results;
+                },
+                Err(error) => { if last_error.as_ref() != Some(&error) { utils::message_box("Antigravity Unlocker", &error); last_error = Some(error); } }
+            },
             Ok(false) => {},
             Err(error) => {
                 let retry = lifetime.save_retry_pending();
@@ -974,40 +1587,64 @@ fn settle_gui_lifetime(lifetime: &std::sync::Arc<ops::GuiLifetime>) {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(windows)]
     #[test]
-    fn unsupported_helper_is_rejected_even_when_proxy_is_also_requested() {
-        for flag in [elevate::PATCH_ROOT_FLAG, elevate::UNPATCH_ROOT_FLAG,
-            background::FORWARDER_FLAG, background::WATCHDOG_FLAG] {
-            assert!(unsupported_macos_role([background::PROXY_FLAG.into(), flag.into()]));
-        }
-        assert!(!unsupported_macos_role([background::PROXY_FLAG.into()]));
+    fn stopped_background_maintenance_requires_exactly_one_argument() {
+        use std::ffi::{OsStr, OsString};
+
+        let receive = |first: Option<&str>, tail: &[&str]| {
+            maintenance_entry(first.map(OsStr::new), tail.iter().map(|arg| OsString::from(*arg)))
+        };
+        assert_eq!(receive(Some(STOPPED_BACKGROUND_MAINTENANCE), &[]), Ok(Some(MaintenanceEntry::StoppedBackground)));
+        assert!(receive(Some(STOPPED_BACKGROUND_MAINTENANCE), &["--watchdog"]).is_err());
+        assert!(receive(Some("--watchdog"), &[STOPPED_BACKGROUND_MAINTENANCE]).is_err());
+        assert_eq!(receive(Some(VENDOR_SUPERSESSION_MAINTENANCE), &[]), Ok(Some(MaintenanceEntry::VendorSupersession)));
+        assert!(receive(Some(VENDOR_SUPERSESSION_MAINTENANCE), &["C:\\foreign"]).is_err());
+        assert!(receive(Some("--watchdog"), &[VENDOR_SUPERSESSION_MAINTENANCE]).is_err());
+        assert_eq!(receive(None, &[]), Ok(None));
+        assert_eq!(receive(Some("--cli"), &[]), Ok(None));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn resource_projection_is_platform_and_final_component_specific() {
-        let bundle = Path::new("/test-fixtures/Antigravity.APP");
-        assert_eq!(installation_resources_for(bundle, true), bundle.join("Contents/Resources"));
-        assert_eq!(installation_resources_for(bundle, false), bundle.join("resources"));
-        for root in [Path::new("/test-fixtures/cli"), Path::new("/test-fixtures/Example.app.other"),
-            Path::new(""), Path::new("relative")]
-        {
-            assert_eq!(installation_resources_for(root, true), root.join("resources"));
-            assert_eq!(installation_resources_for(root, false), root.join("resources"));
+    #[ignore = "requires creator-owned Windows Job and private U04_FIXTURE_EXE/U04_FIXTURE_DIR"]
+    fn role_pending_broken_stderr_keeps_original_until_capture_settles() {
+        struct BrokenReleaseWriter { release: PathBuf, writes: usize }
+        impl std::io::Write for BrokenReleaseWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                let mut marker = fs::OpenOptions::new().write(true).create_new(true).open(&self.release)?;
+                std::io::Write::write_all(&mut marker, b"release")?;
+                marker.sync_all()?;
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
-        // An unrelated or absent bundle name is candidate data, not authorization.
-        let unknown = Path::new("/test-fixtures/unrelated.app");
-        assert_eq!(installation_resources_for(unknown, true), unknown.join("Contents/Resources"));
-    }
-
-    #[test]
-    fn js_targets_use_the_selected_resource_projection() {
-        let root = Path::new("/test-fixtures/Antigravity.app");
-        let resources = installation_resources(root);
-        let targets = patch_ide::js_targets(root);
-        assert_eq!(targets.ide_main, resources.join("app/out/main.js"));
-        assert_eq!(targets.desktop_main, resources.join("app/dist/main.js"));
-        assert_eq!(targets.extension, resources.join("app/extensions/antigravity/dist/extension.js"));
+        let executable = PathBuf::from(env::var_os("U04_FIXTURE_EXE").expect("absolute actor"));
+        let parent = PathBuf::from(env::var_os("U04_FIXTURE_DIR").expect("qualified fixture directory"));
+        let directory = parent.join("role-broken-stderr");
+        fs::create_dir(&directory).unwrap();
+        let mut writer = BrokenReleaseWriter { release: directory.join("release"), writes: 0 };
+        let root = std::sync::Arc::new(command_lifetime::CommandLifetime::default());
+        let mut actions = 0;
+        let result: Result<(), String> = receive_command_role_with_writer(&root, || {
+            actions += 1;
+            let (_, pending) = root.call_with_outcome("role broken stderr fixture", |outcome| {
+                let prepared = utils::PreparedExec::fixture_absolute(&executable).unwrap()
+                    .args(["--fixture", "parent"]).arg(directory.as_os_str());
+                assert_eq!(utils::bounded_output(outcome, prepared, Duration::from_millis(400)), utils::CommandObservation::Deadline);
+                assert!(!outcome.releasable());
+                Err::<(), _>("original role error".into())
+            }).unwrap();
+            assert!(pending.pending());
+            Err("original role error".into())
+        }, &mut writer);
+        assert_eq!(actions, 1);
+        assert_eq!(writer.writes, 1);
+        let error = result.unwrap_err();
+        assert!(error.starts_with("original role error; "));
+        assert!(error.contains("capture_eof=true"));
+        assert!(matches!(root.receive(), command_lifetime::Receiving::Ready));
     }
 
     /// Regression: `%LOCALAPPDATA%` holds an `agy` *directory* (the CLI's folder).
@@ -1038,6 +1675,16 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("agy"), b"binary").unwrap();
+        assert!(is_install_root(&base));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_app_bundle_is_an_install_root() {
+        let base = env::temp_dir().join("Antigravity IDE.app");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("Contents").join("Resources").join("app")).unwrap();
         assert!(is_install_root(&base));
         fs::remove_dir_all(&base).ok();
     }
@@ -1148,9 +1795,49 @@ AG_END
         fixture_file(&cli.join("agy.exe"), b"exe");
         let layout = receive_installation_layout(&cli).unwrap();
         assert_eq!((layout.kind, layout.anchor), (InstallationKind::Cli, cli.join("agy.exe")));
+        let unpacked = root.join("unpacked");
+        let first_backup = unpacked.join("resources/app/out/main.js.bak");
+        let entry = patch_ide::js_targets(&unpacked).ide_main;
+        let second_backup = patch_ide::backup_path(&entry);
+        fixture_file(&first_backup, b"first backup");
+        fixture_file(&second_backup, b"second backup");
+        assert_eq!(resolve_install_root_checked(&unpacked).unwrap(), None);
+        let partial = root.join("partial-unpacked");
+        fixture_file(&patch_ide::backup_path(&patch_ide::js_targets(&partial).ide_main), b"backup");
+        fixture_file(&partial.join("resources/app/package.json"), b"{}");
+        assert_eq!(resolve_install_root_checked(&partial).unwrap(), Some(partial.clone()));
+        assert!(matches!(receive_installation_layout(&partial), Err(error) if error == "installation effect kind/anchor is unavailable"));
+        let empty = root.join("empty-unpacked");
+        fs::create_dir_all(empty.join("resources/app/out")).unwrap();
+        assert_eq!(resolve_install_root_checked(&empty).unwrap(), Some(empty));
+        fixture_file(&entry, b"live entry");
+        assert_eq!(resolve_install_root_checked(&unpacked).unwrap(), Some(unpacked.clone()));
+        let layout = receive_installation_layout(&unpacked).unwrap();
+        assert_eq!((layout.kind, layout.anchor), (InstallationKind::Ide, entry));
+        assert_eq!(fs::read(first_backup).unwrap(), b"first backup");
+        assert_eq!(fs::read(second_backup).unwrap(), b"second backup");
         let incomplete = root.join("incomplete");
         fixture_file(&incomplete.join("resources/app/dist/main.js"), b"main");
-        assert!(receive_installation_layout(&incomplete).is_err());
+        assert_eq!(resolve_install_root_checked(&incomplete).unwrap(), Some(incomplete.clone()));
+        assert!(matches!(receive_installation_layout(&incomplete), Err(error) if error == "Desktop executable is unavailable"));
         assert!(receive_installation_layout(&root.join("unknown")).is_err());
+    }
+
+    #[test]
+    #[ignore = "read-only receipt of externally owned dangling junction fixtures"]
+    fn dangling_resource_junctions_remain_incomplete_installation_candidates() {
+        let root = PathBuf::from(std::env::var_os("AG_WSL_DANGLING_DISCOVERY_FIXTURE_ROOT")
+            .expect("explicit owned fixture root"));
+        for (fixture, junction, expected) in [
+            ("resources-junction", "resources", "installation resources is a reparse point"),
+            ("app-junction", "resources/app", "unpacked installation app is a reparse point"),
+        ] {
+            let path = root.join(fixture);
+            let junction = path.join(junction);
+            assert!(discovery_reparse_point(&fs::symlink_metadata(&junction).unwrap()));
+            assert!(matches!(discovery_metadata(&junction), Ok(None)));
+            assert_eq!(resolve_install_root_checked(&path).unwrap(), Some(path.clone()));
+            assert!(matches!(receive_installation_layout(&path), Err(error) if error == expected));
+        }
     }
 }

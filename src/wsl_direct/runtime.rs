@@ -63,20 +63,164 @@ fn selection_without_effects(settings: &Settings) -> Result<Option<SelectionPrep
     let preferences = settings.wsl.as_ref().ok_or("Выбор WSL ещё не подтверждён.")?;
     if !preferences.enabled {
         return Ok(Some(SelectionPreparation { results: preferences.distros.iter().map(|name| TargetApplyResult { name: name.clone(),
-            state: WslTargetState::NotApplied, detail: Some("WSL выключен.".into()) }).collect(), needs_elevation: false }));
+            state: WslTargetState::NotApplied, detail: Some("WSL выключен.".into()), diagnostic: None }).collect(), needs_elevation: false }));
     }
     if preferences.distros.is_empty() { return Err("Выберите дистрибутив WSL.".into()); }
     if !settings.client_patch && !wants_transport(&settings) {
         return Ok(Some(SelectionPreparation { results: preferences.distros.iter().map(|name| TargetApplyResult {
             name: name.clone(), state: WslTargetState::NotApplied,
-            detail: Some("Для WSL не выбраны изменения; запуск остаётся обычным.".into()),
+            detail: Some("Для WSL не выбраны изменения; запуск остаётся обычным.".into()), diagnostic: None,
         }).collect(), needs_elevation: false }));
     }
     Ok(None)
 }
 
+pub(crate) fn preparation_can_start_guest(settings: &Settings) -> bool {
+    matches!(selection_without_effects(settings), Ok(None))
+}
+
 fn wants_transport(settings: &Settings) -> bool {
     settings.dns || settings.local_proxy || settings.own_proxy_enabled || settings.group_proxy || settings.builtin_exits
+}
+
+#[cfg(windows)]
+fn vendor_background_lease(wait: Option<&dyn Fn() -> Result<(), String>>)
+    -> Result<crate::windows_coordinator::windows_installation::BackgroundLease, String> {
+    use crate::windows_coordinator::windows_installation as owner;
+    let locations = owner::background_locations()?;
+    let inputs = owner::background_inputs(locations.managed_root(), locations.managed_directory(), None,
+        &crate::dns_forwarder::log_dir())?;
+    match wait {
+        Some(check) => owner::wait_for_background_lease(inputs, check),
+        None => owner::background_lease(inputs, None),
+    }
+}
+
+/// One owner route for both a GUI-qualified package and automatic reuse.
+#[cfg(windows)]
+pub(crate) fn apply_vendor_update(
+    bound: crate::windows_coordinator::windows_installation::BoundInstallation,
+    expected: &crate::windows_coordinator::windows_installation::VendorUpdateObservation,
+    input: crate::windows_coordinator::windows_installation::VendorRuntimeInput<'_>,
+    settings: &Settings,
+    automatic: bool,
+    cancellation: &AtomicBool,
+) -> std::result::Result<crate::windows_coordinator::windows_installation::VendorUpdateCompletion,
+    crate::windows_coordinator::windows_installation::gateway_rules::GatewayRuleError> {
+    use crate::windows_coordinator::{self as coordinator, windows_installation as owner};
+    use owner::gateway_rules::{GatewayRuleError, GatewayRuleRunner};
+    if automatic && !automatic_vendor_update_wanted(settings) {
+        return Err(GatewayRuleError::Invalid("automatic WSL update is not positively requested".into()));
+    }
+    if selection_without_effects(settings).map_err(GatewayRuleError::from)?.is_some() {
+        return Err(GatewayRuleError::Invalid("WSL update has no selected effect".into()));
+    }
+    let saved = crate::settings::saved_intent_sha256(settings).map_err(GatewayRuleError::from)?;
+    let preferences = settings.wsl.as_ref().ok_or_else(|| GatewayRuleError::Invalid("WSL selection missing".into()))?;
+    let registered = coordinator::registered_distributions_with_cancel(cancellation).map_err(GatewayRuleError::from)?;
+    if !preferences.distros.iter().all(|name| registered.iter().any(|row| row.name == *name)) {
+        return Err(GatewayRuleError::Invalid("selected WSL distribution is no longer registered".into()));
+    }
+    let _background = vendor_background_lease(None).map_err(GatewayRuleError::from)?;
+    if owner::observe_vendor_update(&bound)? != *expected {
+        return Err(GatewayRuleError::RecoveryRequired("vendor prerequisite changed before maintenance".into()));
+    }
+    let desktop = bound.executable().as_path().to_owned();
+    let powershell = coordinator::system_powershell_program().map_err(GatewayRuleError::from)?;
+    let mut window = VendorMaintenance { inner: GuiMaintenance { desktop: &desktop, powershell, cancellation },
+        settings, saved };
+    let qualified = matches!(&input, owner::VendorRuntimeInput::QualifiedPackage { .. });
+    let mut runner = if qualified { Some(coordinator::gateway_native::WindowsGatewayRuleRunner::new(owner::new_request_id)?) } else { None };
+    let prepared = owner::prepare_vendor_update(&hex::encode(expected.prior_current_sha256), bound, None, input,
+        runner.as_mut().map(|value| value as &mut dyn GatewayRuleRunner), cancellation, &mut window)?;
+    prepared.execute(runner.as_mut().map(|value| value as &mut dyn GatewayRuleRunner), cancellation).map_err(GatewayRuleError::from)
+}
+
+#[cfg(windows)]
+fn ensure_saved_apply_intent(settings: &Settings, saved: &[u8; 32],
+    receive: impl FnOnce(&Settings) -> Result<[u8; 32], String>) -> Result<(), String> {
+    if receive(settings)? != *saved {
+        return Err("Cancelled: saved WSL intent changed".into());
+    }
+    Ok(())
+}
+
+/// Finishing a recorded file operation depends on this acknowledged Apply and
+/// its Desktop window, independently of current guest preparation demands.
+#[cfg(windows)]
+struct SavedIntentMaintenance<'a, W: crate::windows_coordinator::windows_installation::MaintenanceWindow> {
+    inner: W,
+    settings: &'a Settings,
+    saved: [u8; 32],
+}
+#[cfg(windows)]
+impl<W: crate::windows_coordinator::windows_installation::MaintenanceWindow> SavedIntentMaintenance<'_, W> {
+    fn ensure_held_with(&mut self, receive: impl FnOnce(&Settings) -> Result<[u8; 32], String>) -> Result<(), String> {
+        ensure_saved_apply_intent(self.settings, &self.saved, receive)?;
+        self.inner.ensure_held()
+    }
+}
+#[cfg(windows)]
+impl<W: crate::windows_coordinator::windows_installation::MaintenanceWindow>
+    crate::windows_coordinator::windows_installation::MaintenanceWindow for SavedIntentMaintenance<'_, W> {
+    fn ensure_held(&mut self) -> Result<(), String> {
+        self.ensure_held_with(crate::settings::saved_intent_sha256)
+    }
+}
+
+#[cfg(windows)]
+struct VendorMaintenance<'a> {
+    inner: GuiMaintenance<'a>,
+    settings: &'a Settings,
+    saved: [u8; 32],
+}
+#[cfg(windows)]
+impl crate::windows_coordinator::windows_installation::MaintenanceWindow for VendorMaintenance<'_> {
+    fn ensure_held(&mut self) -> Result<(), String> {
+        ensure_saved_apply_intent(self.settings, &self.saved, crate::settings::saved_intent_sha256)?;
+        let selected = self.settings.wsl.as_ref().ok_or("WSL selection missing")?;
+        let registered = crate::windows_coordinator::registered_distributions_with_cancel(self.inner.cancellation)?;
+        if !selected.enabled || selected.distros.is_empty()
+            || !selected.distros.iter().all(|name| registered.iter().any(|row| row.name == *name)) {
+            return Err("Cancelled: selected WSL registration changed".into());
+        }
+        crate::windows_coordinator::windows_installation::MaintenanceWindow::ensure_held(&mut self.inner)
+    }
+}
+
+/// Automatic callers never invent a package; only a previously received host
+/// can be reused, and every real mutation still goes through the same owner.
+#[cfg(windows)]
+pub(crate) fn automatic_vendor_update(root: &std::path::Path, settings: &Settings,
+    cancellation: &AtomicBool) -> Result<bool, String> {
+    use crate::windows_coordinator::{self as coordinator, windows_installation as owner};
+    if !automatic_vendor_update_wanted(settings) { return Ok(false); }
+    let layout = crate::receive_installation_layout(root)?;
+    if layout.kind != crate::InstallationKind::Desktop { return Ok(false); }
+    let mut bound = owner::BoundInstallation::open(&layout.anchor)?;
+    if let Some(context) = coordinator::receive_saved_context(&bound)? { bound.attach_ancestor_context(context)?; }
+    match owner::observe_apply_current(&bound)? {
+        owner::ApplyCurrentObservation::VendorReplacement(expected) => {
+            use sha2::{Digest, Sha256};
+            let source = owner::CheckedPath::open(&std::env::current_exe().map_err(|e| format!("runtime image: {e}"))?,
+                owner::PathKind::File, owner::PathPurpose::Executable)?;
+            let source_sha256 = hex::encode(Sha256::digest(source.read_snapshot()?));
+            apply_vendor_update(bound, &expected, owner::VendorRuntimeInput::ReuseReceivedRuntime { source: &source, source_sha256: &source_sha256 },
+                settings, true, cancellation).map_err(|error| error.to_string())?;
+            Ok(true)
+        }
+        owner::ApplyCurrentObservation::Absent | owner::ApplyCurrentObservation::Settled { .. } => Ok(false),
+        owner::ApplyCurrentObservation::GatewayPending(_) => Err("RecoveryRequired: gateway operation is Pending".into()),
+        owner::ApplyCurrentObservation::VendorPending(_) => Err("RecoveryRequired: vendor operation is Pending; ordinary Apply must receive recovery".into()),
+    }
+}
+
+/// Intent only: actual registration, target identity and the maintenance gate
+/// are received independently before the automatic writer may run.
+pub(crate) fn automatic_vendor_update_wanted(settings: &Settings) -> bool {
+    settings.auto_patch_wanted()
+        && settings.wsl.as_ref().is_some_and(|wsl| wsl.enabled && !wsl.distros.is_empty())
+        && (settings.client_patch || wants_transport(settings))
 }
 
 #[cfg(windows)]
@@ -96,6 +240,39 @@ impl WslApplyPreparation {
     pub(crate) fn requires_elevation(&self) -> bool {
         matches!(self, Self::Selected(selected) if selected.needs_elevation)
     }
+}
+
+/// Settle the acknowledged vendor prerequisites before ordinary native Apply.
+#[cfg(windows)]
+pub(crate) fn apply_vendor_prerequisites(plan: &crate::ops::AllTargetApplyPlan, cancellation: &AtomicBool)
+    -> Result<Vec<(String, [u8; 32])>, String> {
+    use crate::windows_coordinator::windows_installation as owner;
+    let selected = match plan.wsl()? {
+        WslApplyPreparation::Selected(value) => value,
+        WslApplyPreparation::NotSelected(_) => return Err("UpdatePending: WSL vendor update is not selected".into()),
+    };
+    let mut completed = Vec::new();
+    for target in plan.wsl_desktops().filter(|target| target.is_vendor_update()) {
+        let operation = (|| -> Result<(String, [u8; 32]), String> {
+            if cancellation.load(Ordering::SeqCst) { return Err("Cancelled: vendor update not started".into()); }
+            let (bound, observation) = target.receive_acknowledged_desktop_current()?;
+            let expected = match observation {
+                owner::ApplyCurrentObservation::VendorReplacement(value) => value,
+                _ => return Err("UpdatePending: vendor prerequisite changed".into()),
+            };
+            let received = apply_vendor_update(bound, &expected, owner::VendorRuntimeInput::QualifiedPackage {
+                source: &selected.source, expected_host_sha256: &selected.source_sha256, assets: &selected.assets,
+                selection: plan.retirement_for(&expected)?,
+            }, plan.wanted(), false, cancellation).map_err(|error| error.to_string())?;
+            if received.slot_id != expected.slot_id { return Err("vendor result slot differs".into()); }
+            Ok((received.slot_id, received.current_sha256))
+        })();
+        match operation {
+            Ok(slot) => completed.push(slot),
+            Err(error) => return Err(format!("{error}; completed vendor slots: {completed:?}")),
+        }
+    }
+    Ok(completed)
 }
 
 #[cfg(windows)]
@@ -137,7 +314,17 @@ pub(crate) fn inspect_selection(plan: &crate::ops::AllTargetApplyPlan, cancellat
         desktops += 1;
         if cancellation.load(Ordering::SeqCst) { return Err("WSL requirement collection cancelled".into()); }
         let bound = target.desktop_binding()?;
-        let host = GatewayHostInput::receive(&bound, &source, &source_sha256).map_err(|error| error.to_string())?;
+        let observation = owner::observe_apply_current(&bound)?;
+        if matches!(&observation, owner::ApplyCurrentObservation::VendorPending(_) | owner::ApplyCurrentObservation::GatewayPending(_)) {
+            return Err("RecoveryRequired: Apply prerequisite must settle before selected package planning".into());
+        }
+        let vendor = matches!(&observation, owner::ApplyCurrentObservation::VendorReplacement(_));
+        let host = match observation {
+            owner::ApplyCurrentObservation::VendorReplacement(ref expected) =>
+                GatewayHostInput::vendor_prerequisite(&bound, &source, &source_sha256, expected,
+                    plan.retirement_for(expected)?, plan.saved_sha256()),
+            _ => GatewayHostInput::receive(&bound, &source, &source_sha256),
+        }.map_err(|error| error.to_string())?;
         let wanted = match active_profiles {
             Some(active_profiles) => GatewayRequirementNamespaces::TransportWanted { namespaces: &namespaces,
                 active_profiles, administrator: crate::utils::is_admin() },
@@ -149,7 +336,7 @@ pub(crate) fn inspect_selection(plan: &crate::ops::AllTargetApplyPlan, cancellat
         needs_elevation |= matches!(requirements.rules, GatewayRuleEffect::NativeWriteRequired { administrator: false });
         // A new host's transport demand does not discharge old-host custody.
         // Retirement preparation is read-only and also covers transport off.
-        if owner::runtime_installed(&bound)? {
+        if !vendor && owner::runtime_installed(&bound)? {
             let read = owner::admit_runtime_read(target.desktop_binding()?, "wsl-gui-v2")?;
             if read.host_sha256() != source_sha256 {
                 let old_host = checked_runtime_host(&read)?;
@@ -180,6 +367,7 @@ pub(crate) fn prepare_runtime(input: RuntimePreparationInput, cancellation: Arc<
     let transport = wants_transport(&input.settings);
     let mut gateway = None;
     let architecture;
+    let guest_home;
     if transport {
         let ps = coordinator::system_powershell_program()?;
         let context = coordinator::discover_runtime_context(&program, &ps, &input.launch.distro, &cancellation)?;
@@ -195,6 +383,7 @@ pub(crate) fn prepare_runtime(input: RuntimePreparationInput, cancellation: Arc<
         }
         receive_gateway_rule(&read, &context, &cancellation)?;
         architecture = context.architecture.clone();
+        guest_home = context.home.clone();
         gateway = Some(session::SessionSpec {
             program: session::GatewayProgramRef::receive(host.as_path(), &host.native_id(), &input.host_sha256)?,
             selected_distro: input.launch.distro.clone(), selected_user: context.user,
@@ -206,9 +395,11 @@ pub(crate) fn prepare_runtime(input: RuntimePreparationInput, cancellation: Arc<
             status_line_bytes: 16_384,
         });
     } else {
-        architecture = coordinator::discover_runtime_identity(&program, &input.launch.distro, &cancellation)?.architecture;
+        let identity = coordinator::discover_runtime_identity(&program, &input.launch.distro, &cancellation)?;
+        architecture = identity.architecture;
+        guest_home = identity.home;
     }
-    let launcher = coordinator::provision_runtime_helper(&program, &input.launch.distro, &assets, &architecture, &cancellation)?;
+    let launcher = coordinator::provision_runtime_helper(&program, &input.launch.distro, &assets, &architecture, &guest_home, &cancellation)?;
     if cancellation.load(Ordering::SeqCst) { return Err("runtime preparation cancelled after helper retirement".into()); }
     host.recheck()?;
     Ok(RuntimeRecipe { gateway, program, launch: input.launch, launcher,
@@ -235,12 +426,12 @@ fn prepare_windows_selection(plan: Arc<crate::ops::AllTargetApplyPlan>, cancella
     let mut results = Vec::new();
     for name in &wanted.distros {
         if cancellation.load(Ordering::SeqCst) {
-            results.push(TargetApplyResult { name: name.clone(), state: WslTargetState::Cancelled, detail: None });
+            results.push(TargetApplyResult { name: name.clone(), state: WslTargetState::Cancelled, detail: None, diagnostic: None });
             continue;
         }
         if !registered.iter().any(|row| row.name == *name) {
             results.push(TargetApplyResult { name: name.clone(), state: WslTargetState::Blocked,
-                detail: Some("Дистрибутив больше не зарегистрирован.".into()) });
+                detail: Some("Дистрибутив больше не зарегистрирован.".into()), diagnostic: None });
             continue;
         }
         for (index, target) in desktops.iter().enumerate() {
@@ -249,6 +440,9 @@ fn prepare_windows_selection(plan: Arc<crate::ops::AllTargetApplyPlan>, cancella
             let operation = (|| -> Result<(), String> {
                 if !begun[index] { target.recheck_desktop_current()?; }
                 let mut bound = target.desktop_binding()?;
+                if matches!(owner::observe_apply_current(&bound)?, owner::ApplyCurrentObservation::VendorReplacement(_)) {
+                    return Err("UpdatePending: Desktop changed after the acknowledged Apply plan".into());
+                }
                 if !owner::runtime_installed(&bound)? {
                     let ps = coordinator::system_powershell_program()?;
                     let mut window = GuiMaintenance { desktop, powershell: ps, cancellation: &cancellation };
@@ -305,9 +499,9 @@ fn prepare_windows_selection(plan: Arc<crate::ops::AllTargetApplyPlan>, cancella
                 }
                 let program = coordinator::system_wsl_program()?;
                 let identity = coordinator::discover_runtime_identity(&program, name, &cancellation)?;
-                let launcher = coordinator::provision_runtime_helper(&program, name, assets, &identity.architecture, &cancellation)?;
+                let launcher = coordinator::provision_runtime_helper(&program, name, assets, &identity.architecture, &identity.home, &cancellation)?;
                 prepare_private_copy(&program, name, &launcher, &read.server_version()?, &settings,
-                    assets.helper_digest(), &cancellation)?;
+                    assets.helper_digest(), &identity.home, &cancellation)?;
                 if wants_transport(&settings) {
                     let ps = coordinator::system_powershell_program()?;
                     let context = coordinator::discover_runtime_context(&program, &ps, name, &cancellation)?;
@@ -341,10 +535,15 @@ fn prepare_windows_selection(plan: Arc<crate::ops::AllTargetApplyPlan>, cancella
             })();
             merge_target_result(&mut results, match operation {
                 Ok(()) => TargetApplyResult { name: name.clone(), state: WslTargetState::ReadyToOpen,
-                    detail: Some("Подготовка проверена. Откройте WSL в Antigravity.".into()) },
+                    detail: Some("Откройте WSL в Antigravity.".into()), diagnostic: None },
                 Err(error) => TargetApplyResult { name: name.clone(), state: if error.starts_with("Cancelled:") { WslTargetState::Cancelled }
                     else if error.contains("RecoveryRequired:") || error.contains("PreparationIncomplete:") { WslTargetState::Pending }
-                    else { WslTargetState::Blocked }, detail: Some(error) },
+                    else { WslTargetState::Blocked },
+                    detail: Some("Не удалось завершить подготовку. Подробности — в журнале.".into()),
+                    diagnostic: Some(format!("WSL {}: {}", name, crate::windows_coordinator::MetadataContext {
+                        purpose: crate::windows_coordinator::MetadataPurpose::PrivateServerPreparation,
+                        distro: Some(name), private_values: &[desktop.to_str().unwrap_or("")],
+                    }.safe_text(&error))) },
             });
             if needs_elevation { return Ok(SelectionPreparation { results, needs_elevation: true }); }
         }
@@ -398,6 +597,13 @@ fn merge_target_result(results: &mut Vec<TargetApplyResult>, next: TargetApplyRe
             current.detail = Some(match current.detail.take() { Some(prior) => format!("{prior}; {detail}"), None => detail });
         }
     }
+    if let Some(diagnostic) = next.diagnostic {
+        current.diagnostic = Some(match current.diagnostic.take() {
+            Some(prior) if prior != diagnostic => format!("{prior}; {diagnostic}"),
+            Some(prior) => prior,
+            None => diagnostic,
+        });
+    }
 }
 
 #[cfg(windows)]
@@ -439,8 +645,57 @@ pub(crate) fn recover_apply_gateway(bound: crate::windows_coordinator::windows_i
 #[cfg(windows)]
 pub(crate) fn receive_apply_gateway_outcome(target: &crate::instances::GuiReplacementTarget,
     expected: &crate::windows_coordinator::windows_installation::GatewayPendingObservation,
-    result: Result<String, String>,
+    result: Result<crate::windows_coordinator::windows_installation::RecoveryCompletion, String>,
     current: Result<crate::windows_coordinator::windows_installation::BoundInstallation, String>) -> Result<String, String> {
+    receive_apply_recovery_outcome(target, &expected.slot_id, &expected.operation_id, &expected.current_sha256, result, current, None)
+}
+
+/// Source-free prerequisite of the existing acknowledged Apply. Normal file
+/// rights are attempted first; ordinary RequestElevation/ShowMain remains a
+/// fresh restart, never a fabricated full-plan continuation or a parity waiver.
+#[cfg(windows)]
+pub(crate) fn recover_apply_vendor_metadata(bound: crate::windows_coordinator::windows_installation::BoundInstallation,
+    target: &crate::instances::GuiReplacementTarget,
+    expected: &crate::windows_coordinator::windows_installation::VendorPendingObservation,
+    settings: &Settings, saved: [u8; 32], cancel: &AtomicBool) -> Result<String, String> {
+    use crate::windows_coordinator::{self as coordinator, windows_installation as owner};
+    if cancel.load(Ordering::SeqCst) { return Err("Cancelled: Apply vendor metadata recovery not started".into()); }
+    let check = || {
+        if cancel.load(Ordering::SeqCst) { return Err("Cancelled: Apply vendor metadata recovery interrupted".into()); }
+        ensure_saved_apply_intent(settings, &saved, crate::settings::saved_intent_sha256)?;
+        if cancel.load(Ordering::SeqCst) { return Err("Cancelled: Apply vendor metadata recovery interrupted".into()); }
+        Ok(())
+    };
+    check()?;
+    if target.kind != crate::instances::GuiTargetKind::Desktop
+        || bound.native_root_id() != target.native_root_id || bound.native_executable_id() != target.anchor_native_id
+        || !owner::same_windows_path(bound.executable().as_path(), &target.anchor_path)? {
+        return Err("RecoveryRequired: selected vendor recovery intent/target changed".into());
+    }
+    bound.revalidate_context()?;
+    if owner::wait_for_apply_current(&bound, "initial Current observation", &check)?
+        != owner::ApplyCurrentObservation::VendorPending(expected.clone()) {
+        return Err("RecoveryRequired: Apply vendor prerequisite snapshot changed".into());
+    }
+    let _background = vendor_background_lease(Some(&check))?;
+    let powershell = coordinator::system_powershell_program()?;
+    let mut window = SavedIntentMaintenance { inner: GuiMaintenance { desktop: &target.anchor_path, powershell, cancellation: cancel }, settings, saved };
+    let mut runner = coordinator::gateway_native::WindowsGatewayRuleRunner::new(owner::new_request_id)?;
+    let result = owner::recover_waiting_vendor_metadata(bound, &expected.operation_id, &hex::encode(expected.current_sha256),
+        owner::GatewayRecoveryContext { runner: &mut runner, cancel }, &mut window, &check);
+    // Cancellation and Err do not skip receiving a possibly published Current.
+    let current = (|| -> Result<owner::BoundInstallation, String> {
+        let mut current = owner::BoundInstallation::open(&target.anchor_path)?;
+        if let Some(context) = coordinator::receive_saved_context(&current)? { current.attach_ancestor_context(context)?; }
+        Ok(current)
+    })();
+    receive_apply_recovery_outcome(target, &expected.slot_id, &expected.operation_id, &expected.current_sha256, result, current, Some(&check))
+}
+#[cfg(windows)]
+fn receive_apply_recovery_outcome(target: &crate::instances::GuiReplacementTarget, slot_id: &str, operation_id: &str,
+    pending_sha256: &[u8; 32], result: Result<crate::windows_coordinator::windows_installation::RecoveryCompletion, String>,
+    current: Result<crate::windows_coordinator::windows_installation::BoundInstallation, String>,
+    wait_for_success: Option<&dyn Fn() -> Result<(), String>>) -> Result<String, String> {
     use crate::windows_coordinator::windows_installation as owner;
     // Err is not proof of zero changes: finish can publish custody and only
     // then deny fresh readiness. Receive actual Current on both return paths.
@@ -448,16 +703,45 @@ pub(crate) fn receive_apply_gateway_outcome(target: &crate::instances::GuiReplac
         if target.kind != crate::instances::GuiTargetKind::Desktop || current.native_root_id() != target.native_root_id || current.native_executable_id() != target.anchor_native_id {
             return Err("recovery outcome target anchor changed".into());
         }
+        if let (Ok(_), Some(check)) = (&result, wait_for_success) {
+            let stage = "independent success Current observation";
+            // Receive a published Current even if the wait check would now stop.
+            return match owner::observe_apply_current_attempt(&current) {
+                Ok(observed) => Ok(observed),
+                Err(owner::ApplyCurrentReadError::Busy(_)) => {
+                    owner::wait_for_apply_current(&current, stage, check)
+                }
+                Err(owner::ApplyCurrentReadError::Failed(error)) => {
+                    Err(format!("{error}; vendor recovery stage={stage}"))
+                }
+            };
+        }
         owner::observe_apply_current(&current)
     });
+    project_apply_recovery_outcome(slot_id, operation_id, pending_sha256, result, observed)
+}
+
+#[cfg(windows)]
+fn project_apply_recovery_outcome(slot_id: &str, operation_id: &str, pending_sha256: &[u8; 32],
+    result: Result<crate::windows_coordinator::windows_installation::RecoveryCompletion, String>,
+    observed: Result<crate::windows_coordinator::windows_installation::ApplyCurrentObservation, String>,
+) -> Result<String, String> {
+    use crate::windows_coordinator::windows_installation::ApplyCurrentObservation::Settled;
     let evidence = format!("recovery scope slot={} operation={} priorCurrent={}; actualCurrent={observed:?}",
-        expected.slot_id, expected.operation_id, hex::encode(expected.current_sha256));
-    let settled = matches!(&observed, Ok(owner::ApplyCurrentObservation::Settled { slot_id, .. }) if slot_id == &expected.slot_id);
-    match result {
-        Ok(outcome) if settled => Ok(format!("{outcome}; {evidence}")),
-        Ok(outcome) => Err(format!("recovery owner completed but fresh selected Current remains held; ownerOutcome={outcome}; {evidence}")),
-        Err(error) => Err(format!("{error}; {evidence}")),
-    }
+        slot_id, operation_id, hex::encode(pending_sha256));
+    let completion = result.map_err(|error| format!("{error}; {evidence}"))?;
+    let reason = match &observed {
+        Ok(Settled { slot_id: actual_slot, current_sha256 })
+            if completion.slot_id == slot_id && actual_slot == slot_id && *current_sha256 == completion.current_sha256 =>
+        {
+            return Ok(format!("{}; {evidence}", completion.message));
+        }
+        Ok(Settled { .. }) => "fresh selected Current conflicts with the published recovery result",
+        _ if completion.slot_id != slot_id => "published recovery slot conflicts with the selected slot",
+        _ => "fresh selected Current remains held",
+    };
+    Err(format!("recovery owner completed but {reason}; ownerOutcome={}; publishedSlot={} publishedCurrent={}; {evidence}",
+        completion.message, completion.slot_id, hex::encode(completion.current_sha256)))
 }
 #[cfg(windows)]
 impl crate::windows_coordinator::windows_installation::MaintenanceWindow for GuiMaintenance<'_> {
@@ -468,12 +752,14 @@ impl crate::windows_coordinator::windows_installation::MaintenanceWindow for Gui
 
 #[cfg(windows)]
 fn prepare_private_copy(program: &crate::windows_coordinator::windows_installation::CheckedPath, distro: &str,
-    launcher: &str, version: &str, settings: &Settings, expected_helper: &str, cancel: &AtomicBool) -> Result<(), String> {
+    launcher: &str, version: &str, settings: &Settings, expected_helper: &str, guest_home: &str, cancel: &AtomicBool) -> Result<(), String> {
     let mut command = std::process::Command::new(program.as_path());
     command.args(["-d", distro, "--exec", "sh", "-c",
         r#"agLauncher=$1; agEligibility=$2; agTransport=$3; agVersion=$4; exec "$agLauncher" --prepare-only --profile "$agEligibility" "$agTransport" "$HOME/.antigravity-server/bin/$agVersion/language_server""#,
         "sh", launcher, if settings.client_patch { "1" } else { "0" }, if wants_transport(settings) { "1" } else { "0" }, version]);
-    let output = crate::windows_coordinator::runtime_metadata(program, command, cancel, true)?;
+    let output = crate::windows_coordinator::runtime_metadata(program, command, cancel, true,
+        crate::windows_coordinator::MetadataContext { purpose: crate::windows_coordinator::MetadataPurpose::PrivateServerPreparation,
+            distro: Some(distro), private_values: &[launcher, guest_home] })?;
     receive_private_copy_manifest(&output, settings, expected_helper)
 }
 
@@ -542,6 +828,170 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn recovery_projection_requires_the_exact_published_current() {
+        use crate::windows_coordinator::windows_installation::{
+            ApplyCurrentObservation::{Settled, VendorPending}, RecoveryCompletion, VendorPendingObservation,
+        };
+        let published = [7; 32];
+        let pending = [3; 32];
+        let completed = |slot: &str| Ok(RecoveryCompletion {
+            message: "RecoverySettled: fixture",
+            slot_id: slot.into(),
+            current_sha256: published,
+        });
+        let exact = Settled { slot_id: "selected".into(), current_sha256: published };
+        let received = project_apply_recovery_outcome("selected", "operation", &pending,
+            completed("selected"), Ok(exact.clone())).unwrap();
+        assert_eq!(received, format!("RecoverySettled: fixture; recovery scope slot=selected operation=operation priorCurrent={}; actualCurrent=Ok({exact:?})", hex::encode(pending)));
+
+        for (producer_slot, observed_slot, observed_sha256) in [
+            ("selected", "selected", [8; 32]),
+            ("selected", "foreign", published),
+            ("foreign", "selected", published),
+            ("foreign", "foreign", published),
+        ] {
+            let observed = Settled { slot_id: observed_slot.into(), current_sha256: observed_sha256 };
+            let error = project_apply_recovery_outcome("selected", "operation", &pending,
+                completed(producer_slot), Ok(observed.clone())).unwrap_err();
+            assert!(error.contains("conflicts with the published recovery result"), "{error}");
+            assert!(error.contains(&format!("publishedSlot={producer_slot} publishedCurrent={}", hex::encode(published))), "{error}");
+            assert!(error.contains(&format!("actualCurrent=Ok({observed:?})")), "{error}");
+        }
+
+        for observed in [
+            Err("native observation unavailable".into()),
+            Ok(VendorPending(VendorPendingObservation {
+                slot_id: "selected".into(), operation_id: "operation".into(), current_sha256: pending,
+            })),
+        ] {
+            let actual = format!("actualCurrent={observed:?}");
+            let error = project_apply_recovery_outcome("selected", "operation", &pending,
+                completed("selected"), observed).unwrap_err();
+            assert!(error.contains("fresh selected Current remains held") && error.contains(&actual), "{error}");
+        }
+    }
+
+    #[test]
+    fn recovery_projection_preserves_owner_error_and_settled_current() {
+        use crate::windows_coordinator::windows_installation::ApplyCurrentObservation::Settled;
+        let pending = [3; 32];
+        let observed = Settled { slot_id: "selected".into(), current_sha256: [7; 32] };
+        let error = project_apply_recovery_outcome("selected", "operation", &pending,
+            Err("original owner error after publication".into()), Ok(observed.clone())).unwrap_err();
+        assert_eq!(error, format!("original owner error after publication; recovery scope slot=selected operation=operation priorCurrent={}; actualCurrent=Ok({observed:?})", hex::encode(pending)));
+    }
+
+    struct InertMetadataWindow<'a> {
+        trace: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        cancellation: &'a AtomicBool,
+        desktop_running: &'a std::cell::Cell<bool>,
+    }
+    impl crate::windows_coordinator::windows_installation::MaintenanceWindow for InertMetadataWindow<'_> {
+        fn ensure_held(&mut self) -> Result<(), String> {
+            self.trace.borrow_mut().push("gui");
+            if self.cancellation.load(Ordering::SeqCst) { return Err("Cancelled: fixture Desktop window".into()); }
+            if self.desktop_running.get() { return Err("fixture Desktop is live".into()); }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recorded_metadata_window_receives_saved_intent_and_gui_without_guest_demand() {
+        use sha2::{Digest, Sha256};
+        for preference in [None,
+            Some(crate::wsl_api::WslPreferences { enabled: false, distros: vec!["removed fixture guest".into()] }),
+            Some(crate::wsl_api::WslPreferences { enabled: true, distros: Vec::new() }),
+            Some(crate::wsl_api::WslPreferences { enabled: true, distros: vec!["unavailable fixture guest".into()] })] {
+            let mut settings = Settings::default(); settings.wsl = preference;
+            // In-memory bytes stand in only for the saved-reader dependency.
+            // No global settings, guest registration or native window is read.
+            let bytes = serde_json::to_vec_pretty(&settings).unwrap();
+            let saved: [u8; 32] = Sha256::digest(&bytes).into();
+            let trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let cancellation = AtomicBool::new(false);
+            let desktop_running = std::cell::Cell::new(false);
+            let mut window = SavedIntentMaintenance { settings: &settings, saved,
+                inner: InertMetadataWindow { trace: trace.clone(), cancellation: &cancellation, desktop_running: &desktop_running } };
+            let mut receive = |expected: &Settings| {
+                trace.borrow_mut().push("saved");
+                assert_eq!(serde_json::to_vec_pretty(expected).unwrap(), bytes);
+                Ok(saved)
+            };
+            window.ensure_held_with(&mut receive).unwrap();
+            window.ensure_held_with(&mut receive).unwrap();
+            assert_eq!(*trace.borrow(), ["saved", "gui", "saved", "gui"]);
+        }
+    }
+
+    #[test]
+    fn recorded_metadata_window_preserves_continuous_intent_and_gui_failure_order() {
+        use sha2::{Digest, Sha256};
+        let settings = Settings::default();
+        let bytes = serde_json::to_vec_pretty(&settings).unwrap();
+        let saved: [u8; 32] = Sha256::digest(&bytes).into();
+        let observed = std::cell::Cell::new(saved);
+        let read_failure = std::cell::RefCell::new(None::<String>);
+        let trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let cancellation = AtomicBool::new(false);
+        let desktop_running = std::cell::Cell::new(false);
+        let mut window = SavedIntentMaintenance { settings: &settings, saved,
+            inner: InertMetadataWindow { trace: trace.clone(), cancellation: &cancellation, desktop_running: &desktop_running } };
+        let mut receive = |expected: &Settings| {
+            trace.borrow_mut().push("saved");
+            assert_eq!(serde_json::to_vec_pretty(expected).unwrap(), bytes);
+            match read_failure.borrow().as_ref() { Some(error) => Err(error.clone()), None => Ok(observed.get()) }
+        };
+        window.ensure_held_with(&mut receive).unwrap();
+        // A retained marker models an acquired outcome; there is no native call.
+        trace.borrow_mut().push("acquired-result");
+        let mut changed = saved; changed[0] ^= 1; observed.set(changed);
+        assert_eq!(window.ensure_held_with(&mut receive).unwrap_err(), "Cancelled: saved WSL intent changed");
+        assert_eq!(*trace.borrow(), ["saved", "gui", "acquired-result", "saved"]);
+        observed.set(saved);
+        *read_failure.borrow_mut() = Some("settings read failed: synthetic unavailable".into());
+        assert_eq!(window.ensure_held_with(&mut receive).unwrap_err(), "settings read failed: synthetic unavailable");
+        assert_eq!(trace.borrow().last(), Some(&"saved"));
+        *read_failure.borrow_mut() = None;
+        cancellation.store(true, Ordering::SeqCst);
+        assert_eq!(window.ensure_held_with(&mut receive).unwrap_err(), "Cancelled: fixture Desktop window");
+        assert_eq!(&trace.borrow()[trace.borrow().len() - 2..], ["saved", "gui"]);
+        cancellation.store(false, Ordering::SeqCst);
+        desktop_running.set(true);
+        assert_eq!(window.ensure_held_with(&mut receive).unwrap_err(), "fixture Desktop is live");
+        assert_eq!(&trace.borrow()[trace.borrow().len() - 2..], ["saved", "gui"]);
+    }
+
+    #[test]
+    fn automatic_vendor_update_requires_positive_wsl_and_effect_intent() {
+        let mut settings = Settings::default();
+        settings.auto_patch = true;
+        settings.patch_declined = false;
+        settings.client_patch = false;
+        settings.dns = false;
+        settings.local_proxy = false;
+        settings.own_proxy_enabled = false;
+        settings.group_proxy = false;
+        settings.builtin_exits = false;
+        settings.wsl = None;
+        assert!(!automatic_vendor_update_wanted(&settings));
+        settings.wsl = Some(crate::wsl_api::WslPreferences { enabled: true, distros: vec!["fixture".into()] });
+        assert!(!automatic_vendor_update_wanted(&settings));
+        assert!(!preparation_can_start_guest(&settings));
+        settings.client_patch = true;
+        assert!(automatic_vendor_update_wanted(&settings));
+        assert!(preparation_can_start_guest(&settings));
+        settings.patch_declined = true;
+        assert!(!automatic_vendor_update_wanted(&settings));
+        settings.patch_declined = false;
+        settings.wsl.as_mut().unwrap().distros.clear();
+        assert!(!automatic_vendor_update_wanted(&settings));
+        assert!(!preparation_can_start_guest(&settings));
+        settings.wsl.as_mut().unwrap().distros.push("fixture".into());
+        settings.wsl.as_mut().unwrap().enabled = false;
+        assert!(!automatic_vendor_update_wanted(&settings));
+    }
 
     #[test]
     fn private_copy_receiving_rejects_missing_or_changed_profile_identity() {

@@ -261,6 +261,11 @@ struct Connection {
     cancelled: Arc<AtomicBool>,
     committed: Arc<AtomicBool>,
     opening: Option<JoinHandle<OpeningOutcome>>,
+    resolver: Option<Arc<crate::resolvers::ResolverWork>>,
+    resolver_completed: Vec<crate::resolvers::ResolverTerminal>,
+    resolver_facts: Vec<String>,
+    resolver_panics: Vec<Box<dyn std::any::Any + Send>>,
+    resolver_receiving_error: Option<String>,
     opening_failure: Option<OpeningFailure>,
     commit_failure: Option<CommitFailure>,
     opening_panic: Option<Box<dyn std::any::Any + Send>>,
@@ -269,6 +274,18 @@ struct Connection {
     cancel_shutdown: Option<io::Result<()>>,
 }
 impl Connection {
+    fn collect_resolvers(&mut self) {
+        let received = (|| -> Result<(), String> {
+            if let Some(work) = &self.resolver { work.receive_into(&mut self.resolver_completed)?; }
+            crate::resolvers::receive_terminals(&mut self.resolver_completed, &mut self.resolver_facts, &mut self.resolver_panics)
+        })();
+        if let Err(error) = received { self.resolver_receiving_error.get_or_insert(error); }
+        if self.opening.is_none() && self.resolver.as_ref().is_some_and(|work| !work.has_unreceived()) { self.resolver = None; }
+    }
+    fn settled(&self) -> bool {
+        self.outcome.is_some() && self.opening.is_none() && self.resolver_completed.is_empty()
+            && self.resolver.as_ref().is_none_or(|work| !work.has_unreceived())
+    }
     fn finish(&mut self, cause: String, response_bytes: usize, io_error: Option<io::Error>) {
         let boundary = match std::mem::replace(&mut self.phase, Phase::Done) {
             Phase::Reply { cause, .. } => Some(cause),
@@ -284,6 +301,7 @@ impl Connection {
         self.phase = Phase::Done;
     }
     fn cancel(&mut self) {
+        if let Some(work) = &self.resolver { work.cancel(); }
         if self.outcome.is_some() {
             return;
         }
@@ -352,6 +370,7 @@ impl Connection {
         }
     }
     fn advance(&mut self, now: Instant) {
+        self.collect_resolvers();
         if self.cancelled.load(Ordering::Acquire) {
             self.cancel();
         }
@@ -471,11 +490,20 @@ impl Connection {
                                 let cancelled = Arc::clone(&self.cancelled);
                                 let committed = Arc::clone(&self.committed);
                                 let supervisor = thread::current();
+                                let transport = prepared.is_gate().then(crate::settings::checked_transport_intent);
+                                let resolver = match &transport {
+                                    Some(crate::settings::TransportIntent::Explicit { requirements, .. })
+                                        if requirements.active_config.profile == crate::settings::TransportProfile::ExistingConfigured =>
+                                            Some(Arc::new(crate::resolvers::ResolverWork::with_cancellation(supervisor.clone(), cancelled.clone()))),
+                                    _ => None,
+                                };
+                                self.resolver = resolver.clone();
                                 match thread::Builder::new()
                                     .name("wsl-gateway-open".into())
                                     .spawn(move || {
                                         let outcome = if prepared.is_gate() {
-                                            prepared.start_shared(client, prefetched, deadline, &cancelled, &committed, &supervisor)
+                                            prepared.start_shared(client, prefetched, deadline, &cancelled, &committed, &supervisor,
+                                                transport.expect("gate transport snapshot"), resolver.as_deref())
                                         } else {
                                             prepared.start(client, prefetched, deadline, &cancelled, &committed, &supervisor)
                                         };
@@ -835,6 +863,7 @@ fn serve(config: Config) -> bool {
                             cancelled: Arc::clone(&owner.stop),
                             committed: Arc::new(AtomicBool::new(false)),
                             opening: None,
+                            resolver: None, resolver_completed: Vec::new(), resolver_facts: Vec::new(), resolver_panics: Vec::new(), resolver_receiving_error: None,
                             opening_failure: None,
                             commit_failure: None,
                             opening_panic: None,
@@ -901,7 +930,10 @@ fn serve(config: Config) -> bool {
             }
         }
         for connection in &mut owner.connections {
-            if connection.outcome.is_some() && !connection.queued {
+            if !connection.resolver_panics.is_empty() || connection.resolver_receiving_error.is_some() {
+                owner.failure.get_or_insert("RESOLVER_RECEIVING_FAILED".into());
+            }
+            if connection.settled() && !connection.queued {
                 if let Some(sender) = &owner.sender {
                     match sender.try_send(connection.record()) {
                         Ok(()) => connection.queued = true,
@@ -918,7 +950,7 @@ fn serve(config: Config) -> bool {
             && owner
                 .connections
                 .iter()
-                .all(|connection| connection.outcome.is_some())
+                .all(Connection::settled)
         {
             owner.listener.take();
             let status = if owner.failure.is_none() {

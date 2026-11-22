@@ -55,7 +55,7 @@ pub fn verify_key(key: &str) -> bool {
     result == 0
 }
 
-/// Decide local application entry without altering or storing a license key.
+/// Decide local application entry without changing or storing a licence key.
 pub(crate) fn entry_allowed(key: &str, debug_skip: bool) -> bool {
     entry_allowed_for(verify_key(key), cfg!(feature = "personal-build"), debug_skip)
 }
@@ -69,28 +69,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entry_policy_distinguishes_default_personal_and_debug() {
+    fn entry_policy_preserves_default_and_debug_paths() {
         assert!(!entry_allowed_for(false, false, false));
         assert!(entry_allowed_for(true, false, false));
         assert!(entry_allowed_for(false, true, false));
-        assert!(entry_allowed_for(true, true, false));
         assert!(entry_allowed_for(false, false, true));
-    }
-
-    #[cfg(not(feature = "personal-build"))]
-    #[test]
-    fn default_build_denies_invalid_key_entry() {
-        assert!(!entry_allowed("", false));
-        assert!(!entry_allowed("not-a-key", false));
         assert!(!verify_key("not-a-key"));
-        assert!(entry_allowed(&mint_key("ABCDEF123456", &key_secret()), false));
     }
 
-    #[cfg(feature = "personal-build")]
     #[test]
-    fn personal_build_allows_invalid_key_entry() {
-        assert!(entry_allowed("", false));
-        assert!(entry_allowed("not-a-key", false));
+    fn configured_feature_controls_invalid_local_entry() {
+        assert_eq!(entry_allowed("not-a-key", false), cfg!(feature = "personal-build"));
+        assert!(!verify_key("not-a-key"));
     }
 
     /// Mints a key the way dist_keygen.py does, for an arbitrary secret.

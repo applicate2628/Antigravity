@@ -4,6 +4,20 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 
 use crate::utils::powershell;
+#[cfg(target_os = "windows")]
+use crate::utils::{CommandOutcome, CommandObservation};
+
+#[cfg(target_os = "windows")]
+fn receive_command(outcome: &CommandOutcome, observation: CommandObservation) -> Result<(), String> {
+    match observation {
+        CommandObservation::Complete if outcome.complete() && outcome.releasable() && outcome.exit().is_some_and(|status| status.success()) => Ok(()),
+        CommandObservation::NotStarted => Err("environment helper did not start; actual failure retained".into()),
+        CommandObservation::Complete => Err("environment command failed or status is unknown; effect may be partial".into()),
+        CommandObservation::Deadline => Err("environment command deadline expired; effect may be partial".into()),
+        CommandObservation::Failed => Err("environment command failed; effect may be partial".into()),
+        CommandObservation::Pending => Err("environment command remains pending; effect may be partial".into()),
+    }
+}
 
 // Which CloudCode host the client talks to, and why that is the whole fix.
 //
@@ -55,7 +69,11 @@ pub enum Outcome {
 /// Derived from `product.json` rather than hardcoded: the folder is named after
 /// `nameShort`, so a rebranded or renamed build still resolves correctly.
 pub fn ide_settings_path(install: &Path) -> Option<PathBuf> {
-    let product = crate::installation_resources(install).join("app").join("product.json");
+    let product = if install.join("Contents").join("Resources").join("app").join("product.json").exists() {
+        install.join("Contents").join("Resources").join("app").join("product.json")
+    } else {
+        install.join("resources").join("app").join("product.json")
+    };
     let text = fs::read_to_string(product).ok()?;
     let name = Regex::new(r#""nameShort"\s*:\s*"([^"]+)""#)
         .ok()?
@@ -63,11 +81,13 @@ pub fn ide_settings_path(install: &Path) -> Option<PathBuf> {
         .get(1)?
         .as_str()
         .to_string();
-    // The user-config root is `%APPDATA%` on Windows and `~/.config` on Linux -
-    // the same VS Code layout underneath (`<root>/<nameShort>/User/settings.json`).
+    // The user-config root is `%APPDATA%` on Windows, `~/Library/Application Support` on macOS,
+    // and `~/.config` on Linux - the same VS Code layout underneath (`<root>/<nameShort>/User/settings.json`).
     #[cfg(target_os = "windows")]
     let root = PathBuf::from(std::env::var("APPDATA").ok()?);
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let root = PathBuf::from(std::env::var("HOME").ok()?).join("Library").join("Application Support");
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     let root = {
         // An empty XDG_CONFIG_HOME (elevation can pass it through blank) is "unset",
         // not a relative root - fall back to ~/.config in that case.
@@ -168,15 +188,25 @@ pub fn remove_ide(install: &Path) -> Result<(), String> {
 
 /// Removes the variable, but only when it still holds the value we wrote: a
 /// user (or another tool) may have pointed it somewhere themselves.
+#[cfg(not(target_os = "windows"))]
 pub fn remove_cli() -> Result<(), String> {
     if current_cli_endpoint().as_deref() != Some(DAILY_ENDPOINT) {
         return Ok(());
     }
-    let script = format!(
-        "[Environment]::SetEnvironmentVariable('{}',$null,'User')",
-        CLI_ENV_VAR
-    );
-    powershell(&script).ok_or_else(|| "не удалось удалить переменную среды".to_string())?;
+    #[cfg(target_os = "macos")]
+    {
+        set_env(CLI_ENV_VAR, None)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn remove_cli(owner: &mut CommandOutcome) -> Result<(), String> {
+    if current_cli_endpoint(owner)?.as_deref() != Some(DAILY_ENDPOINT) { return Ok(()); }
+    let script = format!("[Environment]::SetEnvironmentVariable('{}',$null,'User')", CLI_ENV_VAR);
+    let receipt = powershell(owner, &script);
+    receive_command(owner, receipt)?;
+    drop(std::mem::take(owner));
     Ok(())
 }
 
@@ -227,20 +257,20 @@ const NO_PROXY_VALUE: &str = "127.0.0.1,localhost,::1";
 /// leftover from the old scheme is taken off in the same step, since a machine
 /// upgrading passes through here and through no undo path.
 #[cfg(target_os = "windows")]
-pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
-    let migrated = remove_legacy_proxy_env(url).unwrap_or(false);
-    if current_env(PROXY_ENV_VAR).as_deref() == Some(url) {
+pub fn apply_proxy(owner: &mut CommandOutcome, url: &str, ca_path: &str) -> Result<Outcome, String> {
+    let migrated = remove_legacy_proxy_env(owner, url)?;
+    if current_env(owner, PROXY_ENV_VAR)?.as_deref() == Some(url) {
         return Ok(if migrated {
             Outcome::Applied
         } else {
             Outcome::AlreadySet
         });
     }
-    set_env(PROXY_ENV_VAR, Some(url))?;
+    set_env(owner, PROXY_ENV_VAR, Some(url))?;
     // The relay route terminates no TLS and installs no CA, so it needs no
     // `NODE_EXTRA_CA_CERTS`; only the legacy carrier route passes a real path.
     if !ca_path.is_empty() {
-        set_env(NODE_CA_ENV_VAR, Some(ca_path))?;
+        set_env(owner, NODE_CA_ENV_VAR, Some(ca_path))?;
     }
     Ok(Outcome::Applied)
 }
@@ -258,33 +288,24 @@ pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
 /// `Ok(true)` when something came off. A value that is not ours is never
 /// touched: `HTTPS_PROXY` is also where a user's own proxy lives (I45).
 #[cfg(target_os = "windows")]
-pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
+pub fn remove_legacy_proxy_env(owner: &mut CommandOutcome, url: &str) -> Result<bool, String> {
+    let proxy = current_env(owner, LEGACY_PROXY_ENV_VAR)?;
+    let no_proxy = current_env(owner, NO_PROXY_ENV_VAR)?;
     let (drop_proxy, drop_no_proxy) = legacy_removals(
-        current_env(LEGACY_PROXY_ENV_VAR).as_deref(),
-        current_env(NO_PROXY_ENV_VAR).as_deref(),
+        proxy.as_deref(),
+        no_proxy.as_deref(),
         url,
     );
     let mut removed = false;
-    let mut trouble: Vec<String> = Vec::new();
-
     if drop_proxy {
-        match set_env(LEGACY_PROXY_ENV_VAR, None) {
-            Ok(()) => removed = true,
-            Err(e) => trouble.push(e),
-        }
+        set_env(owner, LEGACY_PROXY_ENV_VAR, None)?;
+        removed = true;
     }
     if drop_no_proxy {
-        match set_env(NO_PROXY_ENV_VAR, None) {
-            Ok(()) => removed = true,
-            Err(e) => trouble.push(e),
-        }
+        set_env(owner, NO_PROXY_ENV_VAR, None)?;
+        removed = true;
     }
-
-    if trouble.is_empty() {
-        Ok(removed)
-    } else {
-        Err(trouble.join("; "))
-    }
+    Ok(removed)
 }
 
 /// Which of the two legacy variables this tool may take off, given what they
@@ -304,6 +325,90 @@ fn legacy_removals(https: Option<&str>, no_proxy: Option<&str>, url: &str) -> (b
     (drop_proxy, drop_proxy && no_proxy == Some(NO_PROXY_VALUE))
 }
 
+#[cfg(target_os = "macos")]
+fn sync_shell_file(path: &Path, name: &str, value: Option<&str>) -> std::io::Result<()> {
+    if !path.exists() && value.is_none() {
+        return Ok(());
+    }
+    let content = if path.exists() {
+        fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    let start_marker = format!("# [{}_START]", name);
+    let end_marker = format!("# [{}_END]", name);
+
+    let mut new_lines: Vec<String> = Vec::new();
+    let mut skipping = false;
+    for line in content.lines() {
+        if line.trim() == start_marker {
+            skipping = true;
+            continue;
+        }
+        if line.trim() == end_marker {
+            skipping = false;
+            continue;
+        }
+        if !skipping {
+            new_lines.push(line.to_string());
+        }
+    }
+
+    if let Some(val) = value {
+        new_lines.push(start_marker);
+        new_lines.push(format!("export {}=\"{}\"", name, val));
+        new_lines.push(end_marker);
+    }
+
+    let mut result = new_lines.join("\n");
+    if !result.is_empty() && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    fs::write(path, result)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn sync_shell_env(name: &str, value: Option<&str>) {
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = PathBuf::from(home);
+        let zprofile = home_path.join(".zprofile");
+        let _ = sync_shell_file(&zprofile, name, value);
+        let zshrc = home_path.join(".zshrc");
+        if zshrc.exists() || value.is_none() {
+            let _ = sync_shell_file(&zshrc, name, value);
+        }
+    }
+}
+
+/// macOS: removes legacy proxy variables from launchctl and shell configurations.
+#[cfg(target_os = "macos")]
+pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
+    use std::process::Command;
+    let mut removed = false;
+    for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
+        let val = Command::new("launchctl")
+            .args(["getenv", name])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        if let Some(ref v) = val {
+            if !v.is_empty() && is_our_proxy_value(v, url) {
+                let _ = Command::new("launchctl").args(["unsetenv", name]).status();
+                sync_shell_env(name, None);
+                removed = true;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var(NO_PROXY_ENV_VAR) {
+        if v.trim() == NO_PROXY_VALUE {
+            let _ = Command::new("launchctl").args(["unsetenv", NO_PROXY_ENV_VAR]).status();
+            sync_shell_env(NO_PROXY_ENV_VAR, None);
+        }
+    }
+    Ok(removed)
+}
+
 /// Linux keeps the persistent half in the drop-in file, which `apply_proxy`
 /// rewrites in place - so upgrading drops the old names from the next session by
 /// itself. What survives is the *running* user manager, which an older build
@@ -313,7 +418,7 @@ fn legacy_removals(https: Option<&str>, no_proxy: Option<&str>, url: &str) -> (b
 /// Value-scoped, unlike the blanket unset `remove_proxy` does: this runs on the
 /// patch path, where a `https_proxy` the user exported for themselves is none of
 /// our business.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
     use std::process::Command;
     let Ok(out) = Command::new("systemctl")
@@ -364,6 +469,21 @@ pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
+/// macOS: applies PROXY_ENV_VAR to launchd user session and shell profiles (~/.zprofile, ~/.zshrc).
+#[cfg(target_os = "macos")]
+pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
+    let migrated = remove_legacy_proxy_env(url).unwrap_or(false);
+    let already = current_env(PROXY_ENV_VAR).as_deref() == Some(url);
+    if already && !migrated {
+        return Ok(Outcome::AlreadySet);
+    }
+    set_env(PROXY_ENV_VAR, Some(url))?;
+    if !ca_path.is_empty() {
+        set_env(NODE_CA_ENV_VAR, Some(ca_path))?;
+    }
+    Ok(Outcome::Applied)
+}
+
 /// The Linux path uses **two** mechanisms so the language server the IDE spawns
 /// sees the proxy: a `~/.config/environment.d` drop-in makes it survive a reboot,
 /// and `systemctl --user set-environment` sets it in the running user manager, so
@@ -376,7 +496,7 @@ pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
 /// shell, every `curl`, every package manager through `127.0.0.1:53129`. The
 /// private name reaches the patched binaries and nothing else; rewriting the
 /// file in place is also what retires the old names on an upgrade.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
     use std::process::Command;
     let path = environment_d_path()?;
@@ -412,7 +532,7 @@ pub fn apply_proxy(url: &str, _ca_path: &str) -> Result<Outcome, String> {
 }
 
 /// `~/.config/environment.d/ag-unlocker.conf`, honouring `XDG_CONFIG_HOME`.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn environment_d_path() -> Result<PathBuf, String> {
     let base = match std::env::var("XDG_CONFIG_HOME") {
         Ok(x) if !x.is_empty() => PathBuf::from(x),
@@ -425,32 +545,42 @@ fn environment_d_path() -> Result<PathBuf, String> {
 /// Removes them, but only while they still hold what we wrote - a user may have
 /// a proxy of their own, and taking that away would be worse than any bug here.
 #[cfg(target_os = "windows")]
-pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
-    // Every variable is judged and removed on its own, and nothing stops at the
-    // first failure. A half-removed proxy is worse than either state: the value
-    // left behind names a loopback port whose listener the revert has just
-    // deleted, so every program that honours it loses the network. That was
-    // reported from a real machine as "не работает выход в интернет".
-    let mut trouble: Vec<String> = Vec::new();
+pub fn remove_proxy(owner: &mut CommandOutcome, url: &str, ca_path: &str) -> Result<(), String> {
+    // Preserve the first uncertain effect and stop dependent mutations until
+    // the containing owner has received the outcome.
 
     // Unconditional, unlike everything else here: `PROXY_ENV_VAR` is a name only
     // this tool ever writes, so any value under it is ours whatever port it
     // names. That matters for the day the listener moves off 53129 (P26) - a
     // value-scoped removal would leave the old one behind forever.
+    if current_env(owner, PROXY_ENV_VAR)?.is_some() {
+        set_env(owner, PROXY_ENV_VAR, None)?;
+    }
+    // The user-wide variables of builds up to `2.11.0_4`, value-scoped because
+    // `HTTPS_PROXY` is also where a user's own proxy lives.
+    remove_legacy_proxy_env(owner, url)?;
+    clear_node_ca(owner, ca_path)?;
+
+    Ok(())
+}
+
+/// macOS: removes proxy variables from launchctl and shell files.
+#[cfg(target_os = "macos")]
+pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
+    let mut trouble: Vec<String> = Vec::new();
     if current_env(PROXY_ENV_VAR).is_some() {
         if let Err(e) = set_env(PROXY_ENV_VAR, None) {
             trouble.push(e);
         }
     }
-    // The user-wide variables of builds up to `2.11.0_4`, value-scoped because
-    // `HTTPS_PROXY` is also where a user's own proxy lives.
     if let Err(e) = remove_legacy_proxy_env(url) {
         trouble.push(e);
     }
-    if let Err(e) = clear_node_ca(ca_path) {
-        trouble.push(e);
+    if !ca_path.is_empty() {
+        if let Err(e) = set_env(NODE_CA_ENV_VAR, None) {
+            trouble.push(e);
+        }
     }
-
     if trouble.is_empty() {
         Ok(())
     } else {
@@ -462,7 +592,7 @@ pub fn remove_proxy(url: &str, ca_path: &str) -> Result<(), String> {
 /// Only ever removes our own file (the path is ours by construction) and our own
 /// variable; the standard names an older build exported are unset by value, so a
 /// proxy the user set another way survives the revert.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn remove_proxy(url: &str, _ca_path: &str) -> Result<(), String> {
     use std::process::Command;
     if let Ok(path) = environment_d_path() {
@@ -502,7 +632,7 @@ pub fn remove_proxy(url: &str, _ca_path: &str) -> Result<(), String> {
 /// with both variables set the patched server takes ours
 /// (`patch_binary::PROXY_VAR_NEW`). So every caller that could write ours has to
 /// ask this first and remove ours when the answer is `Some`, and every one does.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ForeignProxy {
     pub value: String,
     pub found_in: String,
@@ -510,33 +640,49 @@ pub struct ForeignProxy {
 
 /// The user's own proxy, if they configured one anywhere the client would read.
 #[cfg(target_os = "windows")]
-pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
+pub fn foreign_proxy(owner: &mut CommandOutcome, ours: &str) -> Result<Option<ForeignProxy>, String> {
     for scope in ["User", "Machine"] {
-        if let Some(value) = current_env_in(LEGACY_PROXY_ENV_VAR, scope) {
+        if let Some(value) = current_env_in(owner, LEGACY_PROXY_ENV_VAR, scope)? {
             if !is_ours_on_any_port(&value, ours) {
-                return Some(ForeignProxy {
+                return Ok(Some(ForeignProxy {
                     value,
                     found_in: format!("переменная среды {} ({})", LEGACY_PROXY_ENV_VAR, scope),
+                }));
+            }
+        }
+    }
+    Ok(antigravity_proxy_setting(ours))
+}
+
+#[cfg(target_os = "macos")]
+pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
+    use std::process::Command;
+    for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
+        if let Ok(value) = std::env::var(name) {
+            let value = value.trim().to_string();
+            if !value.is_empty() && !is_our_proxy_value(&value, ours) {
+                return Some(ForeignProxy {
+                    value,
+                    found_in: format!("переменная среды {}", name),
                 });
+            }
+        }
+        if let Ok(out) = Command::new("launchctl").args(["getenv", name]).output() {
+            if out.status.success() {
+                let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !value.is_empty() && !is_our_proxy_value(&value, ours) {
+                    return Some(ForeignProxy {
+                        value,
+                        found_in: format!("launchctl getenv {}", name),
+                    });
+                }
             }
         }
     }
     antigravity_proxy_setting(ours)
 }
 
-/// Linux has no User environment to read, so the same question is asked of the
-/// two places a session proxy can actually live: this process's own environment
-/// (which is the user's login session, since the unlocker is launched from it)
-/// and the systemd user manager, which is where a drop-in or an earlier build's
-/// `set-environment` ends up.
-///
-/// This used to be `antigravity_proxy_setting` alone - and until `_5` that was
-/// merely incomplete, because the old drop-in wrote `HTTPS_PROXY` too and which
-/// of the two won depended on how the app was launched. Now that ours outranks
-/// theirs inside the patched server (S42), silence here would mean a user behind
-/// a corporate proxy is routed into a loopback port that cannot reach anything -
-/// including their sign-in - with nothing on screen to say why.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn foreign_proxy(ours: &str) -> Option<ForeignProxy> {
     for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
         if let Ok(value) = std::env::var(name) {
@@ -643,7 +789,14 @@ fn profile_root() -> Option<PathBuf> {
     std::env::var("APPDATA").ok().map(PathBuf::from)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn profile_root() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn profile_root() -> Option<PathBuf> {
     match std::env::var("XDG_CONFIG_HOME") {
         Ok(x) if !x.is_empty() => Some(PathBuf::from(x)),
@@ -671,6 +824,7 @@ fn profile_root() -> Option<PathBuf> {
 /// proxy *after* being patched would silently keep going through ours. Menu 1
 /// catches that only if they run it again; this runs at every relay start, which
 /// is every boot, so at worst they are back on their own proxy after a restart.
+#[cfg(not(target_os = "windows"))]
 pub fn ensure_proxy_env(ours: &str) -> Result<Outcome, String> {
     if foreign_proxy(ours).is_some() {
         // Theirs, not ours - and ours would win over it, so it has to go.
@@ -688,12 +842,25 @@ pub fn ensure_proxy_env(ours: &str) -> Result<Outcome, String> {
     apply_proxy(ours, "")
 }
 
+#[cfg(target_os = "windows")]
+pub fn ensure_proxy_env(owner: &mut CommandOutcome, ours: &str) -> Result<Outcome, String> {
+    if foreign_proxy(owner, ours)?.is_some() {
+        remove_proxy(owner, ours, "")?;
+        return Ok(Outcome::AlreadySet);
+    }
+    if current_env(owner, PROXY_ENV_VAR)?.is_some_and(|value| is_our_proxy_value(&value, ours)) {
+        return Ok(if remove_legacy_proxy_env(owner, ours)? { Outcome::Applied } else { Outcome::AlreadySet });
+    }
+    apply_proxy(owner, ours, "")
+}
+
 /// Takes our proxy variable off. `Ok(true)` when there was one and it was
 /// removed, `Ok(false)` when there was nothing of ours.
 ///
 /// The watchdog's primitive: it must never touch a value the user set. That is
 /// now true by the *name* - `PROXY_ENV_VAR` is written by nothing else - where it
 /// used to rest on matching the value under a shared name.
+#[cfg(not(target_os = "windows"))]
 pub fn remove_proxy_if_ours(url: &str, ca_path: &str) -> Result<bool, String> {
     if current_env(PROXY_ENV_VAR).is_none() {
         // Nothing of ours under our own name; a legacy pair may still be there.
@@ -701,15 +868,21 @@ pub fn remove_proxy_if_ours(url: &str, ca_path: &str) -> Result<bool, String> {
     }
     remove_proxy(url, ca_path).map(|()| true)
 }
-
 #[cfg(target_os = "windows")]
-fn current_env_in(name: &str, scope: &str) -> Option<String> {
-    let out = powershell(&format!(
+pub fn remove_proxy_if_ours(owner: &mut CommandOutcome, url: &str, ca_path: &str) -> Result<bool, String> {
+    if current_env(owner, PROXY_ENV_VAR)?.is_none() { return remove_legacy_proxy_env(owner, url); }
+    remove_proxy(owner, url, ca_path).map(|()| true)
+}
+#[cfg(target_os = "windows")]
+fn current_env_in(owner: &mut CommandOutcome, name: &str, scope: &str) -> Result<Option<String>, String> {
+    let receipt = powershell(owner, &format!(
         "[Environment]::GetEnvironmentVariable('{}','{}')",
         name, scope
-    ))?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    ));
+    receive_command(owner, receipt)?;
+    let value = String::from_utf8_lossy(owner.stdout()).trim().to_string();
+    drop(std::mem::take(owner));
+    Ok((!value.is_empty()).then_some(value))
 }
 
 /// Whether an `HTTPS_PROXY` value is one this tool wrote.
@@ -758,6 +931,7 @@ fn is_our_proxy_value(value: &str, url: &str) -> bool {
 /// every Node process on the machine trusting a CA nothing uses any more -
 /// harmless today, and exactly the kind of leftover that is impossible to
 /// explain a year from now.
+#[cfg(not(target_os = "windows"))]
 pub fn clear_node_ca(ca_path: &str) -> Result<(), String> {
     if current_env(NODE_CA_ENV_VAR).as_deref() == Some(ca_path) {
         set_env(NODE_CA_ENV_VAR, None)?;
@@ -766,7 +940,13 @@ pub fn clear_node_ca(ca_path: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
+pub fn clear_node_ca(owner: &mut CommandOutcome, ca_path: &str) -> Result<(), String> {
+    if current_env(owner, NODE_CA_ENV_VAR)?.as_deref() == Some(ca_path) { set_env(owner, NODE_CA_ENV_VAR, None)?; }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn set_env(owner: &mut CommandOutcome, name: &str, value: Option<&str>) -> Result<(), String> {
     let literal = match value {
         Some(v) => format!("'{}'", v),
         None => "$null".to_string(),
@@ -775,7 +955,28 @@ fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
         "[Environment]::SetEnvironmentVariable('{}',{},'User')",
         name, literal
     );
-    powershell(&script).ok_or_else(|| format!("не удалось записать {}", name))?;
+    let receipt = powershell(owner, &script);
+    receive_command(owner, receipt)?;
+    drop(std::mem::take(owner));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
+    use std::process::Command;
+    match value {
+        Some(v) => {
+            Command::new("launchctl")
+                .args(["setenv", name, v])
+                .status()
+                .map_err(|e| format!("launchctl setenv: {}", e))?;
+            sync_shell_env(name, Some(v));
+        }
+        None => {
+            let _ = Command::new("launchctl").args(["unsetenv", name]).status();
+            sync_shell_env(name, None);
+        }
+    }
     Ok(())
 }
 
@@ -785,7 +986,7 @@ fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
 /// the proxy carrier that needs it. Removal is a trivial success - there is
 /// nothing of ours in a persistent store to take out - while a request to *set*
 /// one is refused honestly rather than silently doing nothing.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
     match value {
         None => Ok(()),
@@ -797,18 +998,52 @@ fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn current_env(name: &str) -> Option<String> {
-    let out = powershell(&format!(
+fn current_env(owner: &mut CommandOutcome, name: &str) -> Result<Option<String>, String> {
+    let receipt = powershell(owner, &format!(
         "[Environment]::GetEnvironmentVariable('{}','User')",
         name
-    ))?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    ));
+    receive_command(owner, receipt)?;
+    let value = String::from_utf8_lossy(owner.stdout()).trim().to_string();
+    drop(std::mem::take(owner));
+    Ok((!value.is_empty()).then_some(value))
+}
+
+#[cfg(target_os = "macos")]
+fn current_env(name: &str) -> Option<String> {
+    use std::process::Command;
+    if let Ok(out) = Command::new("launchctl").args(["getenv", name]).output() {
+        if out.status.success() {
+            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    if let Ok(val) = std::env::var(name) {
+        let val = val.trim().to_string();
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    let path = PathBuf::from(home).join(".zprofile");
+    let text = fs::read_to_string(path).ok()?;
+    let prefix = format!("export {}=\"", name);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            if let Some(val) = rest.strip_suffix('"') {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// On Linux reads the process environment, the systemd user manager session,
 /// or the persistent environment.d drop-in.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn current_env(name: &str) -> Option<String> {
     if let Ok(v) = std::env::var(name) {
         let trimmed = v.trim().to_string();
@@ -850,16 +1085,23 @@ fn current_env(name: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn current_cli_endpoint() -> Option<String> {
-    let out = powershell(&format!(
+fn current_cli_endpoint(owner: &mut CommandOutcome) -> Result<Option<String>, String> {
+    let receipt = powershell(owner, &format!(
         "[Environment]::GetEnvironmentVariable('{}','User')",
         CLI_ENV_VAR
-    ))?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    ));
+    receive_command(owner, receipt)?;
+    let value = String::from_utf8_lossy(owner.stdout()).trim().to_string();
+    drop(std::mem::take(owner));
+    Ok((!value.is_empty()).then_some(value))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn current_cli_endpoint() -> Option<String> {
+    current_env(CLI_ENV_VAR)
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn current_cli_endpoint() -> Option<String> {
     None
 }
@@ -867,22 +1109,25 @@ fn current_cli_endpoint() -> Option<String> {
 /// The value of our proxy variable as the user environment has it right now.
 /// Read-only; `None` when it is not set.
 #[allow(dead_code)]
+#[cfg(not(target_os = "windows"))]
 pub fn proxy_env_value() -> Option<String> {
     current_env(PROXY_ENV_VAR)
 }
+#[cfg(target_os = "windows")]
+pub fn proxy_env_value(owner: &mut CommandOutcome) -> Result<Option<String>, String> { current_env(owner, PROXY_ENV_VAR) }
 
 /// True when the variable is set AND names our own local listener rather than
 /// something the user configured themselves.
 #[allow(dead_code)]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_os = "windows"))]
 pub fn proxy_env_is_ours() -> bool {
     let ours = crate::proxy::proxy_url();
     proxy_env_value().is_some_and(|v| is_our_proxy_value(&v, &ours))
 }
-
-#[cfg(target_os = "macos")]
-pub fn proxy_env_is_ours(ours: &str) -> bool {
-    proxy_env_value().is_some_and(|value| is_our_proxy_value(&value, ours))
+#[cfg(target_os = "windows")]
+pub fn proxy_env_is_ours(owner: &mut CommandOutcome) -> Result<bool, String> {
+    let ours = crate::proxy::proxy_url();
+    Ok(proxy_env_value(owner)?.is_some_and(|v| is_our_proxy_value(&v, &ours)))
 }
 
 #[cfg(test)]
@@ -1136,11 +1381,15 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads live environment and requires creator-owned command containment"]
     fn proxy_env_queries_run_without_panic() {
-        let _ = proxy_env_value();
-        #[cfg(not(target_os = "macos"))]
-        let _ = proxy_env_is_ours();
-        #[cfg(target_os = "macos")]
-        let _ = proxy_env_is_ours("http://127.0.0.1:53129");
+        #[cfg(target_os = "windows")]
+        {
+            let mut owner = CommandOutcome::default();
+            let _ = proxy_env_value(&mut owner);
+            let _ = proxy_env_is_ours(&mut owner);
+        }
+        #[cfg(not(target_os = "windows"))]
+        { let _ = proxy_env_value(); let _ = proxy_env_is_ours(); }
     }
 }

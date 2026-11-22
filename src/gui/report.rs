@@ -111,39 +111,24 @@ pub fn build(status: Option<&Status>, view: &View) -> String {
     // Fresh from the file, not the window's copy: the route table's ages move
     // every pass and the watcher does not wake the window for them.
     let _ = writeln!(out, "\n— Служба обхода (её запись)");
-    #[cfg(not(target_os = "macos"))]
     match crate::gate::read() {
         Some(r) => relay_part(&mut out, &r),
-        None => { let _ = writeln!(out, "Записи нет — служба не запущена или старая."); }
-    }
-    #[cfg(target_os = "macos")]
-    match crate::gate::read_checked() {
-        Ok(Some(r)) => relay_part(&mut out, &r),
-        Ok(None) => {
+        None => {
             let _ = writeln!(out, "Записи нет — служба не запущена или старая.");
         }
-        Err(error) => { let _ = writeln!(out, "Запись недоступна: {error}"); }
     }
 
     let _ = writeln!(out, "\n— Журнал службы (последние строки)");
-    #[cfg(not(target_os = "macos"))]
-    let log = std::fs::read_to_string(crate::dns_forwarder::log_path()).unwrap_or_default();
-    #[cfg(target_os = "macos")]
-    let log = match crate::user_state_location::macos_state_paths().map_err(|error| error.to_string())
-        .and_then(|state| state.read_file("forwarder.log", crate::user_state_location::MacStateFile::Public).map_err(|error| error.to_string())) {
-        Ok(bytes) => match String::from_utf8(bytes) { Ok(text) => text, Err(error) => { let _ = writeln!(out, "Журнал недоступен: {error}"); String::new() } },
-        Err(error) => { let _ = writeln!(out, "Журнал недоступен: {error}"); String::new() },
+    let log = match crate::dns_forwarder::checked_log_path() {
+        Ok(path) => std::fs::read_to_string(path).unwrap_or_default(),
+        Err(error) => {
+            let _ = writeln!(out, "Журнал недоступен: {error}");
+            return out;
+        }
     };
-    let lines: Vec<&str> = log.lines().collect();
-    let from = lines.len().saturating_sub(LOG_LINES);
-    #[cfg(not(target_os = "macos"))]
+    let lines: Vec<&str> = log.lines().rev().take(LOG_LINES).collect();
     let own = crate::upstream::configured().map(|u| u.display());
-    #[cfg(target_os = "macos")]
-    let own = match crate::upstream::checked_mac_configured() {
-        Ok(value) => value.map(|u| u.display()),
-        Err(error) => { let _ = writeln!(out, "Журнал скрыт: данные для маскирования недоступны ({error})."); return out; }
-    };
-    for line in &lines[from..] {
+    for line in lines.iter().rev() {
         let _ = writeln!(out, "{}", mask_addresses(line, own.as_deref()));
     }
     if lines.is_empty() {
@@ -170,38 +155,68 @@ fn status_part(out: &mut String, s: &Status) {
     );
     let _ = writeln!(out, "\n— Установки");
     for row in &s.installs {
-        let path = row
-            .path
-            .as_ref()
-            .map(|p| mask_path(&p.display().to_string()))
-            .unwrap_or_else(|| "не найдена".to_string());
-        let patched = match row.patched {
-            Some(true) => "пропатчена",
-            Some(false) => "НЕ пропатчена",
-            None => "не проверена",
-        };
-        let _ = writeln!(out, "{}: {} — {}", row.label, path, patched);
+        let path = row.display_path().map(|p| mask_path(&p.display().to_string()))
+            .unwrap_or_else(|| row.discovery_note().unwrap_or_else(|| "не найдена".into()).into_owned());
+        let patch_note = row
+            .patch_observation_label()
+            .map(|label| format!(" — {label}"))
+            .unwrap_or_default();
+        let _ = writeln!(out, "{}: {path}{patch_note}", row.label);
     }
     let _ = writeln!(out, "\n— Переключатели");
+    #[cfg(windows)]
+    {
+        let mode = match s.transport_view {
+            crate::ops::TransportView::SystemTcp => "системное подключение; дополнительные прокси не используются",
+            crate::ops::TransportView::ExistingConfigured => "настроенные маршруты",
+            crate::ops::TransportView::LegacyOrMissing => "прежний режим или режим не выбран",
+            crate::ops::TransportView::Invalid => "не распознан",
+        };
+        let _ = writeln!(out, "Режим подключения: {mode}");
+    }
     let _ = writeln!(out, "Разблокировка входа: {}", onoff(&s.client_patch));
     let _ = writeln!(out, "Автопатч: {}", onoff(&s.watchdog));
     let _ = writeln!(out, "Обход через DNS: {}", onoff(&s.dns));
     let _ = writeln!(out, "Локальный прокси: {}", onoff(&s.local_proxy));
     let _ = writeln!(out, "Встроенные выходы: {}", onoff(&s.builtin_exits));
     let key_present = if crate::settings::group_key().is_empty() { "нет" } else { "есть" };
+    #[cfg(target_os = "macos")]
+    let pc_code = match crate::hwid::cached_pc_code() {
+        Some(Ok(_)) => "доступен",
+        Some(Err(_)) => "недоступен",
+        None => "не запрошен",
+    };
     #[cfg(not(target_os = "macos"))]
+    let pc_code = crate::hwid::pc_code();
     let _ = writeln!(
         out,
         "Прокси из группы: {}, ключ: {}, код ПК: {}",
         onoff(&s.group_proxy),
         key_present,
-        crate::hwid::pc_code()
+        pc_code
     );
-    #[cfg(target_os = "macos")]
-    let _ = writeln!(out, "Прокси из группы: {}, ключ: {}, код устройства: {}", onoff(&s.group_proxy), key_present,
-        match crate::hwid::cached_availability() { None => "не проверен".to_owned(), Some(Ok(())) => "доступен".to_owned(), Some(Err(error)) => format!("недоступен: {error}") });
     let _ = writeln!(out, "Свой прокси: {}", onoff(&s.own_proxy));
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    if let Err(error) = &s.selected_delivery {
+        let _ = writeln!(out, "{}", crate::ops::selected_delivery_warning(error));
+    }
+    let observation_error = s.background_observation_error.as_ref();
+    #[cfg(windows)]
+    let outdated = matches!(&s.selected_delivery, Ok(true));
+    #[cfg(not(windows))]
+    let outdated = s.relay_outdated;
+    if let Some(note) = observation_error {
+        #[cfg(windows)]
+        if let Some(rules) = s.rules_observed {
+            let _ = writeln!(out, "Служба не проверена: {note}; собственные правила DNS: {}", if rules { "есть" } else { "НЕТ" });
+        } else {
+            let _ = writeln!(out, "Служба и правила DNS: состояние не проверено{detail}",
+                detail = if note.is_empty() { String::new() } else { format!(": {note}") });
+        }
+        #[cfg(not(windows))]
+        let _ = writeln!(out, "Служба и правила DNS: состояние не проверено{detail}",
+            detail = if note.is_empty() { String::new() } else { format!(": {note}") });
+    } else {
     let _ = writeln!(
         out,
         "Служба: {}{}; правила DNS: {}",
@@ -210,19 +225,14 @@ fn status_part(out: &mut String, s: &Status) {
         } else {
             "НЕ запущена"
         },
-        if s.relay_outdated {
+        if outdated {
             ", устарела"
         } else {
             ""
         },
-        if s.rules { "есть" } else { "НЕТ" }
+        if cfg!(windows) { match s.rules_observed { Some(true) => "есть", Some(false) => "НЕТ", None => "не проверены" } }
+        else if s.rules { "есть" } else { "НЕТ" }
     );
-    #[cfg(target_os = "macos")]
-    match &s.relay_observation {
-        Ok(observation) => { let _ = writeln!(out, "Служба: {}{}; правила DNS недоступны",
-            if observation.running { "запущена" } else { "НЕ запущена" },
-            if observation.outdated { ", устарела" } else { "" }); },
-        Err(error) => { let _ = writeln!(out, "Состояние службы недоступно: {error}; правила DNS недоступны"); },
     }
     if let Some(vpn) = s.vpn {
         let _ = writeln!(out, "VPN (по сокетам Antigravity): {:?}", vpn);
@@ -230,6 +240,13 @@ fn status_part(out: &mut String, s: &Status) {
     if let Some(eg) = s.relay_egress {
         let _ = writeln!(out, "Сокеты службы: {:?}", eg);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_status_part(status: &Status) -> String {
+    let mut out = String::new();
+    status_part(&mut out, status);
+    out
 }
 
 fn relay_part(out: &mut String, r: &Report) {
@@ -248,7 +265,6 @@ fn relay_part(out: &mut String, r: &Report) {
     for b in &r.blockers {
         let _ = writeln!(out, "Мешает обходу: {}", super::status::blocker_line(b));
     }
-    #[cfg(not(target_os = "macos"))]
     if crate::proxy::port() != crate::proxy::DEFAULT_PORT {
         let _ = writeln!(
             out,
@@ -256,14 +272,6 @@ fn relay_part(out: &mut String, r: &Report) {
             crate::proxy::port(),
             crate::proxy::DEFAULT_PORT
         );
-    }
-    #[cfg(target_os = "macos")]
-    match crate::proxy::checked_mac_port() {
-        Ok(port) if port != crate::proxy::DEFAULT_PORT => {
-            let _ = writeln!(out, "Порт локального прокси: {port} (перенесён со стандартного {})", crate::proxy::DEFAULT_PORT);
-        },
-        Ok(_) => {},
-        Err(error) => { let _ = writeln!(out, "Порт локального прокси недоступен: {error}"); },
     }
     if r.started_at != 0 {
         let _ = writeln!(
@@ -282,8 +290,8 @@ fn relay_part(out: &mut String, r: &Report) {
     let _ = writeln!(
         out,
         "VPN держит маршрут по умолчанию: {}{}",
-        if r.tunnel { "да" } else { "нет" },
-        if r.vpn_exit.is_empty() {
+        match r.tunnel { Some(true) => "да", Some(false) => "нет", None => "не измерено" },
+        if r.tunnel != Some(true) || r.vpn_exit.is_empty() {
             String::new()
         } else {
             format!(", выход: {}", r.vpn_exit)

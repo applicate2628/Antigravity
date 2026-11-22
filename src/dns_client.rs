@@ -492,36 +492,88 @@ pub fn query_raw_via(
     if_index: u32,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
+    query_raw(packet, server, if_index, timeout, false)
+}
+
+fn query_raw(packet: &[u8], server: Ipv4Addr, if_index: u32, timeout: Duration,
+    local_readiness: bool) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now().checked_add(timeout)
+        .filter(|_| !timeout.is_zero())
+        .ok_or("invalid DNS query timeout")?;
     let sock = UdpSocket::bind(("0.0.0.0", 0)).map_err(|_| "нет UDP-сокета".to_string())?;
     if if_index != 0 {
         sys::bind_socket_to_interface(&sock, if_index)?;
     }
-    sock.set_read_timeout(Some(timeout)).ok();
+    let remaining = deadline.checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or("резолвер не ответил")?;
+    sock.set_write_timeout(Some(remaining))
+        .map_err(|error| format!("DNS write timeout: {error}"))?;
     sock.send_to(packet, SocketAddr::from((server, DNS_PORT)))
         .map_err(|_| "запрос не отправлен".to_string())?;
 
     let want_id = packet.get(0..2).map(|b| [b[0], b[1]]);
-    let deadline = Instant::now() + timeout;
+    receive_response(
+        server, local_readiness, want_id, deadline, Instant::now,
+        |remaining| sock.set_read_timeout(Some(remaining)),
+        |buf| sock.recv_from(buf),
+    )
+}
+
+fn receive_response(
+    server: Ipv4Addr,
+    local_readiness: bool,
+    want_id: Option<[u8; 2]>,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut set_timeout: impl FnMut(Duration) -> std::io::Result<()>,
+    mut receive: impl FnMut(&mut [u8]) -> std::io::Result<(usize, SocketAddr)>,
+) -> Result<Vec<u8>, String> {
     let mut buf = [0u8; 4096];
     loop {
-        let (n, from) = sock
-            .recv_from(&mut buf)
+        let remaining = deadline.checked_duration_since(now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or("резолвер не ответил")?;
+        set_timeout(remaining).map_err(|error| format!("DNS read timeout: {error}"))?;
+        let (n, from) = receive(&mut buf)
             .map_err(|_| "резолвер не ответил".to_string())?;
+        if now() >= deadline {
+            return Err("резолвер не ответил".to_string());
+        }
         // A stray packet must not end the wait: keep reading until the deadline
         // for one that came from the resolver and answers the id we sent.
-        let right_source = from.ip() == IpAddr::V4(server);
+        let right_source = from.ip() == IpAddr::V4(server) && (!local_readiness || from.port() == DNS_PORT);
         let right_id = match (want_id, n >= 12) {
             (Some(id), true) => buf[0..2] == id,
             _ => false,
         };
         if right_source && right_id {
-            crate::net::note_reached();
+            if !local_readiness { crate::net::note_reached(); }
             return Ok(buf[..n].to_vec());
         }
-        if Instant::now() >= deadline {
-            return Err("резолвер не ответил".to_string());
-        }
     }
+}
+
+/// Ask the local DNS listener for a gate host's locally synthesized AAAA
+/// response. This does not report an internet reachability observation.
+#[cfg(windows)]
+pub(crate) fn probe_local_gate_dns(server: Ipv4Addr, host: &str) -> Result<(), String> {
+    if !crate::proxy::is_gate_host(host) { return Err("local DNS probe host is not a gate host".into()); }
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut query = build_query(host, id);
+    let qtype = query.len().checked_sub(4).ok_or("local DNS query malformed")?;
+    query[qtype..qtype + 2].copy_from_slice(&28u16.to_be_bytes());
+    let reply = query_raw(&query, server, 0, TIMEOUT, true)?;
+    validate_local_gate_reply(&query, &reply)
+}
+
+#[cfg(windows)]
+fn validate_local_gate_reply(query: &[u8], reply: &[u8]) -> Result<(), String> {
+    if query.len() < 16 || query[query.len() - 4..] != [0, 28, 0, 1]
+        || synth_reply(query, None, 0).as_deref() != Some(reply) {
+        return Err("local DNS probe response does not match the AAAA question".into());
+    }
+    Ok(())
 }
 
 /// Asks `server` for the A records of `host`, forcing the query out of
@@ -542,6 +594,81 @@ pub fn resolve_a_via(host: &str, server: Ipv4Addr, if_index: u32) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_receive_deadline_is_shared_across_strays_and_rejects_late_match() {
+        use std::cell::{Cell, RefCell};
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let elapsed = Cell::new(Duration::ZERO);
+        let timeouts = RefCell::new(Vec::new());
+        let mut calls = 0;
+        let server = Ipv4Addr::LOCALHOST;
+        let result = receive_response(
+            server, true, Some([1, 2]), deadline,
+            || start + elapsed.get(),
+            |remaining| { timeouts.borrow_mut().push(remaining); Ok(()) },
+            |buf| {
+                calls += 1;
+                buf[..12].fill(0);
+                buf[0..2].copy_from_slice(if calls == 1 { &[3, 4] } else { &[1, 2] });
+                elapsed.set(if calls == 1 { Duration::from_secs(6) } else { Duration::from_secs(10) });
+                Ok((12, SocketAddr::from((server, DNS_PORT))))
+            },
+        );
+        assert!(result.is_err(), "a matching response at the deadline is late");
+        assert_eq!(&*timeouts.borrow(), &[Duration::from_secs(10), Duration::from_secs(4)]);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn dns_timeout_setup_fails_closed_and_zero_budget_is_rejected() {
+        let now = Instant::now();
+        let mut received = false;
+        let result = receive_response(
+            Ipv4Addr::LOCALHOST, true, Some([1, 2]), now + Duration::from_secs(1),
+            || now,
+            |_| Err(std::io::Error::new(std::io::ErrorKind::Other, "synthetic timeout failure")),
+            |_| { received = true; unreachable!() },
+        );
+        assert!(result.is_err());
+        assert!(!received);
+        assert!(query_raw(&[1, 2], Ipv4Addr::LOCALHOST, 0, Duration::ZERO, true).is_err());
+        assert!(query_raw(&[1, 2], Ipv4Addr::LOCALHOST, 0, Duration::MAX, true).is_err());
+    }
+
+    #[test]
+    fn dns_receive_accepts_matching_response_before_deadline() {
+        let now = Instant::now();
+        let server = Ipv4Addr::LOCALHOST;
+        let response = receive_response(
+            server, true, Some([1, 2]), now + Duration::from_secs(1),
+            || now,
+            |_| Ok(()),
+            |buf| {
+                buf[..12].fill(0);
+                buf[..2].copy_from_slice(&[1, 2]);
+                Ok((12, SocketAddr::from((server, DNS_PORT))))
+            },
+        ).unwrap();
+        assert_eq!(response.len(), 12);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_gate_reply_requires_matching_complete_empty_aaaa_answer() {
+        let mut query = build_query("daily-cloudcode-pa.googleapis.com", 42);
+        let end = query.len();
+        query[end - 4..end - 2].copy_from_slice(&28u16.to_be_bytes());
+        let reply = synth_reply(&query, None, 0).unwrap();
+        assert!(validate_local_gate_reply(&query, &reply).is_ok());
+        for index in [0, 2, 3, 5, 7, end - 1] {
+            let mut malformed = reply.clone();
+            malformed[index] ^= if index == 2 { 0x80 } else { 1 };
+            assert!(validate_local_gate_reply(&query, &malformed).is_err());
+        }
+        assert!(validate_local_gate_reply(&query, &reply[..reply.len() - 1]).is_err());
+    }
 
     /// An answer we build ourselves has to be one the reader we trust for
     /// upstream replies reads back the same way: same id, same question, the
