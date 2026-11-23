@@ -456,6 +456,28 @@ pub(crate) fn registered_distributions_with_cancel(cancelled: &AtomicBool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "opt-in native WSL registration and running-state metadata read"]
+    fn native_wsl_registration_and_running_discovery() {
+        let observation = observe_registered_distributions(Arc::new(AtomicBool::new(false)))
+            .unwrap_or_else(|_| panic!("failed to receive native WSL registration metadata"));
+        assert!(observation.error.is_none(), "running-state discovery incomplete");
+        let mut names = std::collections::HashSet::new();
+        let mut running_count = 0;
+        for registration in &observation.registrations {
+            assert!(!registration.name.is_empty(), "empty WSL registration name");
+            assert!(names.insert(registration.name.as_str()), "duplicate WSL registration name");
+            let running = registration.running.expect("receive running state for every registration");
+            running_count += usize::from(running);
+        }
+        println!(
+            "WSL_NATIVE_DISCOVERY registered={} running={running_count}",
+            observation.registrations.len()
+        );
+    }
+
     #[test]
     fn diagnostic_masks_known_values_and_script_excerpt_without_losing_cause() {
         let context = MetadataContext { purpose: MetadataPurpose::GuestIdentity, distro: Some("Ubuntu"),
