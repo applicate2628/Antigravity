@@ -17,6 +17,7 @@
 
 use std::io::Write as _;
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -50,16 +51,7 @@ pub fn requested() -> bool {
 }
 
 /// Linux: a terminal and nothing to draw a window into — a server over SSH.
-#[cfg(target_os = "macos")]
-pub fn only_terminal() -> bool {
-    use std::io::IsTerminal;
-    // No DISPLAY on a Mac: the window server is always there, unless this is
-    // a shell reached over SSH.
-    (std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some())
-        && std::io::stdin().is_terminal()
-}
-
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(not(windows))]
 pub fn only_terminal() -> bool {
     use std::io::IsTerminal;
     std::env::var_os("DISPLAY").is_none()
@@ -69,7 +61,7 @@ pub fn only_terminal() -> bool {
 
 /// Runs until the user quits. `note` is shown first in the journal — why the
 /// window did not open, when that is why we are here.
-pub fn run(note: Option<String>) -> Result<(), String> {
+pub fn run(note: Option<String>, lifetime: Arc<ops::GuiLifetime>) -> Result<(), String> {
     #[cfg(windows)]
     {
         console::open()?;
@@ -96,7 +88,7 @@ pub fn run(note: Option<String>) -> Result<(), String> {
         ratatui::crossterm::event::EnableBracketedPaste
     );
 
-    let result = App::new(note).run(&mut terminal);
+    let result = App::new(note, lifetime).run(&mut terminal);
 
     #[cfg(not(windows))]
     let _ = ratatui::crossterm::execute!(
@@ -122,11 +114,10 @@ enum Input {
     Path { text: String, error: Option<String> },
     OwnProxy { text: String },
     CustomDns { text: String },
-    GroupKey { text: String },
 }
 
 /// One selectable line of the main list.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Row {
     /// The status card's one action, when it has one.
     Action(Action),
@@ -134,6 +125,9 @@ enum Row {
     /// The bypass master switch (`ops::bypass_order`).
     Bypass,
     Install(usize),
+    #[cfg(windows)]
+    InstallationRecovery(std::path::PathBuf),
+    VsCodeAntigravity,
     /// The fold over «Настройки для опытных».
     Advanced,
     Provider(usize),
@@ -144,6 +138,18 @@ enum Row {
     GroupProxyCopy,
     GroupProxyPaste,
     Report,
+    #[cfg(windows)]
+    WslMaster,
+    #[cfg(windows)]
+    WslDistro(String),
+    #[cfg(windows)]
+    WslRefresh,
+    #[cfg(windows)]
+    WslApply,
+    #[cfg(windows)]
+    WslCancel,
+    #[cfg(windows)]
+    WslInfo(String),
 }
 
 struct App {
@@ -158,6 +164,8 @@ struct App {
     worker: Worker,
     events: Receiver<Event>,
     status: Option<Status>,
+    #[cfg(windows)]
+    installation_recovery: Option<ops::InstallationRecoveryPreview>,
     gate: gate::View,
     gate_at: Instant,
     gate_rx: Receiver<gate::Signal>,
@@ -175,15 +183,18 @@ struct App {
     /// A line in place of the key hints for a few seconds: what just happened.
     toast: Option<(String, Instant)>,
     quit: bool,
+    shutdown_ready: bool,
+    shutdown_error: Option<String>,
+    lifetime: Arc<ops::GuiLifetime>,
 }
 
 impl App {
-    fn new(note: Option<String>) -> Self {
+    fn new(note: Option<String>, lifetime: Arc<ops::GuiLifetime>) -> Self {
         let (up_tx, update_rx) = channel();
         update::spawn_watch(up_tx, Box::new(|| {}));
         // The loop below polls every 200 ms, so nothing needs waking.
         let (ev_tx, events) = channel();
-        let worker = ops::spawn(ev_tx, Box::new(|| {}));
+        let worker = ops::spawn(ev_tx, Box::new(|| {}), lifetime.clone());
         let (gate_tx, gate_rx) = channel();
         gate::spawn_watch(gate_tx, Box::new(|| {}));
 
@@ -222,6 +233,8 @@ impl App {
             worker,
             events,
             status: None,
+            #[cfg(windows)]
+            installation_recovery: None,
             gate: gate::View::default(),
             gate_at: Instant::now(),
             gate_rx,
@@ -233,6 +246,9 @@ impl App {
             input: None,
             toast: None,
             quit: false,
+            shutdown_ready: false,
+            shutdown_error: None,
+            lifetime,
         }
     }
 
@@ -241,6 +257,19 @@ impl App {
         let mut dirty = true;
         while !self.quit {
             dirty |= self.drain();
+            if self.shutdown_ready {
+                match self.lifetime.poll_close() {
+                    Ok(true) => { self.quit = true; continue; }
+                    Ok(false) => {}
+                    Err(error) => {
+                        if self.shutdown_error.as_ref() != Some(&error) {
+                            self.log.push((Level::Err, format!("Не удалось завершить работу: {error}")));
+                            self.shutdown_error = Some(error);
+                            dirty = true;
+                        }
+                    }
+                }
+            }
             // Ages on the card count up by themselves, so a quiet screen is
             // still redrawn once a second.
             if dirty || drawn_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
@@ -293,6 +322,11 @@ impl App {
                 }
                 Event::Status(s) => self.status = Some(*s),
                 Event::Busy(what) => self.busy = what,
+                #[cfg(windows)]
+                Event::InstallationRecoveryPrepared(preview) => self.installation_recovery = Some(preview),
+                #[cfg(windows)]
+                Event::InstallationRecoveryClosed => self.installation_recovery = None,
+                Event::ShutdownReady => self.shutdown_ready = true,
             }
             any = true;
         }
@@ -308,6 +342,13 @@ impl App {
         self.toast = Some((text.into(), Instant::now()));
     }
 
+    fn request_shutdown(&mut self) {
+        #[cfg(windows)]
+        drop(self.installation_recovery.take());
+        self.lifetime.request_shutdown();
+        self.toast("Завершение работы: ожидаю сохранения и остановки задач.");
+    }
+
     // -----------------------------------------------------------------------
     // Keys
     // -----------------------------------------------------------------------
@@ -316,7 +357,24 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         // Raw mode turns Ctrl+C into a key; it still means "leave".
         if ctrl && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C')) {
-            self.quit = true;
+            if k.kind == KeyEventKind::Press { self.request_shutdown(); }
+            return;
+        }
+        #[cfg(windows)]
+        if self.installation_recovery.is_some() {
+            if k.kind == KeyEventKind::Press {
+                match k.code {
+                    KeyCode::Char('y' | 'Y') if (k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT) && self.busy.is_none() => {
+                        let proposal_id = self.installation_recovery.take().unwrap().proposal_id;
+                        self.worker.send(Cmd::ConfirmInstallationRecovery { proposal_id });
+                    }
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n' | 'N') => {
+                        let proposal_id = self.installation_recovery.take().unwrap().proposal_id;
+                        self.worker.send(Cmd::DismissInstallationRecovery { proposal_id });
+                    }
+                    _ => {}
+                }
+            }
             return;
         }
         if self.screen == Screen::License {
@@ -333,12 +391,10 @@ impl App {
         if self.screen == Screen::License {
             self.key = text.to_string();
             self.key_error = false;
-        } else if let Some(
-            Input::Path { text: t, .. }
+        } else if let Some(Input::Path { text: t, .. }
             | Input::OwnProxy { text: t }
-            | Input::CustomDns { text: t }
-            | Input::GroupKey { text: t },
-        ) = &mut self.input
+            | Input::CustomDns { text: t }) =
+            &mut self.input
         {
             t.push_str(text);
         }
@@ -346,7 +402,7 @@ impl App {
 
     fn on_license_key(&mut self, k: KeyEvent, ctrl: bool) {
         match k.code {
-            KeyCode::Esc => self.quit = true,
+            KeyCode::Esc if k.kind == KeyEventKind::Press => self.request_shutdown(),
             KeyCode::Enter => self.try_key(),
             KeyCode::Backspace => {
                 self.key.pop();
@@ -376,8 +432,7 @@ impl App {
             return;
         }
         if auth::verify_key(self.key.trim()) {
-            self.worker
-                .send(Cmd::RememberLicense(self.key.trim().to_string()));
+            self.worker.send(Cmd::RememberLicense(self.key.trim().to_string()));
             self.screen = Screen::Main;
             self.worker.send(Cmd::Unlocked);
         } else {
@@ -390,10 +445,7 @@ impl App {
     fn on_input_key(&mut self, k: KeyEvent, ctrl: bool) {
         let Some(input) = &mut self.input else { return };
         let text = match input {
-            Input::Path { text, .. }
-            | Input::OwnProxy { text }
-            | Input::CustomDns { text }
-            | Input::GroupKey { text } => text,
+            Input::Path { text, .. } | Input::OwnProxy { text } | Input::CustomDns { text } => text,
         };
         match k.code {
             KeyCode::Esc => self.input = None,
@@ -430,12 +482,6 @@ impl App {
             Some(Input::CustomDns { text }) => {
                 self.worker.send(Cmd::SetCustomDns(text.trim().to_string()))
             }
-            Some(Input::GroupKey { text }) => {
-                let key = text.trim().to_string();
-                if !key.is_empty() {
-                    self.worker.send(Cmd::SetGroupKey(key));
-                }
-            }
             None => {}
         }
     }
@@ -449,7 +495,7 @@ impl App {
             None => {
                 let at = self.list.selected().unwrap_or(0).min(last);
                 if let Some(r) = rows.get(at) {
-                    self.selected = *r;
+                    self.selected = r.clone();
                 }
                 (at, false)
             }
@@ -458,7 +504,7 @@ impl App {
 
     fn go(&mut self, rows: &[Row], at: usize) {
         if let Some(r) = rows.get(at) {
-            self.selected = *r;
+            self.selected = r.clone();
             self.list.select(Some(at));
         }
     }
@@ -467,7 +513,7 @@ impl App {
         let rows = self.rows();
         let last = rows.len().saturating_sub(1);
         let (at, still_there) = self.cursor(&rows);
-        let row = rows.get(at).copied();
+        let row = rows.get(at).cloned();
         // The row that was on screen under the cursor has just gone: a key that
         // acts on a row was aimed at it, not at its replacement.
         let acts_on_row = matches!(
@@ -484,7 +530,7 @@ impl App {
             return;
         }
         match k.code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') if k.kind == KeyEventKind::Press => self.request_shutdown(),
             KeyCode::Up | KeyCode::Char('k') => self.go(&rows, at.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char('j') => self.go(&rows, (at + 1).min(last)),
             KeyCode::PageUp => self.go(&rows, at.saturating_sub(8)),
@@ -502,7 +548,7 @@ impl App {
             KeyCode::Char('a') => self.act_if_offered(Action::EnableAll),
             KeyCode::Char('r') => self.act_if_offered(Action::Repair),
             KeyCode::Char('v') => self.act_if_offered(Action::Verify),
-            KeyCode::Char('o') if crate::gui::report::ENABLED => self.save_report(),
+            KeyCode::Char('o') => self.save_report(),
             KeyCode::Char('x') | KeyCode::Delete => {
                 if let Some(Row::Install(i)) = row {
                     self.forget_install(i);
@@ -532,12 +578,20 @@ impl App {
                 if self.busy_refusal() {
                     return;
                 }
+                if !cap.supported() {
+                    self.toast("Обход через DNS недоступен на macOS");
+                    return;
+                }
                 let state = self
                     .status
                     .as_ref()
                     .map(|s| s.get(cap).clone())
                     .unwrap_or(State::Off);
                 if let State::Blocked(why) = &state {
+                    if cap == Cap::BuiltinExits {
+                        self.worker.send(Cmd::Set(cap, false));
+                        return;
+                    }
                     self.toast(format!("Не включается: {why}"));
                     return;
                 }
@@ -562,16 +616,17 @@ impl App {
                 let text = self.install_path(i).unwrap_or_default();
                 self.input = Some(Input::Path { text, error: None });
             }
+            #[cfg(windows)]
+            Row::InstallationRecovery(path) => {
+                if !self.busy_refusal() { self.worker.send(Cmd::PrepareInstallationRecovery { path }); }
+            }
+            Row::VsCodeAntigravity => {}
             Row::Advanced => self.advanced = !self.advanced,
             Row::Provider(i) => {
                 if self.busy_refusal() {
                     return;
                 }
                 if let Some(p) = self.status.as_ref().and_then(|s| s.providers.get(i)) {
-                    if !p.available {
-                        self.toast("Свой DNS не задан — добавьте сервер в поле ниже.");
-                        return;
-                    }
                     self.worker
                         .send(Cmd::SetProvider(p.name.clone(), !p.enabled));
                 }
@@ -581,24 +636,20 @@ impl App {
                 self.toast("Открыто в браузере: https://t.me/nova_txt/69864");
             }
             Row::GroupProxyCopy => {
+                #[cfg(target_os = "macos")]
+                self.worker.send(Cmd::CopyGroupCommand);
+                #[cfg(not(target_os = "macos"))]
+                {
                 let cmd = format!("/ag+{}", crate::hwid::pc_code());
                 crate::utils::set_clipboard_text(&cmd);
-                self.toast(format!(
-                    "Скопировано: {} — отправьте это сообщение в комнате",
-                    cmd
-                ));
+                self.toast(format!("Скопировано: {} — отправьте это сообщение в комнате", cmd));
+                }
             }
             Row::GroupProxyPaste => {
-                // Over SSH (or with no display) there is no clipboard to read:
-                // the key is then typed or pasted into a field, which the
-                // terminal delivers as a bracketed paste.
-                match crate::utils::clipboard_text().filter(|t| !t.trim().is_empty()) {
-                    Some(text) => self.worker.send(Cmd::SetGroupKey(text)),
-                    None => {
-                        self.input = Some(Input::GroupKey {
-                            text: String::new(),
-                        })
-                    }
+                if let Some(text) = crate::utils::clipboard_text() {
+                    self.worker.send(Cmd::SetGroupKey(text));
+                } else {
+                    self.toast("Буфер обмена пуст");
                 }
             }
             Row::GroupProxyText => {}
@@ -613,6 +664,35 @@ impl App {
                 })
             }
             Row::Report => self.save_report(),
+            #[cfg(windows)]
+            Row::WslMaster => {
+                if let Some(wsl) = self.status.as_ref().map(|s| &s.wsl) {
+                    let enabled = wsl.preferences.as_ref().is_some_and(|p| p.enabled);
+                    if wsl.show_configuration() && !wsl.pending && !wsl.loading { self.worker.send(Cmd::SetWslEnabled(!enabled)); }
+                }
+            }
+            #[cfg(windows)]
+            Row::WslDistro(name) => {
+                if let Some(wsl) = self.status.as_ref().map(|s| &s.wsl) {
+                    if let Some(distro) = wsl.distributions.iter().find(|d| d.name == name) {
+                        if wsl.show_configuration() && wsl.can_set_distro(&name, !distro.selected) { self.worker.send(Cmd::SetWslDistro { name, selected: !distro.selected }); }
+                    }
+                }
+            }
+            #[cfg(windows)]
+            Row::WslRefresh => {
+                if self.status.as_ref().is_some_and(|s| s.wsl.show_configuration() && !s.wsl.loading && !s.wsl.pending) {
+                    self.worker.send(Cmd::RefreshWsl);
+                }
+            }
+            #[cfg(windows)]
+            Row::WslApply => {
+                send_wsl_apply(&self.worker, self.status.as_ref().map(|s| &s.wsl));
+            }
+            #[cfg(windows)]
+            Row::WslCancel => self.worker.send(Cmd::CancelWsl),
+            #[cfg(windows)]
+            Row::WslInfo(_) => {},
         }
     }
 
@@ -634,20 +714,14 @@ impl App {
             Action::Repair => self.worker.send(Cmd::Repair),
             Action::Elevate => {
                 #[cfg(windows)]
-                if crate::utils::relaunch_elevated_with("--tui") {
-                    self.quit = true;
-                    return;
-                }
-                self.toast("Права администратора не получены.");
+                self.worker.send(Cmd::RequestElevation);
             }
             // Opened, and also shown: a terminal with no desktop behind it has
             // no browser to open, and the link is then copied from here.
             Action::Verify => {
                 if let Some((_, url)) = self.facts().and_then(|f| f.verify) {
                     crate::utils::open_url_as_user(&url);
-                    self.toast(format!(
-                        "Если браузер не открылся, откройте ссылку вручную: {url}"
-                    ));
+                    self.toast(format!("Если браузер не открылся, откройте ссылку вручную: {url}"));
                 }
             }
         }
@@ -655,19 +729,17 @@ impl App {
 
     fn install_path(&self, i: usize) -> Option<String> {
         let row = self.status.as_ref()?.installs.get(i)?;
-        row.path.as_ref().map(|p| p.display().to_string())
+        row.display_path().map(|p| p.display().to_string())
     }
 
     fn forget_install(&mut self, i: usize) {
         let Some(row) = self.status.as_ref().and_then(|s| s.installs.get(i)) else {
             return;
         };
-        match (&row.path, row.manual) {
-            (Some(p), true) => {
-                let p = p.clone();
-                self.worker.send(Cmd::ForgetPath(p));
-            }
-            _ => self.toast("Убрать можно только путь, указанный вручную."),
+        if let Some(saved) = row.saved_path() {
+            self.worker.send(Cmd::ForgetPath(saved.to_path_buf()));
+        } else {
+            self.toast("Убрать можно только путь, указанный вручную.");
         }
     }
 
@@ -717,7 +789,7 @@ impl App {
         let saved = crate::utils::desktop_dir()
             .and_then(|dir| crate::utils::save_text_file(&dir, crate::utils::REPORT_FILE, &text))
             .or_else(|| {
-                let dir = crate::dns_forwarder::log_dir();
+                let dir = crate::dns_forwarder::checked_log_dir().ok()?;
                 std::fs::create_dir_all(&dir).ok();
                 crate::utils::save_text_file(&dir, crate::utils::REPORT_FILE, &text)
             });
@@ -752,8 +824,53 @@ impl App {
         rows.push(Row::Cap(Cap::ClientPatch));
         rows.push(Row::Bypass);
         rows.push(Row::Cap(Cap::Watchdog));
-        let installs = self.status.as_ref().map_or(0, |s| s.installs.len());
-        rows.extend((0..installs).map(Row::Install));
+        if let Some(status) = &self.status {
+            for (index, install) in status.installs.iter().enumerate() {
+                rows.push(Row::Install(index));
+                #[cfg(windows)]
+                if let Some(path) = install.recovery_path() {
+                    rows.push(Row::InstallationRecovery(path.to_path_buf()));
+                }
+                #[cfg(not(windows))]
+                let _ = install;
+            }
+            rows.push(Row::VsCodeAntigravity);
+        }
+        #[cfg(windows)]
+        {
+            if let Some(wsl) = self.status.as_ref().map(|s| &s.wsl) {
+                if !wsl.show_configuration() {
+                    if wsl.pending {
+                        rows.push(Row::WslInfo("Операция выполняется или её завершение ещё не подтверждено.".into()));
+                        rows.push(Row::WslCancel);
+                    }
+                } else {
+                rows.push(Row::WslMaster);
+                if wsl.pending { rows.push(Row::WslInfo("Операция выполняется или её завершение ещё не подтверждено".into())); }
+                if wsl.loading { rows.push(Row::WslInfo("Поиск дистрибутивов WSL…".into())); }
+                if let Some(error) = &wsl.error { rows.push(Row::WslInfo(format!("WSL: {error}"))); }
+                if let Err(reason) = &wsl.apply_eligibility { rows.push(Row::WslInfo(reason.clone())); }
+                if wsl.registration_freshness == crate::wsl_api::RegistrationFreshness::Current && wsl.distributions.is_empty() {
+                    rows.push(Row::WslInfo("Дистрибутивы WSL не найдены".into()));
+                }
+                rows.extend(wsl.distributions.iter().map(|d| Row::WslDistro(d.name.clone())));
+                for result in &wsl.results {
+                    use crate::wsl_api::WslTargetState::*;
+                    let state = match result.state {
+                        Unconfirmed => "Не подтверждено", NotApplied => "Не применено",
+                        Preparing => "Подготовка", ReadyToOpen => "Готово к открытию",
+                        Blocked => "Заблокировано", Pending => "Выполняется",
+                        Failed => "Ошибка", Cancelled => "Отменено",
+                    };
+                    let detail = result.detail.as_deref().map(|s| format!(": {s}")).unwrap_or_default();
+                    rows.push(Row::WslInfo(format!("{}: {state}{detail}", result.name)));
+                }
+                if wsl.pending { rows.push(Row::WslCancel); }
+                rows.push(Row::WslRefresh);
+                rows.push(Row::WslApply);
+                }
+            }
+        }
         rows.push(Row::Advanced);
         if self.advanced {
             rows.push(Row::Cap(Cap::Dns));
@@ -764,6 +881,7 @@ impl App {
             }
             rows.push(Row::CustomDnsText);
             rows.push(Row::Cap(Cap::LocalProxy));
+            rows.push(Row::Cap(Cap::BuiltinExits));
             rows.push(Row::Cap(Cap::GroupProxy));
             rows.push(Row::GroupProxyText);
             rows.push(Row::GroupProxyOpenRoom);
@@ -772,9 +890,7 @@ impl App {
             rows.push(Row::Cap(Cap::OwnProxy));
             rows.push(Row::OwnProxyText);
         }
-        if crate::gui::report::ENABLED {
-            rows.push(Row::Report);
-        }
+        rows.push(Row::Report);
         rows
     }
 
@@ -789,7 +905,7 @@ impl App {
                     .status
                     .as_ref()
                     .and_then(|s| s.installs.get(i))
-                    .is_some_and(|r| r.manual);
+                    .is_some_and(|r| r.saved_path().is_some());
                 let full = self.install_path(i).unwrap_or_default();
                 let mut s = "Enter — указать путь вручную".to_string();
                 if manual {
@@ -800,19 +916,33 @@ impl App {
                 }
                 s
             }
+            #[cfg(windows)]
+            Row::InstallationRecovery(path) => format!("Enter — проверить восстановление {}", path.display()),
+            Row::VsCodeAntigravity => String::new(),
             Row::Advanced => "Детали обхода: DNS-серверы, прокси, выходы.".into(),
             Row::Provider(_) => "Пробел — включить или выключить сервер, +/- — выше или ниже в списке.".into(),
             Row::GroupProxyText => "Код этого ПК и состояние ключа.".into(),
             Row::GroupProxyOpenRoom => "Открыть Telegram-комнату для получения ключа.".into(),
             Row::GroupProxyCopy => "Скопировать команду для получения ключа.".into(),
-            Row::GroupProxyPaste => "Вставить полученный ключ (из буфера обмена или в поле ввода).".into(),
-            Row::CustomDnsText => "Enter — задать свой DNS: IPv4, https://… (DoH) или tls://… (DoT) через пробел.".into(),
+            Row::GroupProxyPaste => "Вставить полученный ключ из буфера обмена.".into(),
+            Row::CustomDnsText => "Enter — задать свой DNS: IPv4-адреса через пробел.".into(),
             Row::OwnProxyText => {
                 "Enter — изменить адрес: логин:пароль@адрес:порт (или адрес:порт без пароля).".into()
             }
             Row::Report => {
                 "Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним текстом для группы.".into()
             }
+            #[cfg(windows)]
+            Row::WslMaster | Row::WslDistro(_) => "Пробел — изменить выбор; применение выполняется отдельно.".into(),
+            #[cfg(windows)]
+            Row::WslRefresh => "Enter — обновить список дистрибутивов.".into(),
+            #[cfg(windows)]
+            Row::WslApply => self.status.as_ref().and_then(|s| s.wsl.apply_eligibility.as_ref().err().cloned())
+                .unwrap_or_else(|| "Enter — применить текущие настройки.".into()),
+            #[cfg(windows)]
+            Row::WslCancel => "Enter — отменить выполнение.".into(),
+            #[cfg(windows)]
+            Row::WslInfo(_) => String::new(),
         }
     }
 
@@ -848,11 +978,12 @@ impl App {
                 let Some(r) = self.status.as_ref().and_then(|s| s.installs.get(i)) else {
                     return ListItem::new("");
                 };
-                let (dot, color, what) = match (&r.path, r.patched) {
+                let path = r.display_path();
+                let (dot, color, what) = match (path, r.patched) {
                     (None, _) => (
                         "○",
                         Color::DarkGray,
-                        "не найдено — Enter: указать путь".to_string(),
+                        r.discovery_note().unwrap_or_else(|| "не найдено — Enter: указать путь".into()).into_owned(),
                     ),
                     (Some(p), patched) => (
                         "●",
@@ -864,12 +995,10 @@ impl App {
                         crate::utils::mask_path(&p.display().to_string()),
                     ),
                 };
-                let tail = match (&r.path, r.patched) {
-                    (Some(_), Some(true)) => " · пропатчен",
-                    (Some(_), Some(false)) => " · не пропатчен",
-                    (Some(_), None) => " · проверяю…",
-                    (None, _) => "",
-                };
+                let tail = r
+                    .patch_observation_label()
+                    .map(|label| format!(" · {label}"))
+                    .unwrap_or_default();
                 ListItem::new(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(format!("{dot} "), Style::new().fg(color)),
@@ -877,6 +1006,17 @@ impl App {
                     Span::styled(what, Style::new().fg(Color::DarkGray)),
                     Span::styled(tail, Style::new().fg(color)),
                 ]))
+            }
+            #[cfg(windows)]
+            Row::InstallationRecovery(_) => ListItem::new("  Проверить восстановление"),
+            Row::VsCodeAntigravity => {
+                let Some(snapshot) = &self.status else {
+                    return ListItem::new("");
+                };
+                ListItem::new(format!(
+                    "  {}",
+                    status::vscode_antigravity_text(&snapshot.vscode_antigravity)
+                ))
             }
             Row::Advanced => ListItem::new(Line::styled(
                 format!(
@@ -894,34 +1034,27 @@ impl App {
                 switch_line("      ", &name, &state, busy, width)
             }
             Row::GroupProxyText => {
+                #[cfg(target_os = "macos")]
+                let pc = match crate::hwid::cached_pc_code() {
+                    Some(Ok(code)) => code.to_owned(),
+                    Some(Err(error)) => format!("недоступен: {error}"),
+                    None => "не запрошен".to_owned(),
+                };
+                #[cfg(not(target_os = "macos"))]
                 let pc = crate::hwid::pc_code();
                 let key_text = if crate::settings::group_key().is_empty() {
                     "ключа нет"
-                } else if crate::group::key_rejected() {
-                    "код перестал работать - получите новый в группе"
                 } else {
-                    "ключ есть"
+                    "ключ принят"
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw("      Код ПК: "),
-                    Span::styled(
-                        format!("{} - {}", pc, key_text),
-                        Style::new().fg(Color::Gray),
-                    ),
+                    Span::styled(format!("{} - {}", pc, key_text), Style::new().fg(Color::Gray)),
                 ]))
             }
-            Row::GroupProxyOpenRoom => ListItem::new(Line::from(vec![Span::styled(
-                "      > Открыть комнату группы",
-                Style::new().fg(Color::Cyan),
-            )])),
-            Row::GroupProxyCopy => ListItem::new(Line::from(vec![Span::styled(
-                "      > Скопировать команду",
-                Style::new().fg(Color::Cyan),
-            )])),
-            Row::GroupProxyPaste => ListItem::new(Line::from(vec![Span::styled(
-                "      > Вставить ключ из буфера",
-                Style::new().fg(Color::Cyan),
-            )])),
+            Row::GroupProxyOpenRoom => ListItem::new(Line::from(vec![Span::styled("      > Открыть комнату группы", Style::new().fg(Color::Cyan))])),
+            Row::GroupProxyCopy => ListItem::new(Line::from(vec![Span::styled("      > Скопировать команду", Style::new().fg(Color::Cyan))])),
+            Row::GroupProxyPaste => ListItem::new(Line::from(vec![Span::styled("      > Вставить ключ из буфера", Style::new().fg(Color::Cyan))])),
             Row::CustomDnsText => {
                 let text = self.custom_dns_text();
                 let shown = if text.is_empty() {
@@ -950,6 +1083,29 @@ impl App {
                 Span::styled("⎘ ", Style::new().fg(Color::Cyan)),
                 Span::raw("Сохранить отчёт"),
             ])),
+            #[cfg(windows)]
+            Row::WslMaster => {
+                let enabled = self.status.as_ref().and_then(|s| s.wsl.preferences.as_ref()).is_some_and(|p| p.enabled);
+                ListItem::new(format!("[{}] применить и для WSL", if enabled { "x" } else { " " }))
+            }
+            #[cfg(windows)]
+            Row::WslDistro(name) => {
+                let distro = self.status.as_ref().and_then(|s| s.wsl.distributions.iter().find(|d| d.name == name));
+                let selected = distro.is_some_and(|d| d.selected);
+                let suffix = match distro { Some(d) if d.registration == crate::wsl_api::RegistrationState::Absent => " — больше не найден", Some(d) if d.registration == crate::wsl_api::RegistrationState::Unknown => " — список не подтверждён", Some(d) if d.running == Some(false) => " — остановлен", _ => "" };
+                ListItem::new(format!("  [{}] {name}{suffix}", if selected { "x" } else { " " }))
+            }
+            #[cfg(windows)]
+            Row::WslRefresh => ListItem::new("  Обновить список WSL"),
+            #[cfg(windows)]
+            Row::WslApply => {
+                let available = self.status.as_ref().is_some_and(|s| s.wsl.can_apply());
+                ListItem::new("  Применить").style(if available { Style::default() } else { Style::default().fg(Color::DarkGray) })
+            },
+            #[cfg(windows)]
+            Row::WslCancel => ListItem::new("  Отменить"),
+            #[cfg(windows)]
+            Row::WslInfo(text) => ListItem::new(format!("  {text}")),
         }
     }
 
@@ -977,8 +1133,13 @@ impl App {
     }
 
     fn title_line(&self) -> Line<'static> {
+        #[cfg(target_os = "macos")]
+        let title_str = format!(" Antigravity Unlocker 2 v{} (macOS Edition by @Fuheshka) ", update::current_version());
+        #[cfg(not(target_os = "macos"))]
+        let title_str = format!(" Antigravity Unlocker 2 v{} ", update::current_version());
+
         let mut spans = vec![Span::styled(
-            format!(" Antigravity Unlocker 2 v{} ", update::current_version()),
+            title_str,
             Style::new().add_modifier(Modifier::BOLD),
         )];
         if let Some(rel) = &self.update {
@@ -1084,13 +1245,13 @@ impl App {
         let rows = self.rows();
         let (at, _) = self.cursor(&rows);
         self.list.select(Some(at));
-        let items: Vec<ListItem> = rows.iter().map(|r| self.row_item(*r, list.width)).collect();
+        let items: Vec<ListItem> = rows.iter().map(|r| self.row_item(r.clone(), list.width)).collect();
         let list_widget = List::new(items)
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
             .highlight_symbol("› ");
         f.render_stateful_widget(list_widget, list, &mut self.list);
 
-        let selected = self.list.selected().and_then(|i| rows.get(i).copied());
+        let selected = self.list.selected().and_then(|i| rows.get(i).cloned());
         let hint_text = selected.map(|r| self.row_hint(r)).unwrap_or_default();
         f.render_widget(
             Paragraph::new(hint_text)
@@ -1104,6 +1265,17 @@ impl App {
 
         if self.input.is_some() {
             self.draw_input(f, area);
+        }
+        #[cfg(windows)]
+        if let Some(preview) = &self.installation_recovery {
+            let width = area.width.min(74);
+            let height = area.height.min(10);
+            let popup = Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height);
+            let message = format!("{}\nНезавершённая операция {}\nПодтверждение завершит эту операцию. Настройки приложения применяются отдельно.\n\nEnter/Esc — Отменить\nY — Завершить восстановление Desktop",
+                preview.path.display(), preview.operation_id);
+            f.render_widget(Clear, popup);
+            f.render_widget(Paragraph::new(message).wrap(Wrap { trim: true })
+                .block(Block::default().title(" Восстановление Desktop ").borders(Borders::ALL)), popup);
         }
     }
 
@@ -1195,12 +1367,7 @@ impl App {
             Some(Action::Verify) => " · v — пройти верификацию",
             _ => "",
         };
-        let report = if crate::gui::report::ENABLED {
-            " · o — отчёт"
-        } else {
-            ""
-        };
-        let keys = format!("↑↓ выбор · Пробел/Enter — вкл/выкл{offered}{report} · q — выход");
+        let keys = format!("↑↓ выбор · Пробел/Enter — вкл/выкл{offered} · o — отчёт · q — выход");
         f.render_widget(
             Paragraph::new(keys).style(Style::new().fg(Color::DarkGray)),
             area,
@@ -1226,12 +1393,6 @@ impl App {
                 "Формат: логин:пароль@адрес:порт — или просто адрес:порт, если пароля нет. \
                  Например ivan:secret@203.0.113.9:3128. Только HTTP-прокси. \
                  Пустая строка — убрать прокси.",
-                text,
-                None,
-            ),
-            Some(Input::GroupKey { text }) => (
-                " Ключ группового прокси ",
-                "Буфер обмена недоступен или пуст. Вставьте ключ сюда (Ctrl+Shift+V или правая кнопка мыши в терминале) или наберите его.",
                 text,
                 None,
             ),
@@ -1273,6 +1434,11 @@ impl App {
             popup,
         );
     }
+}
+
+#[cfg(windows)]
+fn send_wsl_apply(worker: &Worker, status: Option<&crate::wsl_api::WslStatus>) {
+    if status.is_some_and(|status| status.show_configuration() && status.can_apply()) { worker.send(Cmd::ApplySettings); }
 }
 
 /// One switch as a line: `[вкл ] Title — note`.
@@ -1334,15 +1500,13 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
         .min(usize::from(u16::MAX)) as u16
 }
 
-/// The licence screen, always — except in a *debug* build started with
-/// `AG_UNLOCKER_DEV_SKIP_KEY`, as in the window.
+/// Local entry uses the same policy as the window.
 fn first_screen(settings: &crate::settings::Settings) -> Screen {
     #[cfg(debug_assertions)]
-    if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
-        return Screen::Main;
-    }
-    // A key accepted before and still good for this version: no screen.
-    if auth::verify_key(&settings.license_key) {
+    let debug_skip = std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some();
+    #[cfg(not(debug_assertions))]
+    let debug_skip = false;
+    if auth::entry_allowed(&settings.license_key, debug_skip) {
         return Screen::Main;
     }
     Screen::License
@@ -1486,6 +1650,103 @@ mod console {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_apply_enter_obeys_backend_eligibility() {
+        use crate::wsl_api::DesktopDiscovery;
+        let lifetime = Arc::new(ops::GuiLifetime::default());
+        let (worker, commands) = ops::layout_test_worker(lifetime.clone());
+        let (_, update_rx) = channel(); let (_, events) = channel(); let (_, gate_rx) = channel();
+        let status = Status {
+            wsl: crate::wsl_api::WslStatus { desktop_target: DesktopDiscovery::Present,
+                distributions: vec![crate::wsl_api::RegisteredDistro { name: "fixture".into(), registration: crate::wsl_api::RegistrationState::Present, selected: true, running: None }],
+                ..Default::default() }, admin: true, installs: Vec::new(),
+            vscode_antigravity: crate::ops::VsCodeAntigravityObservation::Incomplete,
+            client_patch: State::Off, watchdog: State::Off, dns: State::Off, local_proxy: State::Off,
+            own_proxy: State::Off, builtin_exits: State::Off, group_proxy: State::Off, dns_rotation: State::Off,
+            transport_view: crate::ops::TransportView::LegacyOrMissing,
+            transport_choices: Ok(crate::settings::TransportChoices::default()), transport_ready: None,
+            vpn: None, own_proxy_text: String::new(), custom_dns_text: String::new(),
+            relay_outdated: false, selected_delivery: Ok(false), relay_running: false,
+            background_observation_error: None, rules: false, rules_observed: None, providers: Vec::new(), relay_egress: None,
+        };
+        let mut app = App { screen: Screen::Main, key: String::new(), key_error: false, key_next_attempt: None,
+            update: None, update_rx, worker, events, status: Some(status), gate: gate::View::default(), gate_at: Instant::now(), gate_rx,
+            log: Vec::new(), busy: None, list: ListState::default(), selected: Row::WslApply, advanced: false,
+            input: None, toast: None, quit: false, shutdown_ready: false, shutdown_error: None, lifetime, installation_recovery: None };
+        for target in [DesktopDiscovery::Absent, DesktopDiscovery::Incomplete { desktop_found: false, error: "неизвестно".into() }] {
+            app.status.as_mut().unwrap().wsl.desktop_target = target;
+            let rows = app.rows();
+            assert!(!rows.iter().any(|row| matches!(row, Row::WslMaster | Row::WslDistro(_) | Row::WslRefresh | Row::WslApply)));
+        }
+        app.status.as_mut().unwrap().wsl.pending = true;
+        let rows = app.rows();
+        assert!(rows.iter().any(|row| matches!(row, Row::WslCancel)));
+        assert!(!rows.iter().any(|row| matches!(row, Row::WslMaster | Row::WslDistro(_) | Row::WslRefresh | Row::WslApply)));
+        app.selected = Row::WslCancel;
+        app.on_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(commands.try_recv(), Ok(Cmd::CancelWsl)));
+        let wsl = &mut app.status.as_mut().unwrap().wsl;
+        wsl.pending = false;
+        let error = "Другая установка не проверена";
+        wsl.desktop_target = DesktopDiscovery::Incomplete { desktop_found: true, error: error.into() };
+        wsl.apply_eligibility = Err(error.into());
+        let rows = app.rows();
+        assert!(rows.iter().any(|row| matches!(row, Row::WslMaster)));
+        assert!(rows.iter().any(|row| matches!(row, Row::WslDistro(name) if name == "fixture")));
+        assert!(rows.iter().any(|row| matches!(row, Row::WslRefresh)));
+        assert!(rows.iter().any(|row| matches!(row, Row::WslApply)));
+        assert!(rows.iter().any(|row| matches!(row, Row::WslInfo(reason) if reason == error)));
+        app.selected = Row::WslApply;
+        app.on_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(commands.try_recv().is_err());
+        let wsl = &mut app.status.as_mut().unwrap().wsl;
+        wsl.desktop_target = DesktopDiscovery::Present;
+        wsl.apply_eligibility = Ok(());
+        app.on_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(commands.try_recv(), Ok(Cmd::ApplySettings)));
+
+        let path = std::path::PathBuf::from(r"C:\Synthetic\Selected Desktop");
+        let snapshot = app.status.as_mut().unwrap();
+        snapshot.wsl.apply_eligibility = Err("unrelated installation incomplete".into());
+        snapshot.installs.push(ops::InstallRow { path: Some(path.clone()), label: "Antigravity 2.0",
+            patched: Some(true), manual: false, observed_kind: None, coverage: ops::InstallCoverage::Complete });
+        let recovery = Row::InstallationRecovery(path.clone());
+        assert!(!app.rows().contains(&recovery));
+        let original = app.status.as_ref().unwrap().installs[0].clone();
+        for (coverage, expected) in [
+            (ops::InstallCoverage::Complete, "не найдено"),
+            (ops::InstallCoverage::Incomplete, "не удалось проверить"),
+            (ops::InstallCoverage::ObservedStandard, "обнаружена в стандартном месте"),
+        ] {
+            let row = &mut app.status.as_mut().unwrap().installs[0];
+            row.path = None;
+            row.patched = None;
+            row.coverage = coverage;
+            assert!(format!("{:?}", app.row_item(Row::Install(0), 100)).contains(expected));
+            assert!(!app.rows().iter().any(|row| matches!(row, Row::InstallationRecovery(_))));
+        }
+        app.status.as_mut().unwrap().installs[0] = original;
+        app.status.as_mut().unwrap().installs[0].observed_kind = Some(crate::InstallationKind::Desktop);
+        app.selected = Row::Install(0);
+        app.on_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.input.take(), Some(Input::Path { .. })));
+        app.selected = recovery;
+        app.on_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(commands.try_recv(), Ok(Cmd::PrepareInstallationRecovery { path: selected }) if selected == path));
+        for (id, key, confirm) in [("dismiss", KeyCode::Enter, false), ("confirm", KeyCode::Char('y'), true)] {
+            app.installation_recovery = Some(ops::InstallationRecoveryPreview { proposal_id: id.into(), path: path.clone(),
+                operation_id: "recorded-operation".into() });
+            app.on_key(KeyEvent::new(key, KeyModifiers::NONE));
+            match commands.try_recv().unwrap() {
+                Cmd::ConfirmInstallationRecovery { proposal_id } if confirm => assert_eq!(proposal_id, id),
+                Cmd::DismissInstallationRecovery { proposal_id } if !confirm => assert_eq!(proposal_id, id),
+                _ => panic!("unexpected selected recovery action"),
+            }
+        }
+        assert!(commands.try_recv().is_err());
+    }
 
     #[test]
     fn base64_matches_the_standard_alphabet_and_padding() {

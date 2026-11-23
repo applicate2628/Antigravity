@@ -1,6 +1,39 @@
 use std::time::Duration;
 
-use crate::utils::{powershell, powershell_within};
+use crate::utils::{powershell, powershell_within, CommandOutcome, CommandObservation};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservationSupport { Supported, Unsupported }
+
+pub fn observation_support() -> ObservationSupport {
+    if cfg!(target_os = "macos") { ObservationSupport::Unsupported } else { ObservationSupport::Supported }
+}
+
+/// Relay route observation is separate from the client VPN verdict.
+#[cfg(target_os = "macos")]
+pub(crate) fn detect_mac_relay(outcome: &mut CommandOutcome, dest: std::net::Ipv4Addr)
+    -> Result<Option<crate::netif::MacRelayEgress>, String>
+{
+    crate::netif::observe(dest, || {
+        let command = crate::utils::PreparedExec::system(std::path::Path::new("/usr/sbin/netstat"))?
+            .args(["-rn", "-f", "inet"])
+            .env("LC_ALL", "C");
+        let observation = crate::utils::bounded_output(outcome, command, CLIENT_PROBE_LIMIT);
+        received_probe(outcome, observation)?;
+        std::str::from_utf8(outcome.stdout()).map(str::to_owned).map_err(|error| format!("netstat output: {error}"))
+    })
+}
+
+fn received_probe(outcome: &CommandOutcome, observation: CommandObservation) -> Result<(), String> {
+    match observation {
+        CommandObservation::Complete if outcome.complete() && outcome.releasable() && outcome.exit().is_some_and(|status| status.success()) => Ok(()),
+        CommandObservation::NotStarted => Err("egress helper did not start; actual failure retained".into()),
+        CommandObservation::Complete => Err("egress helper exited unsuccessfully or status is unknown".into()),
+        CommandObservation::Deadline => Err("egress helper deadline expired; outcome retained".into()),
+        CommandObservation::Failed => Err("egress helper failed; outcome retained".into()),
+        CommandObservation::Pending => Err("egress helper remains pending".into()),
+    }
+}
 
 // Finding the ISP-facing interface, and why that is the whole job here.
 //
@@ -31,16 +64,6 @@ use crate::utils::{powershell, powershell_within};
 // substituting a name, which is exactly how the tool broke. This module is back
 // to its one job: naming the interface those queries must leave through.
 
-/// Prefixes an earlier build pinned to the physical adapter. They are harmless
-/// but pointless, and the persistent ones outlive the tool, so cleanup drops
-/// them. Remove this once no installed build can still have written them.
-const LEGACY_PINNED_PREFIXES: &[&str] = &[
-    "111.88.96.50/32",
-    "111.88.96.51/32",
-    "2a00:ab00:1233:26::50/128",
-    "2a00:ab00:1233:26::51/128",
-];
-
 #[derive(Debug, Clone)]
 pub struct Egress {
     pub if_index: u32,
@@ -67,23 +90,14 @@ fn parse_egress(line: &str) -> Option<Egress> {
     })
 }
 
-/// Linux/macOS: the ISP link is the non-tunnel default route, and a tunnel is
-/// up when the routing table sends a public address through one (`netif`).
-#[cfg(not(target_os = "windows"))]
-pub fn detect() -> Option<Egress> {
-    let (if_index, vpn_active) = crate::netif::egress()?;
-    Some(Egress {
-        if_index,
-        vpn_active,
-    })
-}
-
 /// The default route that belongs to real hardware. `Get-NetAdapter -Physical`
 /// drops WireGuard/TAP tunnels and the Hyper-V/VMware virtual switches in one
 /// go, and requiring a real next hop drops host-only adapters, which carry a
 /// gateway address but no default route.
-#[cfg(target_os = "windows")]
-pub fn detect() -> Option<Egress> {
+pub fn detect(outcome: &mut CommandOutcome) -> Result<Option<Egress>, String> {
+    if observation_support() == ObservationSupport::Unsupported {
+        return Err("platform egress observation unsupported".into());
+    }
     const SCRIPT: &str = "\
 $phys=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | \
   Where-Object {$_.Status -eq 'Up'} | ForEach-Object {$_.ifIndex}); \
@@ -96,12 +110,18 @@ if ($mine.Count -eq 0) { 'none' } else { \
   $vpn=@($def | Where-Object {$phys -notcontains $_.ifIndex}).Count -gt 0; \
   '{0}|{1}|{2}' -f $best.ifIndex,$best.NextHop,$vpn }";
 
-    let out = powershell(SCRIPT)?;
-    String::from_utf8_lossy(&out.stdout)
+    let observation = powershell(outcome, SCRIPT);
+    received_probe(outcome, observation)?;
+    let text = String::from_utf8_lossy(outcome.stdout());
+    let line = text
         .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
-        .and_then(parse_egress)
+        .ok_or("egress helper: missing route observation")?;
+    let parsed = if line.trim().eq_ignore_ascii_case("none") { None }
+        else { Some(parse_egress(line).ok_or("egress helper: invalid route observation")?) };
+    drop(std::mem::take(outcome));
+    Ok(parsed)
 }
 
 // Which way the *client* leaves, which is not the question `vpn_active` answers.
@@ -193,7 +213,10 @@ const CLIENT_PROBE_LIMIT: Duration = Duration::from_secs(15);
 /// gate hosts' own door (`loopback`), and without this line its source address
 /// (127.x, the loopback adapter, which is not physical) read as a *tunnel*: the
 /// client would have been reported inside a VPN for talking to us.
-pub fn read() -> Reading {
+pub fn read(outcome: &mut CommandOutcome) -> Result<Reading, String> {
+    if observation_support() == ObservationSupport::Unsupported {
+        return Err("platform client egress observation unsupported".into());
+    }
     let script = format!(
         "$ids=@(Get-Process -Name '{glob}' -ErrorAction SilentlyContinue | \
            ForEach-Object {{$_.Id}}); \
@@ -226,32 +249,37 @@ pub fn read() -> Reading {
         listen = crate::proxy::LISTEN_IP,
     );
 
-    let Some(out) = powershell_within(&script, CLIENT_PROBE_LIMIT) else {
-        return Reading {
-            client: ClientEgress::Unknown,
-            relay: ClientEgress::Unknown,
-        };
-    };
-    String::from_utf8_lossy(&out.stdout)
+    let observation = powershell_within(outcome, &script, CLIENT_PROBE_LIMIT);
+    received_probe(outcome, observation)?;
+    let text = String::from_utf8_lossy(outcome.stdout());
+    let line = text
         .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
-        .map_or(
-            Reading {
-                client: ClientEgress::Unknown,
-                relay: ClientEgress::Unknown,
-            },
-            parse_reading,
-        )
+        .ok_or("egress helper: missing client observation")?;
+    if !line.trim().eq_ignore_ascii_case("none") {
+        let mut fields = line.trim().split('|');
+        if (0..5).any(|_| fields.next().and_then(|field| field.trim().parse::<u32>().ok()).is_none()) {
+            return Err("egress helper: invalid client observation".into());
+        }
+    }
+    let reading = parse_reading(line);
+    drop(std::mem::take(outcome));
+    Ok(reading)
 }
 
 /// `Get-Process` wants the image name without its extension. Taken from the
 /// installed path rather than spelled out again, so the two cannot drift.
 fn relay_process_name() -> String {
+    #[cfg(windows)]
+    return crate::background::relay_process_name();
+    #[cfg(not(windows))]
+    {
     crate::background::installed_exe()
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
+        .ok()
+        .and_then(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "ag_dns".to_string())
+    }
 }
 
 fn parse_reading(line: &str) -> Reading {
@@ -303,8 +331,8 @@ fn classify_client(phys: u32, tunnel: u32, ours: u32) -> ClientEgress {
 /// Kept for the one caller that only asks about the client: the stand-down
 /// decision, which is about the client and must not start answering a different
 /// question because a second one became measurable (D13, P34).
-pub fn client_egress() -> ClientEgress {
-    read().client
+pub fn client_egress(outcome: &mut CommandOutcome) -> Result<ClientEgress, String> {
+    Ok(read(outcome)?.client)
 }
 
 /// Whether the DNS layer must stand down for a tunnel (D13).
@@ -334,45 +362,32 @@ pub fn client_egress() -> ClientEgress {
 /// it - the RU-only providers refuse the tunnel's foreign exit (N25). The rules
 /// are always installed now (`dns::setup_dns_nrpt`): the relay decides what they
 /// answer, at runtime.
-pub fn vpn_verdict(egress: Option<&Egress>) -> (bool, ClientEgress) {
-    if !egress.is_some_and(|e| e.vpn_active) {
-        return (false, ClientEgress::Unknown);
+pub fn vpn_verdict(outcome: &mut CommandOutcome, egress: Option<&Egress>) -> Result<(bool, ClientEgress), String> {
+    if observation_support() == ObservationSupport::Unsupported {
+        return Err("platform VPN observation unsupported".into());
     }
-    let client = client_egress();
-    (client == ClientEgress::Tunnel, client)
-}
-
-/// Drops the host routes an earlier build pinned. Deleted per interface rather
-/// than by prefix alone, so a route stranded on an adapter the machine no longer
-/// uses goes too; netsh cleans up whatever the cmdlet could not.
-pub fn remove_legacy_routes() {
-    let list = LEGACY_PINNED_PREFIXES
-        .iter()
-        .map(|p| format!("'{}'", p))
-        .collect::<Vec<_>>()
-        .join(",");
-    let cmd = format!(
-        "foreach ($d in @({})) {{ \
-           $fam=$(if ($d -like '*:*') {{'ipv6'}} else {{'ipv4'}}); \
-           foreach ($s in @('ActiveStore','PersistentStore')) {{ \
-             $st=$(if ($s -eq 'ActiveStore') {{'active'}} else {{'persistent'}}); \
-             foreach ($r in @(Get-NetRoute -DestinationPrefix $d -PolicyStore $s \
-                 -ErrorAction SilentlyContinue)) {{ \
-               Remove-NetRoute -DestinationPrefix $d -InterfaceIndex $r.ifIndex \
-                 -PolicyStore $s -Confirm:$false -ErrorAction SilentlyContinue; \
-               if (@(Get-NetRoute -DestinationPrefix $d -PolicyStore $s -ErrorAction SilentlyContinue | \
-                   Where-Object {{$_.ifIndex -eq $r.ifIndex}}).Count -gt 0) {{ \
-                 netsh interface $fam delete route prefix=$d interface=$($r.ifIndex) store=$st | Out-Null }} }} }} }}",
-        list
-    );
-    powershell(&cmd);
+    if !egress.is_some_and(|e| e.vpn_active) {
+        return Ok((false, ClientEgress::Unknown));
+    }
+    let client = client_egress(outcome)?;
+    Ok((client == ClientEgress::Tunnel, client))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns_client;
     use std::net::Ipv4Addr;
+    use crate::dns_client;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_observation_is_unsupported_without_a_command() {
+        let mut outcome = CommandOutcome::default();
+        assert_eq!(observation_support(), ObservationSupport::Unsupported);
+        assert!(detect(&mut outcome).is_err());
+        assert!(read(&mut outcome).is_err());
+        assert!(outcome.exit().is_none());
+    }
 
     #[test]
     fn egress_line_is_parsed() {
@@ -473,8 +488,9 @@ mod tests {
             vpn_active: false,
         };
         // No tunnel: nothing to stand down for, and the probe never runs.
-        assert_eq!(vpn_verdict(Some(&no_vpn)), (false, ClientEgress::Unknown));
-        assert_eq!(vpn_verdict(None), (false, ClientEgress::Unknown));
+        let mut owner = CommandOutcome::default();
+        assert_eq!(vpn_verdict(&mut owner, Some(&no_vpn)).unwrap(), (false, ClientEgress::Unknown));
+        assert_eq!(vpn_verdict(&mut owner, None).unwrap(), (false, ClientEgress::Unknown));
     }
 
     #[test]
@@ -491,7 +507,8 @@ mod tests {
     #[test]
     #[ignore = "needs a live network; run with --ignored"]
     fn resolves_past_the_tunnel() {
-        let eg = detect().expect("physical egress");
+        let mut owner = CommandOutcome::default();
+        let eg = detect(&mut owner).expect("egress command").expect("physical egress");
         // The first provider with a UDP address - a DoH one has none (I49).
         let server: Ipv4Addr = crate::resolvers::PROVIDERS
             .iter()
@@ -531,9 +548,10 @@ mod tests {
     #[test]
     #[ignore = "reads live processes and sockets; run with --ignored"]
     fn reads_where_the_client_actually_leaves() {
-        let eg = detect();
-        let reading = read();
-        let (stand_down, _) = vpn_verdict(eg.as_ref());
+        let mut owner = CommandOutcome::default();
+        let eg = detect(&mut owner).expect("egress command");
+        let reading = read(&mut owner).expect("client probe");
+        let (stand_down, _) = vpn_verdict(&mut owner, eg.as_ref()).expect("VPN verdict");
         println!(
             "vpn_active: {}\nclient:     {:?}\nслужба:     {:?}\nstand down: {}  (правила DNS {})",
             eg.as_ref().is_some_and(|e| e.vpn_active),
@@ -553,7 +571,8 @@ mod tests {
     #[test]
     #[ignore = "needs a live network; run with --ignored"]
     fn unicast_if_needs_no_host_route() {
-        let eg = detect().expect("physical egress");
+        let mut owner = CommandOutcome::default();
+        let eg = detect(&mut owner).expect("egress command").expect("physical egress");
         let unrouted: Ipv4Addr = "1.1.1.1".parse().unwrap();
         let answer = dns_client::resolve_a_via("github.com", unrouted, eg.if_index);
         println!("via if{} to 1.1.1.1: {:?}", eg.if_index, answer);

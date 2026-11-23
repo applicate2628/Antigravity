@@ -24,9 +24,561 @@ use super::{theme, widgets, App, DONATE_URL, TELEGRAM_GROUP_URL};
 use crate::ops::{Cap, Cmd, Level, State};
 use crate::utils::mask_path;
 
-pub fn view(app: &mut App, ui: &mut egui::Ui) {
-    header(app, ui);
+#[cfg(all(test, windows))]
+thread_local! {
+    static WSL_ACTION_RECTS: std::cell::RefCell<Vec<egui::Rect>> = const { std::cell::RefCell::new(Vec::new()) };
+    static WSL_APPLY_RESPONSE: std::cell::RefCell<Option<(egui::Rect, egui::Id, bool)>> = const { std::cell::RefCell::new(None) };
+    static PROFILE_OPTIONS: std::cell::RefCell<Vec<(egui::Rect, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PROFILE_FORM_ACTIONS: std::cell::RefCell<Option<(egui::Rect, egui::Rect)>> = const { std::cell::RefCell::new(None) };
+    static WSL_SECTION_SEPARATOR: std::cell::RefCell<Option<egui::Rect>> = const { std::cell::RefCell::new(None) };
+    static WSL_PENDING_CANCEL: std::cell::RefCell<Option<egui::Rect>> = const { std::cell::RefCell::new(None) };
+    static HEADER_RECTS: std::cell::RefCell<Vec<egui::Rect>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BODY_META: std::cell::RefCell<Option<(egui::Id, egui::Rect, f32)>> = const { std::cell::RefCell::new(None) };
+    static HEADER_MENU: std::cell::RefCell<Option<(egui::Id, bool)>> = const { std::cell::RefCell::new(None) };
+    static INSTALL_RECTS: std::cell::RefCell<Vec<(&'static str, egui::Rect)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static STATUS_ACTION_RECTS: std::cell::RefCell<Vec<(Action, egui::Rect)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
+#[cfg(all(test, windows))]
+mod layout_tests {
+    use super::*;
+    use crate::wsl_api::{DesktopDiscovery, RegisteredDistro, RegistrationFreshness, RegistrationState, WslPreferences, WslTargetState, TargetApplyResult};
+
+    #[test]
+    #[ignore = "owned Windows metadata actor and in-process GUI channel; Root receives native fixture execution"]
+    fn diagnostic_event_is_one_journal_entry_and_uses_copy_rendering() {
+        let (mut app, _commands) = App::for_layout_test(status());
+        let (sender, events) = std::sync::mpsc::channel();
+        app.events = events;
+        let safe = crate::windows_coordinator::test_diagnostic_text();
+        assert!(!crate::ops::test_forward_wsl_diagnostic(sender, safe.clone()));
+        app.drain_events();
+        assert_eq!(app.log.len(), 1);
+        let copied = journal_copy_text(&app.log);
+        assert_eq!(copied, safe);
+        assert!(copied.contains("native error 51") && copied.contains("\\u{0}"));
+        assert!(copied.contains("encoding ambiguous") && copied.contains("a\\u{0}b\\u{0}") && copied.contains("[private]"));
+        assert!(!copied.contains("fixture-secret"));
+        let alias_units: Vec<_> = b"fixture-secret".chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+        assert!(!copied.contains(&String::from_utf16(&alias_units).unwrap()));
+        let (closed, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        assert!(crate::ops::test_forward_wsl_diagnostic(closed, safe));
+    }
+
+    fn status() -> crate::ops::Status {
+        crate::ops::Status {
+            wsl: crate::wsl_api::WslStatus {
+                desktop_target: DesktopDiscovery::Present,
+                preferences: Some(WslPreferences { enabled: true, distros: vec!["Ubuntu".into()] }),
+                registration_freshness: RegistrationFreshness::Current,
+                distributions: vec![RegisteredDistro { name: "Ubuntu".into(), registration: RegistrationState::Present, selected: true, running: Some(true) }],
+                ..Default::default()
+            },
+            admin: true, installs: Vec::new(), client_patch: State::Off, watchdog: State::Off,
+            vscode_antigravity: crate::ops::VsCodeAntigravityObservation::Incomplete,
+            dns: State::Off, local_proxy: State::Off, own_proxy: State::Off,
+            builtin_exits: State::Off, group_proxy: State::Off, dns_rotation: State::Off,
+            transport_view: crate::ops::TransportView::LegacyOrMissing,
+            transport_choices: Ok(crate::settings::TransportChoices::default()),
+            transport_ready: None,
+            vpn: None, own_proxy_text: String::new(), custom_dns_text: String::new(),
+            relay_outdated: false, relay_running: false, rules: false, rules_observed: None, background_observation_error: None,
+            selected_delivery: Ok(false),
+            providers: Vec::new(), relay_egress: None,
+        }
+    }
+
+    #[test]
+    fn unknown_delivery_offers_repair_and_keeps_enable_all() {
+        let mut snapshot = status();
+        snapshot.client_patch = State::On;
+        snapshot.selected_delivery = Err("synthetic unknown delivery".into());
+        let (mut app, commands) = App::for_layout_test(snapshot);
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, events| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(850.0, 600.0))),
+                events, ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| status_card(app, ui));
+            output.textures_delta.clear();
+        };
+        frame(&mut app, Vec::new());
+        frame(&mut app, Vec::new());
+        let actions = STATUS_ACTION_RECTS.with(|actions| actions.borrow().clone());
+        assert_eq!(actions.iter().map(|(action, _)| *action).collect::<Vec<_>>(), [Action::EnableAll, Action::Repair]);
+        assert!(commands.try_recv().is_err());
+        let repair = actions[1].1.center();
+        for pressed in [true, false] {
+            frame(&mut app, vec![egui::Event::PointerMoved(repair), egui::Event::PointerButton {
+                pos: repair, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        assert!(matches!(commands.try_recv(), Ok(Cmd::Repair)));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn configured_form_uses_saved_choices_and_emits_only_complete_apply() {
+        let mut snapshot = status();
+        snapshot.transport_view = crate::ops::TransportView::SystemTcp;
+        snapshot.transport_choices = Ok(crate::settings::TransportChoices {
+            dns: Some(false), local_proxy: Some(true), builtin_exits: None,
+            group_proxy: Some(false), own_proxy_enabled: Some(true),
+        });
+        let (mut app, commands) = App::for_layout_test(snapshot);
+        app.choose_system();
+        assert!(matches!(commands.try_recv(), Ok(Cmd::UseSystemTcp)));
+        app.open_configured();
+        app.apply_configured();
+        assert!(commands.try_recv().is_err());
+        app.cancel_configured();
+        assert!(commands.try_recv().is_err());
+        app.open_configured();
+        app.configured_draft.as_mut().unwrap().builtin_exits = Some(false);
+        app.apply_configured();
+        match commands.try_recv().unwrap() {
+            Cmd::UseExistingConfigured(c) => assert_eq!((c.dns, c.local_proxy, c.builtin_exits, c.group_proxy, c.own_proxy_enabled),
+                (Some(false), Some(true), Some(false), Some(false), Some(true))),
+            _ => panic!("unexpected configured-mode command"),
+        }
+        assert!(app.configured_draft.is_none());
+    }
+
+    fn history_status() -> crate::ops::Status {
+        let mut value = status();
+        value.wsl.preferences.as_mut().unwrap().distros.push("Debian".into());
+        value.wsl.distributions[0].running = None;
+        value.wsl.distributions.push(RegisteredDistro { name: "Debian".into(), registration: RegistrationState::Present,
+            selected: true, running: Some(false) });
+        value.wsl.results = vec![
+            TargetApplyResult { name: "Ubuntu".into(), state: WslTargetState::Blocked,
+                detail: Some("Не удалось завершить подготовку. Подробности — в журнале.".into()),
+                diagnostic: Some("GuestIdentity: synthetic technical detail".into()) },
+            TargetApplyResult { name: "Debian".into(), state: WslTargetState::ReadyToOpen,
+                detail: Some("Откройте WSL в Antigravity.".into()), diagnostic: None },
+        ];
+        value
+    }
+
+    #[test]
+    fn history_frame_labels_observation_and_apply_without_technical_detail() {
+        fn collect(shape: &egui::epaint::Shape, output: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => output.push(text.galley.job.text.clone()),
+                egui::epaint::Shape::Vec(shapes) => for shape in shapes { collect(shape, output); },
+                _ => {},
+            }
+        }
+        let ctx = egui::Context::default();
+        let (mut app, commands) = App::for_layout_test(history_status());
+        let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1600.0))), ..Default::default() };
+        let _ = ctx.run_ui(input(), |ui| wsl_options(&mut app, ui));
+        let output = ctx.run_ui(input(), |ui| wsl_options(&mut app, ui));
+        let mut text = Vec::new();
+        for shape in &output.shapes { collect(&shape.shape, &mut text); }
+        let rendered = text.join("\n");
+        for expected in ["Последняя проверка списка", "Состояние запуска не подтверждено", "Остановлен",
+            "Последнее применение", "Подготовка завершена"] {
+            assert!(rendered.contains(expected), "missing rendered label: {expected}");
+        }
+        assert!(!rendered.contains("synthetic technical detail"));
+        assert!(commands.try_recv().is_err());
+    }
+
+    fn frame(ctx: &egui::Context, app: &mut App, size: egui::Vec2) -> (Vec<egui::Rect>, Vec<egui::Rect>) {
+        WSL_ACTION_RECTS.with(|r| r.borrow_mut().clear());
+        HEADER_RECTS.with(|r| r.borrow_mut().clear());
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| view(app, ui));
+        // This geometry-only fixture deliberately has no painter.
+        output.textures_delta.clear();
+        (WSL_ACTION_RECTS.with(|r| r.borrow().clone()), HEADER_RECTS.with(|r| r.borrow().clone()))
+    }
+
+    #[test]
+    fn wsl_actions_stay_fixed_across_status_only_updates() {
+        for (size, scale) in [(egui::vec2(520.0, 620.0), 1.0), (egui::vec2(600.0, 840.0), 1.25), (egui::vec2(1000.0, 900.0), 1.5)] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let (mut app, commands) = App::for_layout_test(status());
+            let _ = frame(&ctx, &mut app, size);
+            let baseline = frame(&ctx, &mut app, size);
+            assert_eq!(baseline.0.len(), 2);
+            assert_eq!(baseline.1.len(), 1);
+            let wsl = &mut app.status.as_mut().unwrap().wsl;
+            wsl.loading = true;
+            wsl.pending = true;
+            wsl.error = Some("synthetic error with a longer explanation".into());
+            wsl.results.push(TargetApplyResult { name: "Ubuntu".into(), state: WslTargetState::Failed, detail: Some("synthetic detail".into()), diagnostic: None });
+            app.busy = Some("synthetic progress".into());
+            let changed = frame(&ctx, &mut app, size);
+            assert_eq!(baseline, changed);
+            app.busy = None;
+            app.update = Some(crate::update::ReleaseInfo { tag_name: "v99.0.0".into(), html_url: String::new(), name: None, body: None, published_at: None, prerelease: false, draft: false, assets: Vec::new() });
+            assert_eq!(baseline, frame(&ctx, &mut app, size));
+            app.busy = Some("synthetic progress".into());
+            assert_eq!(baseline, frame(&ctx, &mut app, size));
+            assert!(commands.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn whole_card_hides_wsl_until_desktop_and_keeps_pending_cancel() {
+        fn text(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape { egui::epaint::Shape::Text(t) => out.push(t.galley.job.text.clone()),
+                egui::epaint::Shape::Vec(items) => for item in items { text(item, out); }, _ => {} }
+        }
+        let ctx = egui::Context::default();
+        let (mut app, commands) = App::for_layout_test(status());
+        let render = |app: &mut App| {
+            WSL_SECTION_SEPARATOR.with(|slot| *slot.borrow_mut() = None);
+            WSL_ACTION_RECTS.with(|slot| slot.borrow_mut().clear());
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1600.0))), ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| antigravity_card(app, ui));
+            let mut words = Vec::new(); for shape in &output.shapes { text(&shape.shape, &mut words); }
+            output.textures_delta.clear();
+            words.join("\n")
+        };
+        for target in [DesktopDiscovery::Absent, DesktopDiscovery::Incomplete { desktop_found: false, error: "неизвестно".into() }] {
+            app.status.as_mut().unwrap().wsl.desktop_target = target;
+            let _ = render(&mut app); let rendered = render(&mut app);
+            assert!(!rendered.contains("применить и для WSL") && !rendered.contains("Ubuntu") && !rendered.contains("Обновить список"));
+            assert!(WSL_ACTION_RECTS.with(|slot| slot.borrow().is_empty()));
+            assert!(WSL_SECTION_SEPARATOR.with(|slot| slot.borrow().is_none()));
+        }
+        app.status.as_mut().unwrap().wsl.pending = true;
+        let rendered = render(&mut app);
+        assert!(rendered.contains("Операция выполняется") && rendered.contains("Отменить"));
+        assert!(!rendered.contains("применить и для WSL") && !rendered.contains("Ubuntu"));
+        assert!(WSL_SECTION_SEPARATOR.with(|slot| slot.borrow().is_some()));
+        let cancel = WSL_PENDING_CANCEL.with(|slot| slot.borrow().unwrap()).center();
+        for pressed in [true, false] {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1600.0))),
+                events: vec![egui::Event::PointerMoved(cancel), egui::Event::PointerButton { pos: cancel, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }], ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| antigravity_card(&mut app, ui)); output.textures_delta.clear();
+        }
+        assert!(matches!(commands.try_recv(), Ok(Cmd::CancelWsl)));
+        app.status.as_mut().unwrap().wsl.pending = false;
+        app.status.as_mut().unwrap().wsl.desktop_target = DesktopDiscovery::Present;
+        let rendered = render(&mut app);
+        assert!(rendered.contains("применить и для WSL") && rendered.contains("Ubuntu") && rendered.contains("Обновить список"));
+        assert_eq!(WSL_ACTION_RECTS.with(|slot| slot.borrow().len()), 2);
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn profile_radios_follow_acknowledged_mode_during_draft_and_cancel() {
+        let ctx = egui::Context::default();
+        let mut snapshot = status();
+        snapshot.transport_view = crate::ops::TransportView::SystemTcp;
+        snapshot.transport_choices = Ok(crate::settings::TransportChoices { dns: Some(false), local_proxy: Some(true),
+            builtin_exits: Some(false), group_proxy: Some(false), own_proxy_enabled: Some(false) });
+        let (mut app, commands) = App::for_layout_test(snapshot);
+        let render = |app: &mut App, events: Vec<egui::Event>| {
+            PROFILE_OPTIONS.with(|slot| slot.borrow_mut().clear());
+            PROFILE_FORM_ACTIONS.with(|slot| *slot.borrow_mut() = None);
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 1000.0))), events, ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| bypass_master(app, ui)); output.textures_delta.clear();
+        };
+        let click = |app: &mut App, pos: egui::Pos2| {
+            render(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+            render(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+        };
+        render(&mut app, vec![]); render(&mut app, vec![]);
+        let options = PROFILE_OPTIONS.with(|slot| slot.borrow().clone());
+        assert_eq!((options[0].1, options[1].1), (true, false));
+        click(&mut app, options[1].0.center());
+        assert!(app.configured_draft.is_some() && commands.try_recv().is_err());
+        assert_eq!(PROFILE_OPTIONS.with(|slot| slot.borrow().iter().map(|x| x.1).collect::<Vec<_>>()), vec![true, false]);
+        let (_, cancel) = PROFILE_FORM_ACTIONS.with(|slot| slot.borrow().unwrap());
+        click(&mut app, cancel.center());
+        assert!(app.configured_draft.is_none() && commands.try_recv().is_err());
+        let options = PROFILE_OPTIONS.with(|slot| slot.borrow().clone());
+        click(&mut app, options[1].0.center());
+        let (apply, _) = PROFILE_FORM_ACTIONS.with(|slot| slot.borrow().unwrap());
+        click(&mut app, apply.center());
+        assert!(matches!(commands.try_recv(), Ok(Cmd::UseExistingConfigured(_))));
+        assert_eq!(PROFILE_OPTIONS.with(|slot| slot.borrow().iter().map(|x| x.1).collect::<Vec<_>>()), vec![true, false]);
+        app.status.as_mut().unwrap().transport_view = crate::ops::TransportView::ExistingConfigured;
+        render(&mut app, vec![]);
+        let options = PROFILE_OPTIONS.with(|slot| slot.borrow().clone());
+        assert_eq!((options[0].1, options[1].1), (false, true));
+        click(&mut app, options[0].0.center());
+        assert!(matches!(commands.try_recv(), Ok(Cmd::UseSystemTcp)));
+        assert_eq!(PROFILE_OPTIONS.with(|slot| slot.borrow().iter().map(|x| x.1).collect::<Vec<_>>()), vec![false, true]);
+        app.log.push((Level::Err, "синтетическая ошибка применения".into()));
+        render(&mut app, vec![]);
+        assert_eq!(PROFILE_OPTIONS.with(|slot| slot.borrow().iter().map(|x| x.1).collect::<Vec<_>>()), vec![false, true]);
+        app.status.as_mut().unwrap().transport_view = crate::ops::TransportView::LegacyOrMissing;
+        render(&mut app, vec![]);
+        assert_eq!(PROFILE_OPTIONS.with(|slot| slot.borrow().iter().map(|x| x.1).collect::<Vec<_>>()), vec![false, false]);
+    }
+
+    #[test]
+    fn wsl_apply_click_and_keyboard_obey_backend_eligibility() {
+        let ctx = egui::Context::default();
+        let (mut app, commands) = App::for_layout_test(status());
+        let frame = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 900.0))), events, ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| wsl_options(app, ui));
+            output.textures_delta.clear();
+        };
+        let click = |app: &mut App, pos: egui::Pos2| {
+            frame(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+            frame(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+        };
+        let wsl = &mut app.status.as_mut().unwrap().wsl;
+        wsl.desktop_target = DesktopDiscovery::Incomplete { desktop_found: true, error: "Другая установка не проверена".into() };
+        wsl.apply_eligibility = Err("Другая установка не проверена".into());
+        WSL_APPLY_RESPONSE.with(|s| *s.borrow_mut() = None);
+        frame(&mut app, vec![]);
+        let (rect, disabled_id, enabled) = WSL_APPLY_RESPONSE.with(|s| s.borrow().unwrap());
+        assert!(!enabled);
+        click(&mut app, rect.center());
+        assert!(commands.try_recv().is_err());
+        ctx.memory_mut(|m| m.request_focus(disabled_id));
+        frame(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+        assert!(commands.try_recv().is_err());
+        frame(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE }]);
+        let wsl = &mut app.status.as_mut().unwrap().wsl;
+        wsl.desktop_target = DesktopDiscovery::Present;
+        wsl.apply_eligibility = Ok(());
+        frame(&mut app, vec![]);
+        let (rect, id, enabled) = WSL_APPLY_RESPONSE.with(|s| s.borrow().unwrap());
+        assert!(enabled);
+        click(&mut app, rect.center());
+        assert!(matches!(commands.try_recv(), Ok(Cmd::ApplySettings)));
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+        assert!(matches!(commands.try_recv(), Ok(Cmd::ApplySettings)));
+    }
+
+    #[test]
+    fn disclosure_opens_from_keyboard_without_external_action() {
+        let ctx = egui::Context::default();
+        let (mut app, commands) = App::for_layout_test(status());
+        app.busy = Some("synthetic progress".into());
+        let size = egui::vec2(600.0, 840.0);
+        let _ = frame(&ctx, &mut app, size);
+        let (id, _) = HEADER_MENU.with(|m| m.borrow().expect("menu present"));
+        ctx.memory_mut(|m| m.request_focus(id));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events: vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| view(&mut app, ui));
+        output.textures_delta.clear();
+        assert!(HEADER_MENU.with(|m| m.borrow().expect("menu present").1));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn long_install_path_does_not_overlap_action_rectangles() {
+        let mut snapshot = status();
+        snapshot.installs.push(crate::ops::InstallRow {
+            path: Some(std::path::PathBuf::from(r"C:\Synthetic\A very long installation location\Nested folder\Another nested folder\Antigravity")),
+            label: "Antigravity IDE", patched: Some(false), manual: true, observed_kind: None,
+            coverage: crate::ops::InstallCoverage::Complete,
+        });
+        let ctx = egui::Context::default();
+        let (mut app, commands) = App::for_layout_test(snapshot);
+        let size = egui::vec2(520.0, 620.0);
+        let _ = frame(&ctx, &mut app, size);
+        INSTALL_RECTS.with(|r| r.borrow_mut().clear());
+        let _ = frame(&ctx, &mut app, size);
+        let rows = INSTALL_RECTS.with(|r| r.borrow().clone());
+        let path = rows.iter().find(|(name, _)| *name == "path").expect("path rect").1;
+        for name in ["edit", "remove", "patch"] {
+            let action = rows.iter().find(|(key, _)| *key == name).expect("action rect").1;
+            assert!(path.max.x <= action.min.x, "{name} overlaps the path: {path:?}, {action:?}");
+        }
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn install_inventory_renders_observation_without_effect_actions() {
+        use crate::ops::{InstallCoverage, InstallRow};
+        fn text(shape: &egui::epaint::Shape, out: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push_str(&t.galley.job.text),
+                egui::epaint::Shape::Vec(items) => for item in items { text(item, out); },
+                _ => {}
+            }
+        }
+        let mut snapshot = status();
+        snapshot.installs.push(InstallRow { path: None, label: "Antigravity CLI", patched: None,
+            manual: false, observed_kind: None, coverage: InstallCoverage::Incomplete });
+        let (mut app, commands) = App::for_layout_test(snapshot);
+        let ctx = egui::Context::default();
+        for (coverage, expected) in [
+            (InstallCoverage::Complete, "не найдено"),
+            (InstallCoverage::Incomplete, "не удалось проверить"),
+            (InstallCoverage::ObservedStandard, "обнаружена в стандартном месте"),
+        ] {
+            app.status.as_mut().unwrap().installs[0].coverage = coverage;
+            INSTALL_RECTS.with(|items| items.borrow_mut().clear());
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 500.0))),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| install_rows(&mut app, ui));
+            let mut labels = String::new();
+            for shape in &output.shapes { text(&shape.shape, &mut labels); }
+            assert!(labels.contains(expected));
+            assert!(INSTALL_RECTS.with(|items| items.borrow().iter().all(|(name, _)| *name == "edit")));
+            assert!(commands.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn selected_desktop_recovery_button_prepares_at_every_patch_state_and_confirms_exact_preview() {
+        use crate::InstallationKind;
+        let path = std::path::PathBuf::from(r"C:\Synthetic\Selected Desktop");
+        let mut snapshot = status();
+        snapshot.wsl.preferences.as_mut().unwrap().enabled = false;
+        snapshot.wsl.desktop_target = DesktopDiscovery::Incomplete { desktop_found: true, error: "incomplete sibling".into() };
+        snapshot.installs.push(crate::ops::InstallRow { path: Some(path.clone()), label: "Antigravity 2.0", patched: None,
+            manual: false, observed_kind: None, coverage: crate::ops::InstallCoverage::Complete });
+        let (mut app, commands) = App::for_layout_test(snapshot);
+        let ctx = egui::Context::default();
+        let render = |app: &mut App, events| {
+            INSTALL_RECTS.with(|rects| rects.borrow_mut().clear());
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(780.0, 600.0))), events, ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| { install_rows(app, ui); installation_recovery_dialog(app, ui.ctx()); });
+            output.textures_delta.clear();
+        };
+        let find = |name: &str| INSTALL_RECTS.with(|rects| rects.borrow().iter().find(|(key, _)| *key == name).map(|(_, rect)| rect.center()));
+        let click = |app: &mut App, pos| {
+            for pressed in [true, false] {
+                render(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+                    pressed, modifiers: egui::Modifiers::NONE }]);
+            }
+        };
+        for kind in [None, Some(InstallationKind::Ide), Some(InstallationKind::Cli)] {
+            app.status.as_mut().unwrap().installs[0].observed_kind = kind;
+            render(&mut app, Vec::new());
+            assert!(find("recover").is_none());
+        }
+        app.status.as_mut().unwrap().installs[0].observed_kind = Some(InstallationKind::Desktop);
+        for patched in [Some(true), Some(false), None] {
+            app.status.as_mut().unwrap().installs[0].patched = patched;
+            render(&mut app, Vec::new());
+            click(&mut app, find("recover").unwrap());
+            assert!(matches!(commands.try_recv(), Ok(Cmd::PrepareInstallationRecovery { path: received }) if received == path));
+        }
+        app.installation_recovery = Some(crate::ops::InstallationRecoveryPreview { proposal_id: "live-preview".into(),
+            path, operation_id: "recorded-operation".into() });
+        render(&mut app, Vec::new());
+        render(&mut app, Vec::new());
+        assert!(commands.try_recv().is_err());
+        click(&mut app, find("confirm-recover").unwrap());
+        assert!(matches!(commands.try_recv(), Ok(Cmd::ConfirmInstallationRecovery { proposal_id }) if proposal_id == "live-preview"));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "owned synthetic native visual fixture; requires explicit inputs"]
+    fn native_layout_preview() {
+        use std::io::Write;
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        fn required(name: &str) -> String { std::env::var(name).unwrap_or_else(|_| panic!("missing {name}")) }
+        fn number(name: &str, zero: bool) -> f32 {
+            let n: f32 = required(name).parse().unwrap_or_else(|_| panic!("invalid {name}"));
+            assert!(n.is_finite() && if zero { n >= 0.0 } else { n > 0.0 }, "invalid {name}");
+            n
+        }
+        let case = required("AG_LAYOUT_CASE");
+        assert!(["idle", "busy", "update", "combined", "loading", "error", "results", "cancel", "long", "history"].contains(&case.as_str()), "invalid case");
+        let width = number("AG_LAYOUT_WIDTH", false);
+        let height = number("AG_LAYOUT_HEIGHT", false);
+        let zoom = number("AG_LAYOUT_ZOOM", false);
+        let duration_ms: u64 = required("AG_LAYOUT_DURATION_MS").parse().expect("invalid duration");
+        assert!(duration_ms > 0, "invalid duration");
+        let scroll_y = match std::env::var("AG_LAYOUT_SCROLL_Y") {
+            Ok(value) => { let n: f32 = value.parse().expect("invalid scroll"); assert!(n.is_finite() && n >= 0.0); n }
+            Err(std::env::VarError::NotPresent) => 0.0,
+            Err(_) => panic!("invalid scroll"),
+        };
+        assert!((width * zoom).is_finite() && (height * zoom).is_finite(), "invalid scaled size");
+        let mut s = status();
+        s.wsl.preferences.as_mut().unwrap().distros.push("Debian".into());
+        s.wsl.distributions.push(RegisteredDistro { name: "Debian".into(), registration: RegistrationState::Present, selected: true, running: Some(true) });
+        if case == "long" {
+            s.wsl.distributions.push(RegisteredDistro { name: "Synthetic long distribution name with spaces and unicode пример extended example".into(), registration: RegistrationState::Present, selected: false, running: Some(false) });
+            s.installs.push(crate::ops::InstallRow { path: Some(std::path::PathBuf::from(r"C:\Synthetic\A very long installation location\Nested folder\Another nested folder\Antigravity")), label: "Antigravity IDE", patched: Some(true), manual: true, observed_kind: None, coverage: crate::ops::InstallCoverage::Complete });
+        }
+        if case == "loading" { s.wsl.loading = true; }
+        if case == "error" { s.wsl.error = Some("Синтетическая ошибка обнаружения".into()); }
+        if case == "results" {
+            for name in ["Ubuntu", "Debian"] { s.wsl.results.push(TargetApplyResult { name: name.into(), state: WslTargetState::ReadyToOpen, detail: Some("Откройте WSL в Antigravity.".into()), diagnostic: None }); }
+        }
+        if case == "history" { s = history_status(); }
+        if case == "cancel" { s.wsl.pending = true; }
+        let (mut app, commands) = App::for_layout_test(s);
+        if case == "history" { app.log.push((Level::Err, "GuestIdentity: synthetic technical detail".into())); }
+        if case == "busy" || case == "combined" { app.busy = Some("Синтетическая операция".into()); }
+        if case == "update" || case == "combined" {
+            app.update = Some(crate::update::ReleaseInfo { tag_name: "v99.0.0".into(), html_url: String::new(), name: None, body: None, published_at: None, prerelease: false, draft: false, assets: Vec::new() });
+        }
+        struct Preview { app: App, commands: std::sync::mpsc::Receiver<Cmd>, case: String, width: f32, height: f32, zoom: f32, scroll_y: f32, duration: Duration, frames: u32, ready: Option<std::time::Instant> }
+        impl eframe::App for Preview {
+            fn persist_egui_memory(&self) -> bool { false }
+            fn raw_input_hook(&mut self, _: &egui::Context, input: &mut egui::RawInput) { input.events.clear(); }
+            fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+                let ctx = ui.ctx().clone();
+                WSL_ACTION_RECTS.with(|r| r.borrow_mut().clear());
+                HEADER_RECTS.with(|r| r.borrow_mut().clear());
+                let avail = ui.available_size();
+                egui::Frame::central_panel(&ui.style().clone()).inner_margin(egui::Margin { left: 18, right: 4, top: 18, bottom: 4 }).show(ui, |ui| {
+                    ui.set_min_height(avail.y - 22.0);
+                    view(&mut self.app, ui);
+                });
+                self.frames += 1;
+                if self.frames == 1 {
+                    BODY_META.with(|meta| {
+                        let (id, _, _) = meta.borrow().expect("body metadata");
+                        let mut state = egui::scroll_area::State::load(&ctx, id).expect("scroll state");
+                        state.offset.y = self.scroll_y;
+                        state.store(&ctx, id);
+                    });
+                }
+                if self.frames == 4 {
+                    let actions = WSL_ACTION_RECTS.with(|r| r.borrow().clone());
+                    let header = HEADER_RECTS.with(|r| r.borrow().clone());
+                    let (_, body, actual_scroll) = BODY_META.with(|m| m.borrow().expect("body metadata"));
+                    let rect = |r: egui::Rect| [r.min.x, r.min.y, r.max.x, r.max.y];
+                    let native = ctx.input(|i| i.viewport().native_pixels_per_point);
+                    let info = serde_json::json!({"pid": std::process::id(), "case": self.case, "title": format!("Antigravity Unlocker UI fixture - {}", self.case), "logical_width": self.width, "logical_height": self.height, "zoom": self.zoom, "native_ppp": native, "effective_ppp": ctx.pixels_per_point(), "body": rect(body), "header": header.into_iter().map(rect).collect::<Vec<_>>(), "actions": actions.into_iter().map(rect).collect::<Vec<_>>(), "scroll_requested": self.scroll_y, "scroll_actual": actual_scroll});
+                    println!("FRAME_READY {info}");
+                    std::io::stdout().flush().expect("flush frame marker");
+                    self.ready = Some(std::time::Instant::now());
+                }
+                assert!(self.commands.try_recv().is_err(), "fixture must not submit commands");
+                if self.ready.is_some_and(|t| t.elapsed() >= self.duration) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+            }
+        }
+        let title = format!("Antigravity Unlocker UI fixture - {case}");
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default().with_title(&title).with_inner_size([width * zoom, height * zoom]).with_active(false).with_mouse_passthrough(false),
+            event_loop_builder: Some(Box::new(|builder| { builder.with_any_thread(true); })),
+            persist_window: false,
+            ..Default::default()
+        };
+        let preview = Preview { app, commands, case, width, height, zoom, scroll_y, duration: Duration::from_millis(duration_ms), frames: 0, ready: None };
+        eframe::run_native(&title, options, Box::new(move |cc| { theme::apply(&cc.egui_ctx); cc.egui_ctx.set_zoom_factor(zoom); Ok(Box::new(preview)) })).expect("preview window failed");
+    }
+}
+
+pub fn view(app: &mut App, ui: &mut egui::Ui) {
+    egui::Panel::top("status-strip")
+        .frame(egui::Frame::new())
+        .show(ui, |ui| header(app, ui));
     // A bottom panel, reserved *before* the scrolling body. Laid out the other
     // way round — scroll area first, footer after — the scroll area claims every
     // remaining pixel and the footer is positioned past the bottom of the
@@ -44,7 +596,7 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
     egui::CentralPanel::default()
         .frame(egui::Frame::new())
         .show(ui, |ui| {
-            egui::ScrollArea::vertical()
+            let scroll = egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     // Put back what the outer frame gave up to the scroll bar,
@@ -60,27 +612,40 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
                     log_card(app, ui);
                     ui.add_space(12.0);
                 });
+            #[cfg(all(test, windows))]
+            BODY_META.with(|meta| *meta.borrow_mut() = Some((scroll.id, scroll.inner_rect, scroll.state.offset.y)));
+            #[cfg(not(all(test, windows)))]
+            let _ = scroll;
         });
 }
 
 // ---------------------------------------------------------------------------
 
 fn header(app: &mut App, ui: &mut egui::Ui) {
-    app.update_banner(ui);
-
-    // No product name and no version here: both are in the title bar already,
-    // and repeating them costs a line of a window this narrow.
-    if let Some(what) = &app.busy {
-        ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().size(14.0));
-            ui.label(
-                egui::RichText::new(what.clone())
-                    .size(12.0)
-                    .color(theme::MUTED),
-            );
+    let row = ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if app.update.is_some() && ui.button("Обновление").clicked() {
+                crate::utils::open_url(crate::update::RELEASES_LATEST_URL);
+            }
+            let menu = ui.menu_button("Подробнее", |ui| {
+                ui.label(super::title());
+                if let Some(what) = &app.busy { ui.label(what); }
+                if let Some(rel) = &app.update {
+                    ui.label(format!("Доступна новая версия — {}", rel.display_version()));
+                }
+            });
+            #[cfg(all(test, windows))]
+            HEADER_MENU.with(|m| *m.borrow_mut() = Some((menu.response.id, menu.inner.is_some())));
+            #[cfg(not(all(test, windows)))]
+            let _ = menu;
+            let text = app.busy.as_deref().map(str::to_owned).unwrap_or_else(super::title);
+            ui.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(theme::MUTED)).truncate());
         });
-        ui.add_space(8.0);
-    }
+    });
+    #[cfg(all(test, windows))]
+    HEADER_RECTS.with(|rects| rects.borrow_mut().push(row.response.rect));
+    #[cfg(not(all(test, windows)))]
+    let _ = row;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +683,8 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
     }
 
     let busy = app.is_busy();
+    #[cfg(all(test, windows))]
+    STATUS_ACTION_RECTS.with(|actions| actions.borrow_mut().clear());
     let mut pressed: Option<Action> = None;
     let mut copy = false;
     let mut reveal: Option<std::path::PathBuf> = None;
@@ -142,68 +709,80 @@ fn status_card(app: &mut App, ui: &mut egui::Ui) {
             ui.label(egui::RichText::new(&h.detail).size(13.5).color(theme::TEXT));
             if let Some(action) = h.action {
                 ui.add_space(10.0);
-                if widgets::primary(ui, action.label(), !busy).clicked() {
+                let response = widgets::primary(ui, action.label(), !busy);
+                #[cfg(all(test, windows))]
+                STATUS_ACTION_RECTS.with(|actions| actions.borrow_mut().push((action, response.rect)));
+                if response.clicked() {
                     pressed = Some(action);
                 }
             }
-            if super::report::ENABLED {
-                ui.add_space(10.0);
-                // The saved file is named on a line of its own, under the buttons.
-                // A report the size of these is pasted into a chat as a wall of
-                // text nobody reads and half of them arrive truncated, so the file
-                // *is* the deliverable and its name is what the user has to act on;
-                // the path is not shown, because «рабочий стол» plus «Показать» is
-                // what actually gets them to it.
-                let saved = app
-                    .report_saved
-                    .clone()
-                    .filter(|(at, _)| at.elapsed() < REPORT_SHOWN_FOR);
-                ui.horizontal(|ui| {
+            #[cfg(windows)]
+            if h.action != Some(Action::Repair)
+                && app.status.as_ref().is_some_and(|status| status.admin && status.selected_delivery.is_err()) {
+                ui.add_space(6.0);
+                let response = ui.add_enabled(!busy, egui::Button::new("Починить…"));
+                #[cfg(all(test, windows))]
+                STATUS_ACTION_RECTS.with(|actions| actions.borrow_mut().push((Action::Repair, response.rect)));
+                if response.clicked() {
+                    pressed = Some(Action::Repair);
+                }
+            }
+            ui.add_space(10.0);
+            // The saved file is named on a line of its own, under the buttons.
+            // A report the size of these is pasted into a chat as a wall of
+            // text nobody reads and half of them arrive truncated, so the file
+            // *is* the deliverable and its name is what the user has to act on;
+            // the path is not shown, because «рабочий стол» plus «Показать» is
+            // what actually gets them to it.
+            let saved = app
+                .report_saved
+                .clone()
+                .filter(|(at, _)| at.elapsed() < REPORT_SHOWN_FOR);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!busy, egui::Button::new(egui::RichText::new("Сохранить отчёт").size(12.5)))
+                    .on_hover_text("Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним файлом на рабочем столе: приложите его к сообщению")
+                    .clicked()
+                {
+                    copy = true;
+                }
+                if let Some((_, path)) = &saved {
                     if ui
-                        .add_enabled(!busy, egui::Button::new(egui::RichText::new("Сохранить отчёт").size(12.5)))
-                        .on_hover_text("Всё, что нужно, чтобы понять, почему Antigravity отвечает или нет — одним файлом на рабочем столе: приложите его к сообщению")
+                        .add(egui::Button::new(egui::RichText::new("Показать файл").size(12.5)))
+                        .on_hover_text("Открыть папку с отчётом")
                         .clicked()
                     {
-                        copy = true;
+                        reveal = Some(path.clone());
                     }
-                    if let Some((_, path)) = &saved {
-                        if ui
-                            .add(egui::Button::new(egui::RichText::new("Показать файл").size(12.5)))
-                            .on_hover_text("Открыть папку с отчётом")
-                            .clicked()
-                        {
-                            reveal = Some(path.clone());
-                        }
-                    }
-                });
-                if let Some((_, path)) = &saved {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Отчёт сохранён на рабочий стол: «{}». Приложите этот файл к сообщению.",
-                            path.file_name()
-                                .map(|f| f.to_string_lossy().into_owned())
-                                .unwrap_or_default()
-                        ))
-                        .size(12.5)
-                        .color(theme::OK),
-                    );
-                    ui.ctx().request_repaint_after(Duration::from_millis(500));
                 }
-                if app
-                    .report_clipboard_at
-                    .is_some_and(|at| at.elapsed() < REPORT_SHOWN_FOR)
-                {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Файл сохранить не удалось — отчёт скопирован, вставьте его в сообщение.",
-                        )
-                        .size(12.5)
-                        .color(theme::WARN),
-                    );
-                    ui.ctx().request_repaint_after(Duration::from_millis(500));
-                }
+            });
+            if let Some((_, path)) = &saved {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Отчёт сохранён на рабочий стол: «{}». Приложите этот файл к сообщению.",
+                        path.file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    ))
+                    .size(12.5)
+                    .color(theme::OK),
+                );
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+            if app
+                .report_clipboard_at
+                .is_some_and(|at| at.elapsed() < REPORT_SHOWN_FOR)
+            {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Файл сохранить не удалось — отчёт скопирован, вставьте его в сообщение.",
+                    )
+                    .size(12.5)
+                    .color(theme::WARN),
+                );
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
             }
         });
 
@@ -283,20 +862,220 @@ fn antigravity_card(app: &mut App, ui: &mut egui::Ui) {
         );
         ui.add_space(6.0);
         install_rows(app, ui);
+        if let Some(snapshot) = &app.status {
+            ui.label(status::vscode_antigravity_text(&snapshot.vscode_antigravity));
+        }
+
+        #[cfg(target_os = "windows")]
+        if app.status.as_ref().is_some_and(|s| s.wsl.show_configuration() || s.wsl.pending) {
+            ui.add_space(10.0);
+            let _separator = ui.separator();
+            #[cfg(all(test, windows))]
+            WSL_SECTION_SEPARATOR.with(|slot| *slot.borrow_mut() = Some(_separator.rect));
+            ui.add_space(8.0);
+            wsl_options(app, ui);
+        }
     });
+}
+
+#[cfg(target_os = "windows")]
+fn wsl_options(app: &mut App, ui: &mut egui::Ui) {
+    use crate::wsl_api::{WslTargetState, RegistrationState, RegistrationFreshness, WslRefreshOutcome};
+
+    let Some(wsl) = app.status.as_ref().map(|s| s.wsl.clone()) else {
+        return;
+    };
+    if !wsl.show_configuration() {
+        if wsl.pending {
+            ui.label("Операция выполняется или её завершение ещё не подтверждено.");
+            let cancel = ui.button("Отменить");
+            #[cfg(all(test, windows))]
+            WSL_PENDING_CANCEL.with(|slot| *slot.borrow_mut() = Some(cancel.rect));
+            if cancel.clicked() { app.worker.send(Cmd::CancelWsl); }
+        }
+        return;
+    }
+    let mut enabled = wsl.preferences.as_ref().is_some_and(|p| p.enabled);
+    if ui.add_enabled(!wsl.pending && !wsl.loading, egui::Checkbox::new(&mut enabled, "применить и для WSL")).changed() {
+        app.worker.send(Cmd::SetWslEnabled(enabled));
+    }
+    for distro in &wsl.distributions {
+        ui.push_id((&distro.name, "wsl-distro"), |ui| {
+            let mut selected = distro.selected;
+            if ui.add_enabled(wsl.can_set_distro(&distro.name, !distro.selected), egui::Checkbox::new(&mut selected, &distro.name)).changed() {
+                app.worker.send(Cmd::SetWslDistro { name: distro.name.clone(), selected });
+            }
+        });
+    }
+    ui.horizontal_wrapped(|ui| {
+        let refresh = ui.add_enabled(!wsl.loading && !wsl.pending, egui::Button::new("Обновить список"));
+        #[cfg(all(test, windows))]
+        WSL_ACTION_RECTS.with(|rects| rects.borrow_mut().push(refresh.rect));
+        if refresh.clicked() {
+            app.worker.send(Cmd::RefreshWsl);
+        }
+        let apply = ui.add_enabled(wsl.can_apply(), egui::Button::new("Применить"));
+        #[cfg(all(test, windows))]
+        WSL_ACTION_RECTS.with(|rects| rects.borrow_mut().push(apply.rect));
+        #[cfg(all(test, windows))]
+        WSL_APPLY_RESPONSE.with(|slot| *slot.borrow_mut() = Some((apply.rect, apply.id, apply.enabled())));
+        if apply.clicked() {
+            app.worker.send(Cmd::ApplySettings);
+        }
+        if wsl.pending && ui.button("Отменить").clicked() {
+            app.worker.send(Cmd::CancelWsl);
+        }
+    });
+    if let Err(reason) = &wsl.apply_eligibility { ui.label(reason); }
+    if wsl.loading {
+        ui.label("Поиск дистрибутивов WSL…");
+    }
+    if let Some(error) = &wsl.error {
+        ui.label(format!("WSL: {error}"));
+    }
+    if wsl.registration_freshness == RegistrationFreshness::Current && wsl.distributions.is_empty() {
+        ui.label("Дистрибутивы WSL не найдены.");
+    }
+    if let Some(result) = wsl.refresh_result {
+        let outcome = match result.outcome {
+            WslRefreshOutcome::Completed => "завершено",
+            WslRefreshOutcome::Failed => "не удалось",
+            WslRefreshOutcome::Unconfirmed => "не подтверждено",
+        };
+        ui.label(format!("Обновление списка №{}: {outcome}", result.attempt));
+    } else if wsl.registration_freshness != RegistrationFreshness::Unobserved && !wsl.distributions.is_empty() {
+        ui.label("Последняя проверка списка");
+    }
+    for distro in &wsl.distributions {
+        let state = if distro.registration == RegistrationState::Absent {
+            Some("Больше не найден")
+        } else if distro.registration == RegistrationState::Unknown {
+            Some("Список ещё не подтверждён")
+        } else if distro.running == Some(false) {
+            Some("Остановлен")
+        } else if distro.running.is_none() {
+            Some("Состояние запуска не подтверждено")
+        } else {
+            None
+        };
+        if let Some(state) = state {
+            ui.label(format!("{}: {state}", distro.name));
+        }
+    }
+    if wsl.pending { ui.label("Операция выполняется или её завершение ещё не подтверждено."); }
+    if !wsl.results.is_empty() {
+        let heading = if wsl.results.iter().any(|result| result.state == WslTargetState::Preparing) {
+            "Текущее применение"
+        } else { "Последнее применение" };
+        ui.label(heading);
+    }
+    for result in &wsl.results {
+        let state = match result.state {
+            WslTargetState::Unconfirmed => "Не подтверждено",
+            WslTargetState::NotApplied => "Не применено",
+            WslTargetState::Preparing => "Подготовка",
+            WslTargetState::ReadyToOpen => "Подготовка завершена",
+            WslTargetState::Blocked => "Заблокировано",
+            WslTargetState::Pending => "Выполняется",
+            WslTargetState::Failed => "Ошибка",
+            WslTargetState::Cancelled => "Отменено",
+        };
+        let detail = result.detail.as_deref().map(|s| format!(": {s}")).unwrap_or_default();
+        ui.label(format!("{}: {state}{detail}", result.name));
+    }
 }
 
 /// The master switch of the bypass. Derived, never stored: it is on when any
 /// part of the bypass is, which keeps one truth instead of two.
 fn bypass_master(app: &mut App, ui: &mut egui::Ui) {
+    #[cfg(windows)]
+    {
+        ui.label("Системное подключение использует сеть и DNS Windows. Дополнительные прокси сохраняются, но в этом режиме не используются.");
+        let acknowledged = app.status.as_ref().map(|s| s.transport_view);
+        let system_note = egui::Label::new("Выбран системный режим. Сохранённые дополнительные маршруты сейчас не используются.");
+        if acknowledged == Some(crate::ops::TransportView::SystemTcp) {
+            ui.add(system_note);
+        } else {
+            // Preserve the radio row's position while the explanation is hidden.
+            let _ = system_note.selectable(false).sense(egui::Sense::hover()).layout_in_ui(ui);
+        }
+        ui.horizontal_wrapped(|ui| {
+            let system = acknowledged == Some(crate::ops::TransportView::SystemTcp);
+            let configured = acknowledged == Some(crate::ops::TransportView::ExistingConfigured);
+            let system_control = ui.add_enabled(!app.is_busy(), egui::RadioButton::new(system, "Системное подключение"));
+            #[cfg(all(test, windows))]
+            PROFILE_OPTIONS.with(|options| options.borrow_mut().push((system_control.rect, system)));
+            if system_control.clicked() {
+                app.cancel_configured();
+                if !system { app.choose_system(); }
+            }
+            let configured_control = ui.add_enabled(!app.is_busy(), egui::RadioButton::new(configured, "Настроенное подключение"));
+            #[cfg(all(test, windows))]
+            PROFILE_OPTIONS.with(|options| options.borrow_mut().push((configured_control.rect, configured)));
+            if configured_control.clicked() {
+                app.open_configured();
+            }
+        });
+        if let Some(status) = &app.status {
+            if let Err(error) = &status.transport_choices { ui.label(format!("Настройки выбора недоступны: {error}")); }
+        }
+        let mut apply = false;
+        let mut cancel = false;
+        let busy = app.is_busy();
+        if let Some(choices) = &mut app.configured_draft {
+            ui.label("Сохранённые значения показаны как предпочтения. Выберите все пять пунктов и подтвердите их для этого режима.");
+            for (label, value) in [
+                ("DNS для обхода", &mut choices.dns),
+                ("Прокси для клиента", &mut choices.local_proxy),
+                ("Встроенные выходы", &mut choices.builtin_exits),
+                ("Групповой прокси", &mut choices.group_proxy),
+                ("Свой прокси", &mut choices.own_proxy_enabled),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    let available = label != "Встроенные выходы" || crate::proxy::exits_available();
+                    if ui.add_enabled(available, egui::RadioButton::new(*value == Some(true), "Включено")).clicked() {
+                        *value = Some(true);
+                    }
+                    ui.radio_value(value, Some(false), "Выключено");
+                    if !available { ui.label("Недоступно в этой сборке"); }
+                });
+            }
+            let complete = [choices.dns, choices.local_proxy, choices.builtin_exits, choices.group_proxy, choices.own_proxy_enabled].iter().all(Option::is_some);
+            ui.horizontal(|ui| {
+                let apply_button = widgets::primary(ui, "Применить настроенный режим", complete && !busy);
+                let cancel_button = ui.button("Отмена");
+                #[cfg(all(test, windows))]
+                PROFILE_FORM_ACTIONS.with(|slot| *slot.borrow_mut() = Some((apply_button.rect, cancel_button.rect)));
+                apply = apply_button.clicked();
+                cancel = cancel_button.clicked();
+            });
+            if !complete { ui.label("Для каждого пункта выберите включено или выключено."); }
+        }
+        if cancel { app.cancel_configured(); }
+        if apply { app.apply_configured(); }
+        ui.add_space(8.0);
+    }
     let any_on = app.status.as_ref().is_some_and(|s| s.bypass_on());
     let mut master = any_on;
     let busy = app.is_busy();
     let flipped = widgets::switch_row(ui, &mut master, !busy, |ui| {
         let (title, hint) = status::BYPASS_TEXT;
-        widgets::title_info(ui, title, hint);
+        ui.label(egui::RichText::new(title).size(14.0));
+        widgets::hint(ui, hint);
     });
     if flipped {
+        #[cfg(windows)]
+        {
+            let system = app.status.as_ref().is_some_and(|s| s.transport_view == crate::ops::TransportView::SystemTcp);
+            if system {
+                app.worker.send(Cmd::Set(Cap::LocalProxy, master));
+            } else {
+                // Optional routes remain separate user choices.
+                for cap in [Cap::Dns, Cap::LocalProxy] { app.worker.send(Cmd::Set(cap, master)); }
+            }
+        }
+        #[cfg(not(windows))]
         for cap in crate::ops::bypass_order(master) {
             app.worker.send(Cmd::Set(cap, master));
         }
@@ -312,10 +1091,13 @@ fn install_rows(app: &mut App, ui: &mut egui::Ui) {
     let mut forget: Option<std::path::PathBuf> = None;
     let mut edit: Option<String> = None;
     let mut patch: Option<std::path::PathBuf> = None;
+    #[cfg(windows)]
+    let mut recovery: Option<std::path::PathBuf> = None;
 
     for row in &rows {
+        let path = row.display_path();
         ui.horizontal(|ui| {
-            let color = match (&row.path, row.patched) {
+            let color = match (path, row.patched) {
                 (None, _) => theme::LINE,
                 (Some(_), Some(true)) => theme::OK,
                 (Some(_), Some(false)) => theme::MUTED,
@@ -324,66 +1106,71 @@ fn install_rows(app: &mut App, ui: &mut egui::Ui) {
             widgets::dot(ui, color);
             ui.label(egui::RichText::new(row.label).size(13.0));
 
-            match &row.path {
-                Some(path) => {
-                    let shown = mask_path(&path.display().to_string());
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(shown)
-                                .size(12.0)
-                                .color(theme::MUTED)
-                                .monospace(),
-                        )
-                        // One line, cut with an ellipsis rather than wrapped: a
-                        // long install path would push the pencil off the row.
-                        .truncate(),
-                    )
-                    .on_hover_text(path.display().to_string());
-                }
-                None => {
-                    ui.label(
-                        egui::RichText::new("не найдено — укажите путь")
-                            .size(12.0)
-                            .color(theme::MUTED),
-                    );
-                }
-            }
-
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if row.manual {
-                    if let Some(p) = &row.path {
-                        if ui
-                            .small_button("✖")
-                            .on_hover_text("Убрать указанный путь")
-                            .clicked()
-                        {
-                            forget = Some(p.clone());
-                        }
+                if let Some(saved) = row.saved_path() {
+                    let button = ui
+                        .small_button("✖")
+                        .on_hover_text("Убрать указанный путь");
+                    #[cfg(all(test, windows))]
+                    INSTALL_RECTS.with(|r| r.borrow_mut().push(("remove", button.rect)));
+                    if button.clicked() {
+                        forget = Some(saved.to_path_buf());
                     }
                 }
-                if let (Some(path), Some(false)) = (&row.path, row.patched) {
-                    if ui
+                if let (Some(path), Some(false)) = (path, row.patched) {
+                    let button = ui
                         .small_button("Пропатчить")
-                        .on_hover_text("Наложить патч на эту установку")
-                        .clicked()
-                    {
-                        patch = Some(path.clone());
+                        .on_hover_text("Наложить патч на эту установку");
+                    #[cfg(all(test, windows))]
+                    INSTALL_RECTS.with(|r| r.borrow_mut().push(("patch", button.rect)));
+                    if button.clicked() {
+                        patch = Some(path.to_path_buf());
                     }
                 }
-                if ui
+                let button = ui
                     .small_button("✏")
-                    .on_hover_text("Указать путь вручную")
-                    .clicked()
-                {
+                    .on_hover_text("Указать путь вручную");
+                #[cfg(all(test, windows))]
+                INSTALL_RECTS.with(|r| r.borrow_mut().push(("edit", button.rect)));
+                if button.clicked() {
                     edit = Some(
-                        row.path
-                            .as_ref()
-                            .map(|p| p.display().to_string())
+                        path.map(|p| p.display().to_string())
                             .unwrap_or_default(),
                     );
                 }
+                // Allocate controls first so the remaining width is the actual
+                // space available to the path, including optional controls.
+                match path {
+                    Some(path) => {
+                        let shown = mask_path(&path.display().to_string());
+                        let shown = match row.unconfirmed_patch_note() {
+                            Some(note) => format!("{note} · {shown}"),
+                            None => shown,
+                        };
+                        let label = ui.add(egui::Label::new(
+                            egui::RichText::new(shown).size(12.0).color(theme::MUTED).monospace(),
+                        ).truncate()).on_hover_text(path.display().to_string());
+                        #[cfg(all(test, windows))]
+                        INSTALL_RECTS.with(|r| r.borrow_mut().push(("path", label.rect)));
+                        #[cfg(not(all(test, windows)))]
+                        let _ = label;
+                    }
+                    None => {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(row.discovery_note().unwrap_or_else(|| "не найдено — укажите путь".into()))
+                                .size(12.0).color(theme::MUTED),
+                        ).truncate());
+                    }
+                }
             });
         });
+        #[cfg(windows)]
+        if let Some(path) = row.recovery_path() {
+            let button = ui.add_enabled(!app.is_busy(), egui::Button::new("Проверить восстановление").small());
+            #[cfg(test)]
+            INSTALL_RECTS.with(|r| r.borrow_mut().push(("recover", button.rect)));
+            if button.clicked() { recovery = Some(path.to_path_buf()); }
+        }
     }
 
     if let Some(p) = forget {
@@ -392,8 +1179,39 @@ fn install_rows(app: &mut App, ui: &mut egui::Ui) {
     if let Some(p) = patch {
         app.worker.send(Cmd::PatchInstall(p));
     }
+    #[cfg(windows)]
+    if let Some(path) = recovery {
+        app.worker.send(Cmd::PrepareInstallationRecovery { path });
+    }
     if let Some(text) = edit {
         app.path_dialog = Some(text);
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn installation_recovery_dialog(app: &mut App, ctx: &egui::Context) {
+    let Some(preview) = app.installation_recovery.as_ref() else { return; };
+    let modal = egui::Modal::new(egui::Id::new("installation-recovery-confirmation")).show(ctx, |ui| {
+        ui.set_max_width(420.0);
+        ui.heading("Восстановление Desktop");
+        ui.label(preview.path.display().to_string());
+        ui.label(format!("Незавершённая операция {}", preview.operation_id));
+        ui.label("Подтверждение завершит эту операцию. Настройки приложения применяются отдельно.");
+        ui.horizontal_wrapped(|ui| {
+            let cancel = ui.button("Отменить");
+            let confirm = ui.add_enabled(!app.is_busy(), egui::Button::new("Завершить восстановление Desktop"));
+            #[cfg(test)]
+            INSTALL_RECTS.with(|r| r.borrow_mut().push(("confirm-recover", confirm.rect)));
+            (cancel.clicked(), confirm.clicked())
+        }).inner
+    });
+    let (cancel, confirm) = modal.inner;
+    if confirm || cancel || modal.should_close() {
+        if let Some(preview) = app.installation_recovery.take() {
+            let proposal_id = preview.proposal_id;
+            app.worker.send(if confirm { Cmd::ConfirmInstallationRecovery { proposal_id } }
+                else { Cmd::DismissInstallationRecovery { proposal_id } });
+        }
     }
 }
 
@@ -409,96 +1227,49 @@ fn dev_open() -> bool {
 }
 
 fn advanced_card(app: &mut App, ui: &mut egui::Ui) {
-    // On the main screen, not folded: with the explanations behind their «i»
-    // buttons there is room for it, and the user opens nothing to see what is
-    // switched on.
-    ui.label(
+    egui::CollapsingHeader::new(
         egui::RichText::new("Настройки для опытных")
             .size(13.0)
             .color(theme::MUTED),
-    );
-    ui.add_space(6.0);
-    widgets::card(ui, |ui| {
-        network_facts(app, ui);
-        vpn_exclusion_button(app, ui);
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(8.0);
+    )
+    .id_salt("advanced")
+    .default_open(dev_open())
+    .show(ui, |ui| {
+        widgets::card(ui, |ui| {
+            network_facts(app, ui);
 
-        cap_row(app, ui, Cap::Dns);
-        providers_list(app, ui);
-        custom_dns_field(app, ui);
+            cap_row(app, ui, Cap::Dns);
+            providers_list(app, ui);
+            custom_dns_field(app, ui);
 
-        ui.add_space(10.0);
-        cap_row(app, ui, Cap::LocalProxy);
+            ui.add_space(10.0);
+            cap_row(app, ui, Cap::LocalProxy);
 
-        ui.add_space(10.0);
-        cap_row(app, ui, Cap::OwnProxy);
-        own_proxy_field(app, ui);
+            ui.add_space(10.0);
+            cap_row(app, ui, Cap::BuiltinExits);
+
+            ui.add_space(10.0);
+            cap_row(app, ui, Cap::OwnProxy);
+            own_proxy_field(app, ui);
+        });
     });
-}
-
-/// A small «i» that opens or closes the text kept under `key`. Returns whether
-/// the text is showing.
-fn info_toggle(ui: &mut egui::Ui, key: &str) -> bool {
-    let id = egui::Id::new(key);
-    let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
-    if widgets::info_button(ui, open).clicked() {
-        open = !open;
-    }
-    ui.data_mut(|d| d.insert_temp(id, open));
-    open
-}
-
-fn info_open(ui: &egui::Ui, key: &str) -> bool {
-    ui.data(|d| d.get_temp::<bool>(egui::Id::new(key)))
-        .unwrap_or(false)
-}
-
-/// Copies the path of this program, for adding it to a VPN's list of exceptions.
-/// The VPN's own settings are not ours to write, so the button hands over the one
-/// thing they ask for.
-fn vpn_exclusion_button(app: &mut App, ui: &mut egui::Ui) {
-    let copied = app
-        .vpn_path_copied
-        .is_some_and(|at| at.elapsed() < Duration::from_secs(5));
-    let label = if copied {
-        "Путь до анлокера скопирован"
-    } else {
-        "Добавить анлокер в исключения VPN"
-    };
-    ui.horizontal(|ui| {
-        if ui
-            .add(egui::Button::new(egui::RichText::new(label).size(13.0)))
-            .clicked()
-        {
-            if let Ok(exe) = std::env::current_exe() {
-                crate::utils::set_clipboard_text(&exe.display().to_string());
-                app.vpn_path_copied = Some(std::time::Instant::now());
-            }
-        }
-        info_toggle(ui, "vpn-info");
-    });
-    if info_open(ui, "vpn-info") {
-        widgets::hint(
-            ui,
-            "Копирует путь к этой программе. Вставьте его в список исключений вашего VPN \
-             (раздельное туннелирование), чтобы её соединения шли мимо VPN.",
-        );
-    }
-    if copied {
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
-    }
 }
 
 /// What the relay says about the network right now: the VPN, where it comes
 /// out, and the path in use. Facts, not advice - there is nothing here the
 /// user has to act on, which is why it sits in the folded section.
 fn network_facts(app: &App, ui: &mut egui::Ui) {
+    #[cfg(windows)]
+    if app.status.as_ref().is_some_and(|s| s.transport_view == crate::ops::TransportView::SystemTcp) {
+        widgets::hint(ui, "Выбранный системный режим следует сетевым настройкам Windows, включая применимые правила VPN; состояние службы показано выше.");
+        return;
+    }
     let Some(r) = app.gate.relay.as_ref() else {
         return;
     };
-    let vpn = if !r.tunnel {
+    let vpn = if r.tunnel.is_none() {
+        "Состояние VPN не измерено.".to_string()
+    } else if r.tunnel == Some(false) {
         "VPN не обнаружен.".to_string()
     } else if r.vpn_exit.is_empty() {
         "VPN включён — соединения службы с сервисами разблокировки идут мимо него.".to_string()
@@ -553,6 +1324,8 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
     if providers.is_empty() {
         return;
     }
+    let busy = app.is_busy();
+
     let mut flip: Option<(String, bool)> = None;
     // (from, to) — set the moment the pointer passes over another row, not on
     // release: the row has to follow the cursor while the button is still down.
@@ -565,23 +1338,14 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
             .color(theme::MUTED),
     )
     .id_salt("providers")
-    .default_open(true)
+    .default_open(false)
     .show(ui, |ui| {
         let first_on = providers.iter().position(|p| p.enabled);
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Порядок — перетаскиванием за «≡»")
-                    .size(12.0)
-                    .color(theme::MUTED),
-            );
-            info_toggle(ui, "providers-info");
-        });
-        if info_open(ui, "providers-info") {
-            widgets::hint(
-                ui,
-                "Зажмите полоски слева и перетащите. Первый в списке спрашивается первым.",
-            );
-        }
+        widgets::hint(
+            ui,
+            "Порядок можно менять: зажмите полоски слева и перетащите. \
+             Первый в списке спрашивается первым.",
+        );
         ui.add_space(4.0);
 
         for (i, p) in providers.iter().enumerate() {
@@ -602,25 +1366,16 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
                     .response
                     .on_hover_cursor(egui::CursorIcon::Grab);
 
-                    // Not tied to `busy`: a provider switch is a settings write
-                    // and answers at once, so it must not wait behind whatever
-                    // the worker is doing for another switch.
                     let mut on = p.enabled;
-                    if widgets::switch(ui, &mut on, dns_on && p.available).changed() {
+                    if widgets::switch(ui, &mut on, dns_on && !busy).changed() {
                         flip = Some((p.name.clone(), on));
                     }
                     // Without rotation only the first enabled one is ever asked,
                     // so the rest are drawn as what they are: on, but not in use.
                     let idle = !rotating && p.enabled && first_on != Some(i);
                     let text = egui::RichText::new(status::provider_name(&p.name)).size(13.0);
-                    ui.label(if idle || !p.available {
-                        text.color(theme::MUTED)
-                    } else {
-                        text
-                    });
-                    if !p.available {
-                        widgets::hint(ui, "— не задан");
-                    } else if idle {
+                    ui.label(if idle { text.color(theme::MUTED) } else { text });
+                    if idle {
                         widgets::hint(ui, "— не используется");
                     }
                 })
@@ -649,11 +1404,6 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
     });
 
     if let Some((name, on)) = flip {
-        // The row flips under the pointer this frame; the worker's snapshot
-        // confirms (or, for the last provider, takes it back) a moment later.
-        if let Some(row) = app.providers_local.iter_mut().find(|r| r.name == name) {
-            row.enabled = on;
-        }
         app.worker.send(Cmd::SetProvider(name, on));
     }
     if let Some((from, to)) = moved {
@@ -687,28 +1437,30 @@ fn providers_list(app: &mut App, ui: &mut egui::Ui) {
 fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
     let busy = app.is_busy();
     ui.add_space(4.0);
+    widgets::hint(
+        ui,
+        "Для активации прокси из группы Nova — отправьте туда команду и вставьте \
+         полученный код в поле ниже.",
+    );
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         if ui.button("Скопировать команду").clicked() {
+            #[cfg(target_os = "macos")]
+            app.worker.send(crate::ops::Cmd::CopyGroupCommand);
+            #[cfg(not(target_os = "macos"))]
+            {
             let cmd = format!("/ag+{}", crate::hwid::pc_code());
             crate::utils::set_clipboard_text(&cmd);
             app.log.push((
                 Level::Info,
                 "Команда скопирована — отправьте её в группе.".to_string(),
             ));
+            }
         }
         if ui.button("Открыть группу").clicked() {
             crate::utils::open_url(GROUP_ROOM_URL);
         }
-        info_toggle(ui, "group-info");
     });
-    if info_open(ui, "group-info") {
-        widgets::hint(
-            ui,
-            "Для активации прокси из группы Nova — отправьте туда команду и вставьте \
-             полученный код в поле ниже.",
-        );
-    }
     ui.add_space(4.0);
     let field = egui::TextEdit::singleline(&mut app.group_key_input)
         .hint_text("код из группы")
@@ -736,18 +1488,6 @@ fn group_proxy_field(app: &mut App, ui: &mut egui::Ui) {
         app.group_key_input = text.clone();
         app.group_key_sent = text;
     }
-    if crate::group::key_rejected() {
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(format!(
-                "Код для прокси из группы перестал работать: {}.",
-                crate::group::KEY_DEAD_NOTE
-                    .trim_start_matches("код перестал работать — ")
-            ))
-            .size(12.0)
-            .color(theme::BAD),
-        );
-    }
 }
 
 /// The group's topic where the bot answers the command.
@@ -757,26 +1497,15 @@ const GROUP_ROOM_URL: &str = "https://t.me/nova_txt/69864";
 fn custom_dns_field(app: &mut App, ui: &mut egui::Ui) {
     let busy = app.is_busy();
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Свой DNS: IPv4, DoH или DoT")
-                .size(12.0)
-                .color(theme::MUTED),
-        );
-        info_toggle(ui, "custom-dns-info");
-    });
-    if info_open(ui, "custom-dns-info") {
-        widgets::hint(
-            ui,
-            "Можно несколько, через пробел: обычный адрес 77.88.8.8, DoH — \
-             https://dns.example.com/dns-query, DoT — tls://dns.example.com. Пока поле пустое, \
-             этот сервер выключен.",
-        );
-    }
+    ui.label(
+        egui::RichText::new("Свой DNS для обхода (IPv4 через пробел)")
+            .size(12.0)
+            .color(theme::MUTED),
+    );
     ui.horizontal(|ui| {
         ui.add_space(10.0);
         let field = egui::TextEdit::singleline(&mut app.custom_dns_input)
-            .hint_text("77.88.8.8 · https://… · tls://…")
+            .hint_text("например 77.88.8.8")
             .desired_width(ui.available_width() - 110.0);
         let resp = ui.add_enabled(!busy, field);
         let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -823,12 +1552,13 @@ fn cap_row(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
         .map(|s| s.get(cap).clone())
         .unwrap_or(State::Off);
     let mut on = state.is_on();
-    let blocked = matches!(state, State::Blocked(_));
+    let blocked = !cap.supported() || matches!(state, State::Blocked(_));
     let enabled = !app.is_busy() && !blocked;
 
     let note = state.note().map(|s| s.to_string());
     let flipped = widgets::switch_row(ui, &mut on, enabled, |ui| {
-        widgets::title_info(ui, title, hint);
+        ui.label(egui::RichText::new(title).size(14.0));
+        widgets::hint(ui, hint);
         if let Some(note) = note {
             ui.label(egui::RichText::new(note).size(12.0).color(if blocked {
                 theme::WARN
@@ -839,6 +1569,10 @@ fn cap_row(app: &mut App, ui: &mut egui::Ui, cap: Cap) {
     });
     if flipped {
         app.worker.send(Cmd::Set(cap, on));
+    }
+    if cap == Cap::BuiltinExits && matches!(state, State::Blocked(_)) &&
+        ui.add_enabled(!app.is_busy(), egui::Button::new("Отключить сохранённый выбор")).clicked() {
+        app.worker.send(Cmd::Set(cap, false));
     }
 }
 
@@ -852,6 +1586,9 @@ fn log_line(level: Level, line: &str) -> String {
     } else {
         line.to_string()
     }
+}
+fn journal_copy_text(log: &[(Level, String)]) -> String {
+    log.iter().map(|(level, line)| log_line(*level, line)).collect::<Vec<_>>().join("\n")
 }
 
 fn log_card(app: &mut App, ui: &mut egui::Ui) {
@@ -938,12 +1675,7 @@ fn log_keys(app: &mut App, ui: &mut egui::Ui) {
             asked
         });
         if copy {
-            let text: String = app
-                .log
-                .iter()
-                .map(|(level, line)| log_line(*level, line))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let text = journal_copy_text(&app.log);
             ui.ctx().copy_text(text);
         }
         // Any click, or Escape, gives the selection up — otherwise the next
@@ -967,48 +1699,49 @@ fn footer(ui: &mut egui::Ui) {
     ui.spacing_mut().interact_size.y = 18.0;
     ui.spacing_mut().item_spacing.y = 0.0;
 
-    // Built right-to-left, so it reads left-to-right on screen while staying
-    // pinned to the right edge.
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        // The outer frame keeps only 4 px on the right, for the scroll bar. The
-        // footer is not inside the scrolling area, so it pays that back itself
-        // or its last link is cut off by the window edge.
-        ui.add_space(12.0);
+    // Wrap the links in reading order when the available width is narrow.
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new("Отблагодарить копеечкой:")
+                .size(FOOTER_TEXT)
+                .color(theme::MUTED),
+        );
+        if ui
+            .link(egui::RichText::new("nova-app.eu/donate").size(FOOTER_TEXT))
+            .clicked()
+        {
+            crate::utils::open_url(DONATE_URL);
+        }
+        ui.label(
+            egui::RichText::new("|")
+                .size(FOOTER_TEXT)
+                .color(theme::LINE),
+        );
+        ui.label(
+            egui::RichText::new("Группа в Telegram:")
+                .size(FOOTER_TEXT)
+                .color(theme::MUTED),
+        );
         if ui
             .link(egui::RichText::new("t.me/nova_txt").size(FOOTER_TEXT))
             .clicked()
         {
             crate::utils::open_url(TELEGRAM_GROUP_URL);
         }
-        ui.label(
-            egui::RichText::new("Группа в Telegram:")
-                .size(FOOTER_TEXT)
-                .color(theme::MUTED),
-        );
-        ui.label(
-            egui::RichText::new("|")
-                .size(FOOTER_TEXT)
-                .color(theme::LINE),
-        );
-        if ui
-            .link(egui::RichText::new("nova.gratis/donate").size(FOOTER_TEXT))
-            .clicked()
+        #[cfg(target_os = "macos")]
         {
-            crate::utils::open_url(DONATE_URL);
+            ui.label(
+                egui::RichText::new("|")
+                    .size(FOOTER_TEXT)
+                    .color(theme::LINE),
+            );
+            if ui
+                .link(egui::RichText::new("by @Fuheshka").size(FOOTER_TEXT))
+                .clicked()
+            {
+                crate::utils::open_url("https://github.com/Fuheshka/Antigravity-Unlocker");
+            }
         }
-        // The solid suit glyph, in red of its own: «❤» comes out of the emoji
-        // font as an outline in the text colour. The row runs right to left, so
-        // what is added first sits nearest the link: heart, then the word.
-        ui.label(
-            egui::RichText::new("♥")
-                .size(FOOTER_TEXT + 1.0)
-                .color(egui::Color32::from_rgb(0xE0, 0x30, 0x48)),
-        );
-        ui.label(
-            egui::RichText::new("Благодарности")
-                .size(FOOTER_TEXT)
-                .color(theme::MUTED),
-        );
     });
 }
 

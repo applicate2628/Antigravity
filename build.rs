@@ -1,9 +1,13 @@
+#[cfg(windows)]
 extern crate winres;
 
 use sha2::{Digest, Sha256};
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
+#[path = "build_support/release_identity.rs"]
+mod release_identity;
 
 /// Reads a `const NAME: &str = "..."` literal straight out of src/canary.rs, so
 /// the source stays the single source of truth for the build script, the binary
@@ -70,19 +74,79 @@ fn token_for(seed: &str, sep: &str, version: &str) -> String {
     format!("AGU-{}-{}-{}", &hex[0..5], &hex[5..10], &hex[10..15])
 }
 
+fn verified_public_release(base: &str, explicit: Option<&OsStr>, acceptance_path: &Path) -> Result<String, String> {
+    if env::var("PROFILE").as_deref() != Ok("release") {
+        return Err("accepted release requires the Cargo release profile".into());
+    }
+    let exists = |path: &str| Path::new(path).try_exists().map_err(|error| format!("release input observation: {error}"));
+    let relay = env::var_os("AG_WITH_RELAY").is_some_and(|value| value == "1")
+        && exists("src/relay.rs")? && exists(".relay_key")?;
+    if relay || exists(".group")? || (exists("src/exits.rs")? && exists(".exits")?) {
+        return Err("accepted release has private inputs outside the verified snapshot".into());
+    }
+    let profile = if env::var_os("CARGO_FEATURE_PERSONAL_BUILD").is_some() {
+        release_identity::PERSONAL_RELEASE_PROFILE
+    } else { release_identity::PUBLIC_RELEASE_PROFILE };
+    if env::var("AG_RELEASE_PROFILE").as_deref() != Ok(profile) {
+        return Err("compiled release profile differs from the approved profile pin".into());
+    }
+    let target = env::var("TARGET").map_err(|_| "release target unavailable")?;
+    let request = env::var("AG_RELEASE_BUILD_REQUEST").map_err(|_| "release invocation identity missing")?;
+    if request.len() != 32 || !request.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return Err("release invocation identity is not canonical hexadecimal".into());
+    }
+    let expected = env::var("AG_RELEASE_RECORD_SHA256").map_err(|_| "accepted release record digest missing")?;
+    let acceptance = release_identity::read_release_input(acceptance_path)?;
+    if !release_identity::is_sha256(&expected) || release_identity::sha256(&acceptance) != expected {
+        return Err("accepted release record bytes differ from the selected invocation".into());
+    }
+    let manifest = env::var_os("AG_RELEASE_SOURCE_MANIFEST").ok_or("release source manifest missing")?;
+    let manifest = release_identity::read_release_input(Path::new(&manifest))?;
+    let source = release_identity::verify_source_snapshot(Path::new("."), &manifest)?;
+    if env::var("AG_RELEASE_SOURCE_SHA256").as_deref() != Ok(source.as_str()) {
+        return Err("verified source snapshot differs from the approved source pin".into());
+    }
+    let accepted = release_identity::accepted_public_version(&acceptance, &source, profile, &target,
+        |path| release_identity::read_platform_receipt(acceptance_path, path))?;
+    release_identity::require_public_projection(&accepted, base, explicit)?;
+    println!("cargo:rustc-env=AG_VERIFIED_RELEASE_REQUEST={request}");
+    println!("cargo:rustc-env=AG_VERIFIED_RELEASE_SOURCE_SHA256={source}");
+    println!("cargo:rustc-env=AG_VERIFIED_RELEASE_RECORD_SHA256={expected}");
+    println!("cargo:rustc-env=AG_VERIFIED_RELEASE_PROFILE={profile}");
+    println!("cargo:rustc-env=AG_VERIFIED_RELEASE_TARGET={target}");
+    Ok(accepted)
+}
+
 fn main() {
+    let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION unset");
+    let explicit = env::var_os("AG_FULL_VERSION");
+    println!("cargo:rerun-if-changed=build_support/release_identity.rs");
+    for input in ["AG_ACCEPTED_RELEASE_RECORD", "AG_RELEASE_SOURCE_MANIFEST", "AG_RELEASE_RECORD_SHA256", "AG_RELEASE_BUILD_REQUEST",
+        "AG_RELEASE_PROFILE", "AG_RELEASE_SOURCE_SHA256"] {
+        println!("cargo:rerun-if-env-changed={input}");
+    }
+    let identity = if let Some(path) = env::var_os("AG_ACCEPTED_RELEASE_RECORD") {
+        verified_public_release(&version, explicit.as_deref(), Path::new(&path))
+    } else {
+        release_identity::resolve(&version, explicit.as_deref())
+    };
+    let full = identity.unwrap_or_else(|error| panic!("release identity: {error}"));
+    println!("cargo:rustc-env=AG_FULL_VERSION={full}");
+    // One explicit package input pins the existing sibling Linux helper. A
+    // public build may omit it; runtime then reports package-incomplete rather
+    // than trusting a helper and mutable manifest to certify one another.
+    println!("cargo:rerun-if-env-changed=AG_WSL_HELPER_SHA256");
+    if let Some(value) = env::var_os("AG_WSL_HELPER_SHA256") {
+        let value = value.into_string().expect("AG_WSL_HELPER_SHA256 must be text");
+        let value = value.trim().to_ascii_lowercase();
+        assert!(value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "AG_WSL_HELPER_SHA256 must be one SHA-256 digest");
+        println!("cargo:rustc-env=AG_WSL_EXPECTED_HELPER_SHA256={value}");
+    }
     println!("cargo:rerun-if-changed=src/canary.rs");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=AG_FULL_VERSION");
 
-    if let Ok(full_ver) = env::var("AG_FULL_VERSION") {
-        let trimmed = full_ver.trim();
-        if !trimmed.is_empty() {
-            println!("cargo:rustc-env=AG_FULL_VERSION={}", trimmed);
-        }
-    }
-
-    let version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
     let canary_src = fs::read_to_string("src/canary.rs").expect("src/canary.rs is missing");
     let seed = const_from_canary_rs(&canary_src, "CANARY_SEED");
     let sep = const_from_canary_rs(&canary_src, "CANARY_SEP");
@@ -147,26 +211,22 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(exits)");
     println!("cargo:rerun-if-changed=.exits");
     println!("cargo:rerun-if-changed=src/exits.rs");
-    // Comments and blank lines are stripped here rather than at runtime, so
-    // nothing but addresses is ever inside the binary. A list with no address
-    // left (every exit measured dead and struck off) is the same as no file: the
-    // route compiles out like it does in a public clone, instead of failing the
-    // build.
-    let exit_list = if Path::new("src/exits.rs").exists() && Path::new(".exits").exists() {
-        fs::read_to_string(".exits")
-            .expect("read .exits")
+    let exits = Path::new("src/exits.rs").exists() && Path::new(".exits").exists();
+    if exits {
+        println!("cargo:rustc-cfg=exits");
+        let list = fs::read_to_string(".exits").expect("read .exits");
+        // Comments and blank lines are stripped here rather than at runtime, so
+        // nothing but addresses is ever inside the binary.
+        let cleaned = list
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        String::new()
-    };
-    let exits = !exit_list.is_empty();
-    if exits {
-        println!("cargo:rustc-cfg=exits");
-        bake_secret("exits_gen.rs", "EXITS", &exit_list);
+            .join("\n");
+        if cleaned.is_empty() {
+            panic!(".exits exists but lists no addresses");
+        }
+        bake_secret("exits_gen.rs", "EXITS", &cleaned);
     }
 
     println!("cargo:rerun-if-changed=.group");
@@ -193,6 +253,7 @@ fn main() {
         relay, exits, group
     );
 
+    #[cfg(windows)]
     if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
         let mut res = winres::WindowsResource::new();
         res.set_icon("icon.ico");
@@ -216,7 +277,7 @@ fn main() {
                 static_canary, release_token
             ),
         );
-        // Kept in step with Cargo.toml, which build_rust.py rewrites per release.
+        // Numeric resources use the Cargo package base.
         res.set("FileVersion", &version);
         res.set("ProductVersion", &version);
         res.compile().unwrap();

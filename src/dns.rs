@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -7,7 +6,18 @@ use crate::dns_forwarder;
 use crate::egress::{self, Egress};
 use crate::hosts_pin;
 use crate::resolvers;
-use crate::utils::{bounded_output, no_window, powershell};
+use crate::utils::{bounded_output, powershell, CommandOutcome, CommandObservation, PreparedExec};
+
+fn receive_command(outcome: &CommandOutcome, observation: CommandObservation) -> Result<(), String> {
+    match observation {
+        CommandObservation::Complete if outcome.complete() && outcome.releasable() && outcome.exit().is_some_and(|status| status.success()) => Ok(()),
+        CommandObservation::NotStarted => Err("DNS helper did not start; actual failure retained".into()),
+        CommandObservation::Complete => Err("DNS helper failed or exit status is unknown; effect may be partial".into()),
+        CommandObservation::Deadline => Err("DNS helper deadline expired; effect may be partial".into()),
+        CommandObservation::Failed => Err("DNS helper failed; effect may be partial".into()),
+        CommandObservation::Pending => Err("DNS helper remains pending; effect may be partial".into()),
+    }
+}
 
 // NRPT-based selective DNS routing. Only the exact hostnames that Antigravity
 // actually talks to AND that the upstream resolver actually proxies are routed
@@ -52,17 +62,9 @@ const AG_NRPT_LEGACY_TAGS: &[&str] = &["AG_UNLOCKER_NRPT"];
 // a foreign rule on either name is left alone (so is a subtree rule, I44).
 // Everything else Antigravity talks to - oauth2/www/play/accounts and
 // jetski-webchannel - works on real Google and is deliberately not listed.
-//
-// `aicode` (2026-11-06, owner) is here for a different reason than the other
-// two: not because a provider substitutes it (only geohide was measured doing
-// so), but because it carries the voice session and the relay's loopback
-// answer is the only door a running client takes to the route table. A rule
-// is what sends its lookup to the relay at all; with the door down it is
-// answered from the pool like the rest, so it costs a passthrough at worst.
 const AG_NRPT_CORE: &[&str] = &[
     "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
-    "aicode.googleapis.com",
 ];
 
 /// The names an NRPT rule always points at the relay - and therefore the ones
@@ -161,9 +163,9 @@ pub fn invalidate_cache() {
 /// Expensive: shells out to PowerShell on Windows, so this is intended for on-demand
 /// checks (e.g. user toggles, periodic health checks), not for every UI render frame.
 #[allow(dead_code)]
-pub fn is_nrpt_applied_fresh() -> bool {
+pub fn is_nrpt_applied_fresh(owner: &mut CommandOutcome) -> Result<bool, String> {
     invalidate_cache();
-    is_nrpt_applied()
+    is_nrpt_applied(owner)
 }
 
 fn ps_string_list(items: &[&str]) -> String {
@@ -183,114 +185,151 @@ fn all_tags() -> Vec<&'static str> {
 /// True when the machine has no routable IPv6 address. In that case the AAAA
 /// records handed out by the resolver point at an unreachable proxy, so IPv4 is
 /// forced ahead of IPv6 to avoid connect timeouts.
-fn lacks_global_ipv6() -> bool {
-    let out = powershell(
+fn lacks_global_ipv6(owner: &mut CommandOutcome) -> Result<bool, String> {
+    let receipt = powershell(owner,
         "(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue | \
          Where-Object { $_.IPAddress -notlike 'fe80*' -and $_.IPAddress -ne '::1' -and \
          $_.PrefixOrigin -ne 'WellKnown' } | Measure-Object).Count",
     );
-    match out {
-        Some(o) => String::from_utf8_lossy(&o.stdout)
-            .trim()
-            .parse::<usize>()
-            .map_or(false, |n| n == 0),
-        // If the probe fails, leave the system policy alone.
-        None => false,
+    receive_command(owner, receipt)?;
+    let result = String::from_utf8_lossy(owner.stdout()).trim().parse::<usize>()
+        .map(|n| n == 0).map_err(|_| "DNS IPv6 probe returned invalid output")?;
+    drop(std::mem::take(owner));
+    Ok(result)
+}
+
+fn set_ipv4_precedence(owner: &mut CommandOutcome, precedence: &str) -> Result<(), String> {
+    let cmd = PreparedExec::system(std::path::Path::new("netsh.exe"))?
+        .args(["interface", "ipv6", "set", "prefixpolicy", IPV4_PREFIX, precedence, "4"]);
+    let receipt = bounded_output(owner, cmd, HELPER_LIMIT);
+    invalidate_cache();
+    receive_command(owner, receipt)?;
+    drop(std::mem::take(owner));
+    Ok(())
+}
+
+fn restore_ipv4_precedence(owner: &mut CommandOutcome) -> Result<(), String> {
+    let script = format!("$ErrorActionPreference='Stop'; $p=@(Get-NetPrefixPolicy -ErrorAction Stop | \
+        Where-Object {{ $_.Prefix -eq '{}' }} | ForEach-Object {{ $_.Precedence }}); \
+        ConvertTo-Json -InputObject $p -Compress; 'AG_END'", IPV4_PREFIX);
+    let receipt = powershell(owner, &script);
+    receive_command(owner, receipt)?;
+    let values = parse_precedence(owner.stdout())?;
+    if values.len() > 1 { return Err("DNS IPv4 precedence results are ambiguous".into()); }
+    drop(std::mem::take(owner));
+    if values.first().is_some_and(|v| v.to_string() == IPV4_PREFIX_PREFERRED_PRECEDENCE) {
+        set_ipv4_precedence(owner, IPV4_PREFIX_DEFAULT_PRECEDENCE)?;
     }
+    Ok(())
 }
 
-fn set_ipv4_precedence(precedence: &str) {
-    let mut cmd = Command::new("netsh");
-    cmd.args([
-        "interface",
-        "ipv6",
-        "set",
-        "prefixpolicy",
-        IPV4_PREFIX,
-        precedence,
-        "4",
-    ]);
-    // Bounded like everything else on this path: `netsh` is a child process and
-    // a child process can stop answering.
-    bounded_output(no_window(&mut cmd), HELPER_LIMIT);
+fn parse_precedence(stdout: &[u8]) -> Result<Vec<u32>, String> {
+    let text = std::str::from_utf8(stdout).map_err(|_| "IPv4 precedence: invalid UTF-8")?;
+    let json = text.trim().strip_suffix("\nAG_END").ok_or("IPv4 precedence: incomplete output")?.trim();
+    serde_json::from_str(json).map_err(|e| format!("IPv4 precedence: invalid output: {e}"))
 }
 
-/// Restores the default IPv4/IPv6 precedence, but only if the current value is
-/// the one this tool sets. A precedence the user (or another tool) chose is
-/// left untouched.
-fn restore_ipv4_precedence() {
-    let out = powershell(
-        "(Get-NetPrefixPolicy -ErrorAction SilentlyContinue | \
-         Where-Object { $_.Prefix -eq '::ffff:0:0/96' }).Precedence",
-    );
-    let is_ours = out.map_or(false, |o| {
-        String::from_utf8_lossy(&o.stdout).trim() == IPV4_PREFIX_PREFERRED_PRECEDENCE
-    });
-    if is_ours {
-        set_ipv4_precedence(IPV4_PREFIX_DEFAULT_PRECEDENCE);
-    }
-}
-
-/// Linux has no NRPT and no relay installed yet, so there is nothing to remove;
-/// the undo menus must not spawn doomed helpers or error here.
 #[cfg(not(target_os = "windows"))]
-pub fn remove_dns_nrpt() {}
+pub fn remove_dns_nrpt(_owner: &mut CommandOutcome) -> Result<(), String> { Ok(()) }
 
 #[cfg(target_os = "windows")]
-pub fn remove_dns_nrpt() {
-    restore_ipv4_precedence();
-    // The pinned addresses only exist to serve these rules, so they go together.
-    hosts_pin::remove_entries().ok();
-    egress::remove_legacy_routes();
+pub fn remove_dns_nrpt(owner: &mut CommandOutcome) -> Result<(), String> {
+    remove_dns_nrpt_checked(owner)
+}
 
-    let cmd = format!(
-        "$tags=@({}); Get-DnsClientNrptRule -ErrorAction SilentlyContinue | \
-         Where-Object {{ $tags -contains $_.Comment }} | \
-         Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; \
-         Clear-DnsClientCache -ErrorAction SilentlyContinue",
-        ps_string_list(&all_tags())
-    );
-    powershell(&cmd);
+#[cfg(target_os = "windows")]
+pub(crate) fn remove_dns_nrpt_checked(owner: &mut CommandOutcome) -> Result<(), String> {
+    restore_ipv4_precedence(owner).map_err(|e| format!("DNS precedence: {e}; effect may be partial"))?;
+    let hosts_cleanup = hosts_pin::remove_entries();
     invalidate_cache();
+    hosts_cleanup.map_err(|e| format!("DNS hosts cleanup: {e}; effect may be partial"))?;
+    let cmd = format!(
+        "$ErrorActionPreference='Stop'; $tags=@({}); Get-DnsClientNrptRule -ErrorAction Stop | \
+         Where-Object {{ $tags -contains $_.Comment }} | \
+         Remove-DnsClientNrptRule -Force -ErrorAction Stop; \
+         Clear-DnsClientCache -ErrorAction Stop; 'AG_DONE'", ps_string_list(&all_tags())
+    );
+    let receipt = powershell(owner, &cmd);
+    invalidate_cache();
+    receive_command(owner, receipt)?;
+    if std::str::from_utf8(owner.stdout()).ok().map(str::trim) != Some("AG_DONE") {
+        return Err("DNS NRPT cleanup incomplete; effect may be partial".into());
+    }
+    drop(std::mem::take(owner));
+    Ok(())
 }
 
 /// Namespaces currently installed under our tag, lowercased.
-fn installed_namespaces() -> Vec<String> {
+fn installed_namespaces(owner: &mut CommandOutcome) -> Result<Vec<String>, String> {
     let cmd = format!(
         "Get-DnsClientNrptRule -ErrorAction SilentlyContinue | \
          Where-Object {{$_.Comment -eq '{}'}} | ForEach-Object {{ $_.Namespace }}",
         AG_NRPT_TAG
     );
-    match powershell(&cmd) {
-        Some(o) => String::from_utf8_lossy(&o.stdout)
+    let receipt = powershell(owner, &cmd);
+    receive_command(owner, receipt)?;
+    let result = String::from_utf8_lossy(owner.stdout())
             .lines()
             .map(|l| l.trim().trim_end_matches('.').to_lowercase())
             .filter(|l| !l.is_empty())
-            .collect(),
-        None => Vec::new(),
-    }
+            .collect();
+    drop(std::mem::take(owner));
+    Ok(result)
+}
+
+/// Fresh, failure-transparent evidence for privilege preflight.
+#[cfg(target_os = "windows")]
+pub(crate) struct NrptState {
+    pub(crate) core_applied: bool,
+    pub(crate) owned_rules_present: bool,
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn checked_nrpt_state(owner: &mut CommandOutcome) -> Result<NrptState, String> {
+    let script = format!(
+        "$ErrorActionPreference='Stop'; $tags=@({}); $current='{}'; \
+         $rules=@(Get-DnsClientNrptRule | Where-Object {{ $tags -contains $_.Comment }}); \
+         $names=@($rules | Where-Object {{ $_.Comment -eq $current }} | ForEach-Object {{ $_.Namespace }}); \
+         $result=@{{ names=$names; owned=($rules.Count -gt 0) }}; \
+         ConvertTo-Json -InputObject $result -Compress; 'AG_END'",
+        ps_string_list(&all_tags()), AG_NRPT_TAG
+    );
+    let receipt = powershell(owner, &script);
+    receive_command(owner, receipt)?;
+    let text = std::str::from_utf8(owner.stdout()).map_err(|_| "NRPT query invalid UTF-8")?;
+    let json = text.trim().strip_suffix("\nAG_END").ok_or("NRPT query incomplete")?.trim();
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Wire { names: Vec<String>, owned: bool }
+    let wire: Wire = serde_json::from_str(json).map_err(|e| format!("invalid NRPT query: {e}"))?;
+    if wire.names.iter().any(|n| n.trim().is_empty()) { return Err("empty NRPT namespace".into()); }
+    drop(std::mem::take(owner));
+    Ok(NrptState {
+        core_applied: AG_NRPT_CORE.iter().all(|ns| wire.names.iter().any(|n| n.trim().trim_end_matches('.').eq_ignore_ascii_case(ns))),
+        owned_rules_present: wire.owned,
+    })
 }
 
 /// No NRPT layer on Linux yet, so no rules are ever applied. Returning false
 /// keeps the "running without admin" advisory honest and stops `main()` probing
 /// PowerShell that is not there.
 #[cfg(not(target_os = "windows"))]
-pub fn is_nrpt_applied() -> bool {
-    false
+pub fn is_nrpt_applied(_owner: &mut CommandOutcome) -> Result<bool, String> {
+    Ok(false)
 }
 
 /// True when every core namespace already has a rule. Extra rules (e.g. the
 /// Gemini-only namespace) do not make this false - they are still ours and are
 /// cleaned up together.
 #[cfg(target_os = "windows")]
-pub fn is_nrpt_applied() -> bool {
+pub fn is_nrpt_applied(owner: &mut CommandOutcome) -> Result<bool, String> {
     if let Ok(cache) = NRPT_CACHE.lock() {
         if let Some(v) = *cache {
-            return v;
+            return Ok(v);
         }
     }
 
-    let installed = installed_namespaces();
+    let installed = installed_namespaces(owner)?;
     let applied = AG_NRPT_CORE
         .iter()
         .all(|ns| installed.iter().any(|i| i == &ns.to_lowercase()));
@@ -298,7 +337,7 @@ pub fn is_nrpt_applied() -> bool {
     if let Ok(mut cache) = NRPT_CACHE.lock() {
         *cache = Some(applied);
     }
-    applied
+    Ok(applied)
 }
 
 /// Resolvers to write into the rule.
@@ -397,7 +436,7 @@ pub struct DnsOutcome {
 /// out of it; the rule is deleted outright only when nothing else is left. This
 /// is the one place the tool touches another product's configuration, and it is
 /// deliberately narrowed to the exact names it routes.
-fn take_over_conflicting_rules(namespaces: &[&str]) -> Vec<String> {
+fn take_over_conflicting_rules(owner: &mut CommandOutcome, namespaces: &[&str]) -> Result<Vec<String>, String> {
     let cmd = format!(
         "$ours=@({ours}); \
          foreach ($r in @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue | \
@@ -422,10 +461,12 @@ fn take_over_conflicting_rules(namespaces: &[&str]) -> Vec<String> {
         ),
         tag = AG_NRPT_TAG
     );
-    match powershell(&cmd) {
-        Some(out) => parse_conflicts(&String::from_utf8_lossy(&out.stdout), namespaces),
-        None => Vec::new(),
-    }
+    let receipt = powershell(owner, &cmd);
+    invalidate_cache();
+    receive_command(owner, receipt)?;
+    let result = parse_conflicts(&String::from_utf8_lossy(owner.stdout()), namespaces);
+    drop(std::mem::take(owner));
+    Ok(result)
 }
 
 /// Picks the `namespace|owner` lines that collide with one of ours.
@@ -518,17 +559,14 @@ const HELPER_LIMIT: Duration = Duration::from_secs(15);
 /// this reports "not done" so the caller can say so rather than half-running the
 /// Windows path.
 #[cfg(not(target_os = "windows"))]
-pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
+pub fn setup_dns_nrpt(_owner: &mut CommandOutcome) -> Result<DnsOutcome, String> {
     Err("DNS-слой на Linux пока не портирован".to_string())
 }
 
 #[cfg(target_os = "windows")]
-pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
-    // Remove any of our previous rules to keep a clean idempotent state.
-    remove_dns_nrpt();
-
-    let egress = egress::detect();
-    let via_relay = background::is_enabled();
+pub fn setup_dns_nrpt(owner: &mut CommandOutcome) -> Result<DnsOutcome, String> {
+    let egress = egress::detect(owner)?;
+    let via_relay = background::is_enabled(owner)?;
 
     // The rules go in whatever the tunnel does (D25). Until 2.14.0_1 a tunnel
     // carrying the client installed nothing and left the VPN to decide (D13) -
@@ -542,13 +580,16 @@ pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
     //
     // Measured all the same, so `DnsOutcome` still reports what the tunnel was
     // doing when the rules went in.
-    let (_, client) = egress::vpn_verdict(egress.as_ref());
+    let (_, client) = egress::vpn_verdict(owner, egress.as_ref())?;
+
+    // Refresh our rules only after the prerequisite observations succeed.
+    remove_dns_nrpt_checked(owner).map_err(|e| format!("DNS setup cleanup: {e}"))?;
 
     let namespaces: Vec<&str> = AG_NRPT_CORE.to_vec();
 
     // Before ours go in: a leftover rule from another tool on the same name wins
     // silently and would make everything below pointless for that name.
-    let taken_over = take_over_conflicting_rules(&namespaces);
+    let taken_over = take_over_conflicting_rules(owner, &namespaces)?;
 
     // Each name gets its own rule with its own nameserver list, because which
     // providers substitute a name differs per name (only geohide proxies
@@ -591,24 +632,13 @@ pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
         adds
     );
 
-    let out = powershell(&cmd).ok_or_else(|| "не удалось запустить PowerShell".to_string())?;
+    let receipt = powershell(owner, &cmd);
     invalidate_cache();
+    receive_command(owner, receipt)?;
+    drop(std::mem::take(owner));
 
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let lower = stderr.to_lowercase();
-        let hint = if lower.contains("denied") || lower.contains("elevation") {
-            "требуются права администратора".to_string()
-        } else if stderr.is_empty() {
-            "PowerShell завершился с ошибкой".to_string()
-        } else {
-            stderr
-        };
-        return Err(format!("NRPT: {}", hint));
-    }
-
-    if lacks_global_ipv6() {
-        set_ipv4_precedence(IPV4_PREFIX_PREFERRED_PRECEDENCE);
+    if lacks_global_ipv6(owner)? {
+        set_ipv4_precedence(owner, IPV4_PREFIX_PREFERRED_PRECEDENCE)?;
     }
 
     // Fallback for a machine without the relay. With a tunnel up the rules alone
@@ -627,7 +657,9 @@ pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
     };
     if !pinned.is_empty() {
         // hosts is consulted through the same cache the rules just flushed.
-        powershell("Clear-DnsClientCache -ErrorAction SilentlyContinue");
+        let receipt = powershell(owner, "Clear-DnsClientCache -ErrorAction SilentlyContinue");
+        receive_command(owner, receipt)?;
+        drop(std::mem::take(owner));
     }
 
     Ok(DnsOutcome {
@@ -645,20 +677,20 @@ pub fn setup_dns_nrpt() -> Result<DnsOutcome, String> {
 /// What to print after the DNS step, or `None` when there is nothing worth
 /// saying. A conflicting rule is reported on top of everything else: it makes
 /// the rest a no-op for that name, silently.
-pub fn outcome_note(o: &DnsOutcome) -> Option<String> {
+pub fn outcome_note(owner: &mut CommandOutcome, o: &DnsOutcome) -> Result<Option<String>, String> {
     let mut lines: Vec<String> = Vec::new();
 
     // Said first and on its own: nothing else in this function describes rules
     // that were not written, and a user who sees no other note would reasonably
     // assume the step silently failed.
     if o.stood_down_for_vpn {
-        return Some(
+        return Ok(Some(
             "  Обнаружен активный VPN, трафик Antigravity идёт через него —\n  \
              правила DNS не создавались. Запросы идут так, как их настраивает\n  \
              VPN. Если выход VPN в разрешённом регионе, обход уже работает и\n  \
              без наших правил; если нет — отключите VPN и запустите пункт 1 снова."
                 .to_string(),
-        );
+        ));
     }
 
     // The two cases a tunnel used to swallow. Said early and in full, because a
@@ -701,8 +733,12 @@ pub fn outcome_note(o: &DnsOutcome) -> Option<String> {
     }
 
     if o.via_relay {
+        #[cfg(target_os = "windows")]
+        let relay_running = background::is_running(owner)?;
+        #[cfg(not(target_os = "windows"))]
+        let relay_running = { let _ = owner; background::is_running() };
         lines.push(
-            if background::is_running() {
+            if relay_running {
                 "  Резолвинг идёт через фоновый релей — адреса берутся с канала\n  \
                  провайдера и обновляются по TTL."
             } else {
@@ -711,16 +747,16 @@ pub fn outcome_note(o: &DnsOutcome) -> Option<String> {
             }
             .to_string(),
         );
-        return Some(lines.join("\n"));
+        return Ok(Some(lines.join("\n")));
     }
 
     if let Some(note) = fallback_note(o) {
         lines.push(note);
     }
     if lines.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(lines.join("\n"))
+        Ok(Some(lines.join("\n")))
     }
 }
 
@@ -767,12 +803,12 @@ fn fallback_note(o: &DnsOutcome) -> Option<String> {
 /// Nothing is pinned on Linux yet (no NRPT, no relay), so there is nothing to
 /// refresh. A no-op keeps `main()`'s startup path clean.
 #[cfg(not(target_os = "windows"))]
-pub fn refresh_pinned_hosts() {}
+pub fn refresh_pinned_hosts(_owner: &mut CommandOutcome) -> Result<(), String> { Ok(()) }
 
 #[cfg(target_os = "windows")]
-pub fn refresh_pinned_hosts() {
-    if !is_nrpt_applied() {
-        return;
+pub fn refresh_pinned_hosts(owner: &mut CommandOutcome) -> Result<(), String> {
+    if !is_nrpt_applied(owner)? {
+        return Ok(());
     }
     // Same evidence rule as `setup_dns_nrpt`, and it matters more here: this
     // runs unattended on every elevated start, so reading "a tunnel is up" as
@@ -784,16 +820,27 @@ pub fn refresh_pinned_hosts() {
     // No VPN branch any more (D25): the rules stay whatever the tunnel does, and
     // the relay decides at runtime what they answer.
     // The relay resolves live, so a pinned block would only be a stale copy.
-    if background::is_enabled() {
+    if background::is_enabled(owner)? {
         hosts_pin::remove_entries().ok();
-        return;
+        return Ok(());
     }
     hosts_pin::remove_entries().ok();
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precedence_query_requires_complete_valid_result() {
+        assert_eq!(parse_precedence(b"[]\r\nAG_END\r\n").unwrap(), Vec::<u32>::new());
+        assert_eq!(parse_precedence(b"[46]\nAG_END").unwrap(), vec![46]);
+        assert!(parse_precedence(b"").is_err());
+        assert!(parse_precedence(b"[46]").is_err());
+        assert!(parse_precedence(b"[x]\nAG_END").is_err());
+        assert!(parse_precedence(b"null\nAG_END").is_err());
+    }
     use std::net::Ipv4Addr;
 
     /// The stand-down is announced on its own and nothing else is printed with
@@ -811,7 +858,8 @@ mod tests {
             taken_over: vec!["cloudcode-pa.googleapis.com (OTHER)".to_string()],
             probe_gave_up: true,
         };
-        let note = outcome_note(&o).expect("должно быть сообщение");
+        let mut owner = CommandOutcome::default();
+        let note = outcome_note(&mut owner, &o).unwrap().expect("должно быть сообщение");
         assert!(note.contains("VPN"), "{}", note);
         assert!(note.contains("правила DNS не создавались"), "{}", note);
         // The relay/probe/takeover lines belong to a run that wrote rules.
@@ -837,14 +885,15 @@ mod tests {
             probe_gave_up: false,
         };
 
-        let excluded = outcome_note(&with(egress::ClientEgress::Physical)).expect("сообщение");
+        let mut owner = CommandOutcome::default();
+        let excluded = outcome_note(&mut owner, &with(egress::ClientEgress::Physical)).unwrap().expect("сообщение");
         assert!(excluded.contains("мимо него"), "{}", excluded);
         assert!(excluded.contains("400"), "{}", excluded);
         assert!(!excluded.contains("не создавались"), "{}", excluded);
 
         // Antigravity was not running: the rules still go in, and the note says
         // the measurement is what is missing rather than claiming either way.
-        let unknown = outcome_note(&with(egress::ClientEgress::Unknown)).expect("сообщение");
+        let unknown = outcome_note(&mut owner, &with(egress::ClientEgress::Unknown)).unwrap().expect("сообщение");
         assert!(unknown.contains("не запущен"), "{}", unknown);
         assert!(!unknown.contains("не создавались"), "{}", unknown);
 
@@ -854,9 +903,9 @@ mod tests {
             ..with(egress::ClientEgress::Unknown)
         };
         assert!(
-            outcome_note(&plain).map_or(true, |n| !n.contains("VPN")),
+            outcome_note(&mut owner, &plain).unwrap().map_or(true, |n| !n.contains("VPN")),
             "{:?}",
-            outcome_note(&plain)
+            outcome_note(&mut owner, &plain)
         );
     }
 
@@ -956,13 +1005,10 @@ mod tests {
 
     #[test]
     fn without_the_relay_ipv6_is_listed_and_loopback_is_not() {
-        let servers = assemble_nameservers(false, &["31.25.239.132"]);
+        let servers = assemble_nameservers(false, &["45.155.204.190"]);
         assert!(!servers.iter().any(|s| s == dns_forwarder::LISTEN_IP));
-        // Whatever v6 resolvers the pool has belong in the no-relay list (since
-        // 2.31.0 it has none: eu.geohide.ru is IPv4 only).
-        assert_eq!(
+        assert!(
             servers.iter().any(|s| s.contains(':')),
-            !resolvers::all_v6().is_empty(),
             "v6 resolvers belong in the no-relay list: {:?}",
             servers
         );
@@ -980,8 +1026,9 @@ mod tests {
         println!("--- before ---\n{}\n--------------", before);
 
         // Each precondition, so a silent no-op says which one failed.
-        println!("nrpt applied: {}", is_nrpt_applied());
-        let eg = egress::detect();
+        let mut owner = CommandOutcome::default();
+        println!("nrpt applied: {}", is_nrpt_applied(&mut owner).unwrap());
+        let eg = egress::detect(&mut owner).unwrap();
         println!(
             "egress: if{:?} vpn={:?}",
             eg.as_ref().map(|e| e.if_index),
@@ -1001,7 +1048,7 @@ mod tests {
             }
         }
 
-        refresh_pinned_hosts();
+        refresh_pinned_hosts(&mut owner).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap_or_default();
         println!("--- after ---\n{}\n-------------", after);

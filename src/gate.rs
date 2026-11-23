@@ -73,7 +73,8 @@ pub struct Report {
     pub loopback: bool,
     /// Whether a VPN holds the default route, and where its exit is (a country
     /// code, empty until measured).
-    pub tunnel: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<bool>,
     pub vpn_exit: String,
     /// The route table, best first, for the report the window copies out.
     pub routes: Vec<crate::routes::Row>,
@@ -91,6 +92,266 @@ pub struct Report {
     pub started_at: u64,
     /// The relay's own exe - the file an antivirus exception has to name.
     pub exe: String,
+    /// Untrusted serialized transport facts; lifecycle owners must bind these
+    /// to the actual current process and listeners before granting readiness.
+    #[cfg(windows)]
+    #[serde(default, deserialize_with = "decode_transport", serialize_with = "encode_transport", skip_serializing_if = "TransportObservation::is_absent")]
+    pub(crate) transport: TransportObservation,
+    /// Optional image-bound generation. Absence never establishes an older image.
+    #[cfg(windows)]
+    #[serde(default, deserialize_with = "decode_installed_generation", serialize_with = "encode_installed_generation")]
+    pub(crate) installed_generation: InstalledGenerationObservation,
+    #[cfg(windows)]
+    #[serde(skip)]
+    pub(crate) persistence_hold: Option<String>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransportInstance {
+    pub(crate) pid: u32,
+    pub(crate) creation_time: u64,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CapabilityObservation {
+    Disabled,
+    Starting,
+    Ready,
+    Failed(String),
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransportCapabilities {
+    pub(crate) dns: CapabilityObservation,
+    pub(crate) tcp_proxy: CapabilityObservation,
+    pub(crate) dns_alias: CapabilityObservation,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransportReport {
+    pub(crate) schema: u32,
+    pub(crate) instance: TransportInstance,
+    pub(crate) active_config: crate::settings::ActiveTransportConfig,
+    pub(crate) observed: TransportCapabilities,
+}
+
+#[cfg(windows)]
+impl TransportReport {
+    fn validate(&self) -> Result<(), String> {
+        let config = self.active_config;
+        if self.schema != 1 || self.instance.pid == 0 || self.instance.creation_time == 0 {
+            return Err("invalid transport schema or process identity".into());
+        }
+        config.validate()?;
+        for value in [&self.observed.dns, &self.observed.tcp_proxy, &self.observed.dns_alias] {
+            if matches!(value, CapabilityObservation::Failed(cause) if cause.is_empty()) {
+                return Err("transport failure cause is empty".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Default)]
+pub(crate) enum TransportObservation {
+    #[default]
+    Absent,
+    Valid(TransportReport),
+    Invalid(String),
+}
+
+#[cfg(windows)]
+impl TransportObservation {
+    fn is_absent(&self) -> bool { matches!(self, Self::Absent) }
+}
+
+#[cfg(windows)]
+fn decode_transport<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<TransportObservation, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let parsed = serde_json::from_value::<TransportReport>(value).map_err(|_| "malformed transport observation".to_owned())
+        .and_then(|report| { report.validate()?; Ok(report) });
+    Ok(match parsed { Ok(report) => TransportObservation::Valid(report), Err(error) => TransportObservation::Invalid(error) })
+}
+
+#[cfg(windows)]
+fn encode_transport<S: serde::Serializer>(value: &TransportObservation, serializer: S) -> Result<S::Ok, S::Error> {
+    match value {
+        TransportObservation::Absent => serializer.serialize_none(),
+        TransportObservation::Valid(report) => {
+            report.validate().map_err(serde::ser::Error::custom)?;
+            report.serialize(serializer)
+        }
+        // Preserve the component-local unknown state without copying untrusted
+        // payload into a later advisory report or blocking unrelated fields.
+        TransportObservation::Invalid(_) => serializer.serialize_none(),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InstalledGeneration {
+    pub(crate) schema: u32,
+    pub(crate) generation: u32,
+    pub(crate) program_native_id: crate::windows_coordinator::windows_installation::NativeObjectId,
+    pub(crate) program_sha256: String,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Default)]
+pub(crate) enum InstalledGenerationObservation {
+    #[default]
+    Absent,
+    Valid(InstalledGeneration),
+    Invalid(String),
+}
+
+#[cfg(windows)]
+fn decode_installed_generation<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<InstalledGenerationObservation, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() { return Ok(InstalledGenerationObservation::Absent); }
+    let parsed = serde_json::from_value::<InstalledGeneration>(value).map_err(|error| error.to_string())
+        .and_then(|binding| {
+            if binding.schema != 1 || binding.generation == 0 || binding.program_sha256.len() != 64
+                || !binding.program_sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+                return Err("invalid installed generation schema, value or digest".into());
+            }
+            Ok(binding)
+        });
+    Ok(match parsed { Ok(binding) => InstalledGenerationObservation::Valid(binding),
+        Err(cause) => InstalledGenerationObservation::Invalid(cause) })
+}
+
+#[cfg(windows)]
+fn encode_installed_generation<S: serde::Serializer>(binding: &InstalledGenerationObservation, serializer: S) -> Result<S::Ok, S::Error> {
+    match binding {
+        InstalledGenerationObservation::Absent => serializer.serialize_none(),
+        InstalledGenerationObservation::Valid(value) => value.serialize(serializer),
+        InstalledGenerationObservation::Invalid(cause) => Err(serde::ser::Error::custom(format!("invalid installed generation: {cause}"))),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) enum BoundGeneration {
+    Bound(u32),
+    Unknown(String),
+}
+
+#[cfg(windows)]
+pub(crate) fn receive_bound_generation(program: &crate::windows_coordinator::windows_installation::CheckedPath) -> BoundGeneration {
+    let Some(path) = path() else { return BoundGeneration::Unknown("relay report path unavailable".into()); };
+    receive_bound_generation_from(&path, program)
+}
+
+#[cfg(windows)]
+fn receive_bound_generation_from(path: &std::path::Path, program: &crate::windows_coordinator::windows_installation::CheckedPath) -> BoundGeneration {
+    match receive_bound_report_from(path, program) {
+        Ok(report) => match report.installed_generation {
+            InstalledGenerationObservation::Valid(binding) => BoundGeneration::Bound(binding.generation),
+            _ => BoundGeneration::Unknown("installed generation binding disappeared".into()),
+        },
+        Err(cause) => BoundGeneration::Unknown(cause),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn receive_bound_report(program: &crate::windows_coordinator::windows_installation::CheckedPath) -> Result<Report, String> {
+    let path = path().ok_or("relay report path unavailable")?;
+    receive_bound_report_from(&path, program)
+}
+
+#[cfg(windows)]
+fn receive_bound_report_from(path: &std::path::Path, program: &crate::windows_coordinator::windows_installation::CheckedPath) -> Result<Report, String> {
+    let source = checked_runtime_metadata_source(program)?;
+    let data = crate::windows_coordinator::windows_installation::read_protected_user_metadata(path)?
+        .ok_or("protected generation report absent")?;
+    let report: Report = serde_json::from_slice(&data).map_err(|error| format!("invalid protected report: {error}"))?;
+    checked_installed_generation(&report, &source)?.ok_or("installed generation binding absent")?;
+    program.recheck()?;
+    Ok(report)
+}
+
+#[cfg(windows)]
+fn checked_installed_generation(report: &Report, source: &RuntimeMetadataSource) -> Result<Option<u32>, String> {
+    match &report.installed_generation {
+        InstalledGenerationObservation::Absent => Ok(None),
+        InstalledGenerationObservation::Invalid(cause) => Err(format!("invalid installed generation binding: {cause}")),
+        InstalledGenerationObservation::Valid(binding) if binding.program_native_id == source.program && binding.program_sha256 == source.sha256 => Ok(Some(binding.generation)),
+        InstalledGenerationObservation::Valid(_) => Err("installed generation does not match the protected program".into()),
+    }
+}
+
+/// The writer's observed payload may establish absent binding or a conflict.
+/// Only the protected reader can receive a present binding as current.
+#[cfg(windows)]
+pub(crate) fn generation_repair_required(preflight: &crate::windows_coordinator::windows_installation::UserMetadataPreflight,
+    program: &crate::windows_coordinator::windows_installation::CheckedPath) -> Result<bool, String> {
+    let Some(data) = preflight.bytes() else { return Ok(true); };
+    let report: Report = serde_json::from_slice(data).map_err(|error| format!("invalid existing generation report: {error}"))?;
+    match checked_installed_generation(&report, &checked_runtime_metadata_source(program)?)? {
+        None => Ok(true),
+        Some(generation) if generation != crate::dns_forwarder::RELAY_VERSION => Err("installed generation conflicts with the selected image".into()),
+        Some(_) => { require_current_generation(program)?; Ok(false) }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn require_current_generation(program: &crate::windows_coordinator::windows_installation::CheckedPath) -> Result<(), String> {
+    match receive_bound_generation(program) {
+        BoundGeneration::Bound(generation) if generation == crate::dns_forwarder::RELAY_VERSION => Ok(()),
+        BoundGeneration::Bound(_) => Err("installed generation conflicts with the selected image".into()),
+        BoundGeneration::Unknown(cause) => Err(cause),
+    }
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn receive_fixture_generation(path: &std::path::Path,
+    program: &crate::windows_coordinator::windows_installation::CheckedPath) -> BoundGeneration {
+    receive_bound_generation_from(path, program)
+}
+
+/// The caller supplies the independently received actual published program;
+/// the returned publication retains its preimage until the operation settles.
+#[cfg(windows)]
+pub(crate) fn publish_program_generation(program: &crate::windows_coordinator::windows_installation::CheckedPath,
+    preflight: Option<&crate::windows_coordinator::windows_installation::UserMetadataPreflight>)
+    -> Result<crate::windows_coordinator::windows_installation::UserMetadataPublication,
+        crate::windows_coordinator::windows_installation::MetadataFailure> {
+    use crate::windows_coordinator::windows_installation as owner;
+    let prepare = || -> Result<(PathBuf, Vec<u8>), String> {
+        let payload = program_generation_payload(program)?;
+        program.recheck()?;
+        Ok((path().ok_or("gate report path unavailable")?, payload))
+    };
+    let (target, payload) = prepare().map_err(|cause| owner::MetadataFailure {
+        phase: "generation-report-preparation", cause, replace_result: None,
+        evidence: serde_json::json!({"kind":"generation-report-preparation","publicationAttempted":false}), live: Vec::new(), pending: None, unwind: None, secondary_unwinds: Vec::new(),
+    })?;
+    owner::publish_user_metadata_checked(owner::UserMetadataField::GateReport, &target, &payload, preflight)
+}
+
+#[cfg(windows)]
+fn program_generation_payload(program: &crate::windows_coordinator::windows_installation::CheckedPath) -> Result<Vec<u8>, String> {
+    let source = checked_runtime_metadata_source(program)?;
+    let report = Report { installed_generation: InstalledGenerationObservation::Valid(InstalledGeneration {
+        schema: 1, generation: crate::dns_forwarder::RELAY_VERSION,
+        program_native_id: source.program, program_sha256: source.sha256,
+    }), ..Report::default() };
+    serde_json::to_vec(&report).map_err(|error| format!("generation report serialization: {error}"))
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn fixture_program_generation_payload(program: &crate::windows_coordinator::windows_installation::CheckedPath) -> Result<Vec<u8>, String> {
+    program_generation_payload(program)
 }
 
 /// Something on this machine that keeps part of the bypass from running, as the
@@ -210,8 +471,8 @@ pub fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn path() -> Option<PathBuf> {
-    let dir = crate::dns_forwarder::log_dir();
+pub(crate) fn path() -> Option<PathBuf> {
+    let dir = crate::dns_forwarder::checked_log_dir().ok()?;
     if dir.as_os_str().is_empty() {
         return None;
     }
@@ -219,8 +480,29 @@ fn path() -> Option<PathBuf> {
 }
 
 pub fn read() -> Option<Report> {
-    let raw = std::fs::read_to_string(path()?).ok()?;
-    serde_json::from_str(&raw).ok()
+    read_checked().ok().flatten()
+}
+
+/// Fresh report evidence: only a missing file means that no report exists.
+pub(crate) fn read_checked() -> Result<Option<Report>, String> {
+    let path = path().ok_or("relay report path unavailable")?;
+    checked_report(std::fs::read_to_string(path))
+}
+
+fn checked_report(raw: std::io::Result<String>) -> Result<Option<Report>, String> {
+    match raw {
+        Ok(raw) => serde_json::from_str::<Report>(&raw)
+            .map(|mut report| {
+                if crate::egress::observation_support() == crate::egress::ObservationSupport::Unsupported {
+                    report.tunnel = None;
+                    report.vpn_exit.clear();
+                }
+                Some(report)
+            })
+            .map_err(|e| format!("invalid relay report: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read relay report: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -229,8 +511,317 @@ pub fn read() -> Option<Report> {
 
 /// This process's copy, so a partial update never has to read the file back to
 /// keep the fields it is not changing.
+#[cfg(not(windows))]
 static CURRENT: Mutex<Option<Report>> = Mutex::new(None);
 
+#[cfg(windows)]
+#[derive(Default)]
+struct WindowsWriterState {
+    report: Report,
+    live_resources: Vec<crate::windows_coordinator::windows_installation::AcquiredCreation>,
+    pending: Vec<RuntimePendingMetadata>,
+    secondary_unwinds: Vec<crate::windows_coordinator::windows_installation::OwnedUnwind>,
+}
+#[cfg(windows)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeMetadataSource {
+    program: crate::windows_coordinator::windows_installation::NativeObjectId,
+    sha256: String,
+}
+#[cfg(windows)]
+struct RuntimePendingMetadata {
+    source: RuntimeMetadataSource,
+    receipt: crate::windows_coordinator::windows_installation::PendingUserMetadataPublication,
+}
+#[cfg(windows)]
+impl WindowsWriterState {
+    fn prepare_metadata(&mut self, field: crate::windows_coordinator::windows_installation::UserMetadataField,
+        source: &RuntimeMetadataSource, recheck_source: &dyn Fn() -> Result<RuntimeMetadataSource, String>) -> Result<(), String> {
+        use crate::windows_coordinator::windows_installation as owner;
+        let mut index = 0;
+        while index < self.pending.len() {
+            if self.pending[index].receipt.field() != field { index += 1; continue; }
+            if self.pending[index].source != *source { return Err("pending metadata source differs from current protected program".into()); }
+            let received = owner::receive_pending_user_metadata(&mut self.pending[index].receipt, field);
+            if recheck_source()? != *source { return Err("metadata source changed during pending receiving".into()); }
+            if self.pending[index].receipt.restoration_owed() { return Err("pending metadata restoration remains owed".into()); }
+            let published = match received {
+                owner::PendingMetadataReceiving::CanonicalUnchangedReceived => false,
+                owner::PendingMetadataReceiving::PublishedReceived => true,
+                owner::PendingMetadataReceiving::Held { cause, actual } => return Err(format!("{cause}; actual={actual:?}")),
+            };
+            self.pending[index].receipt.release_received(published, &mut self.live_resources);
+            self.pending.remove(index);
+        }
+        if field == owner::UserMetadataField::GateReport { self.report.persistence_hold = None; }
+        for result in self.finish_live_resources() {
+            if let Err(cause) = result { eprintln!("metadata cleanup remains held: {cause}"); }
+        }
+        Ok(())
+    }
+
+    fn write_gate_metadata(&mut self, target: &std::path::Path, source: &RuntimeMetadataSource,
+        recheck_source: &dyn Fn() -> Result<RuntimeMetadataSource, String>, change: impl FnOnce(&mut Report)) -> Result<(), String> {
+        use crate::windows_coordinator::windows_installation as owner;
+        self.prepare_metadata(owner::UserMetadataField::GateReport, source, recheck_source)?;
+        if recheck_source()? != *source { return Err("runtime metadata source changed before publication".into()); }
+        change(&mut self.report);
+        self.report.at = now_unix();
+        if self.report.started_at == 0 { self.report.started_at = self.report.at; }
+        self.report.installed_generation = InstalledGenerationObservation::Valid(InstalledGeneration {
+            schema: 1, generation: crate::dns_forwarder::RELAY_VERSION,
+            program_native_id: source.program.clone(), program_sha256: source.sha256.clone(),
+        });
+        let payload = serde_json::to_vec(&self.report).map_err(|error| format!("gate report serialization: {error}"))?;
+        if recheck_source()? != *source { return Err("runtime metadata source changed before publication".into()); }
+        let mut publication = match owner::publish_user_metadata(owner::UserMetadataField::GateReport, target, &payload) {
+            Ok(value) => value,
+            Err(mut error) => {
+                let unwind = error.unwind.take();
+                let pending = error.pending.is_some();
+                if let Some(receipt) = error.pending.take() { self.pending.push(RuntimePendingMetadata { source: source.clone(), receipt }); }
+                self.live_resources.append(&mut error.live);
+                self.secondary_unwinds.append(&mut error.secondary_unwinds);
+                if let Some(payload) = unwind { std::panic::resume_unwind(payload.0); }
+                let message = format!("{error}; actual={}", error.evidence);
+                if pending { self.report.persistence_hold = Some(message.clone()); }
+                let finishes = self.finish_live_resources();
+                if !finishes.is_empty() { return Err(format!("{message}; owned-resource receiving={finishes:?}")); }
+                return Err(message);
+            }
+        };
+        let current = recheck_source().and_then(|actual| {
+            if actual == *source { Ok(()) } else { Err("runtime metadata source changed after publication".into()) }
+        });
+        if let Err(error) = current {
+            let message = format!("gate publication retained after image recheck: {error}; actual={}", publication.evidence());
+            self.report.persistence_hold = Some(message.clone());
+            let mut failure = publication.into_failure("gate-image-recheck", message.clone(), true, false);
+            if let Some(receipt) = failure.pending.take() { self.pending.push(RuntimePendingMetadata { source: source.clone(), receipt }); }
+            self.live_resources.append(&mut failure.live);
+            let finishes = self.finish_live_resources();
+            return Err(format!("{message}; owned-resource receiving={finishes:?}"));
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| publication.settle())) {
+            Ok(Ok(_)) => {},
+            Ok(Err(cause)) => {
+                let mut error = publication.into_failure("gate-settlement", cause, false, false);
+                let message = format!("{error}; actual={}", error.evidence);
+                if let Some(receipt) = error.pending.take() { self.pending.push(RuntimePendingMetadata { source: source.clone(), receipt }); }
+                self.live_resources.append(&mut error.live);
+                let finishes = self.finish_live_resources();
+                return Err(format!("{message}; owned-resource receiving={finishes:?}"));
+            },
+            Err(payload) => {
+                let mut error = publication.into_failure("gate-settlement-unwind", "gate settlement unwound".into(), true, false);
+                if let Some(receipt) = error.pending.take() { self.pending.push(RuntimePendingMetadata { source: source.clone(), receipt }); }
+                self.live_resources.append(&mut error.live);
+                std::panic::resume_unwind(payload)
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_live_resources(&mut self) -> Vec<Result<serde_json::Value, String>> {
+        let mut results = Vec::new();
+        let mut index = 0;
+        while index < self.live_resources.len() {
+            match self.live_resources[index].finish() {
+                Ok(evidence) => { results.push(Ok(evidence)); self.live_resources.remove(index); }
+                Err(cause) => { results.push(Err(cause)); index += 1; }
+            }
+        }
+        results
+    }
+}
+#[cfg(windows)]
+static CURRENT: Mutex<Option<WindowsWriterState>> = Mutex::new(None);
+
+#[cfg(windows)]
+fn runtime_metadata_source() -> Result<RuntimeMetadataSource, String> {
+    with_runtime_metadata_source(|source, _| Ok(source.clone()))
+}
+
+#[cfg(windows)]
+fn checked_runtime_metadata_source(program: &crate::windows_coordinator::windows_installation::CheckedPath) -> Result<RuntimeMetadataSource, String> {
+    use sha2::{Digest, Sha256};
+    program.recheck()?;
+    let bytes = program.read_snapshot()?;
+    program.recheck()?;
+    Ok(RuntimeMetadataSource { program: program.native_id(), sha256: hex::encode(Sha256::digest(&bytes)) })
+}
+
+#[cfg(windows)]
+fn with_runtime_metadata_source<T>(action: impl FnOnce(&RuntimeMetadataSource,
+    &dyn Fn() -> Result<RuntimeMetadataSource, String>) -> Result<T, String>) -> Result<T, String> {
+    use crate::windows_coordinator::windows_installation as owner;
+    let image = RUNTIME_IMAGE.get().ok_or("runtime image was not received")?;
+    image.recheck()?;
+    let locations = owner::background_locations()?;
+    let inputs = owner::background_inputs(locations.managed_root(), locations.managed_directory(), None, &crate::dns_forwarder::log_dir())?;
+    let lease = owner::background_lease(inputs, None)?;
+    let program = owner::checked_background_path(&lease, locations.managed_program(), owner::PathKind::File)?;
+    if program.native_id() != image.native_id() { return Err("runtime image differs from protected managed program".into()); }
+    let check = || {
+        image.recheck()?;
+        program.recheck()?;
+        let current = owner::checked_background_path(&lease, locations.managed_program(), owner::PathKind::File)?;
+        if current.native_id() != program.native_id() || current.native_id() != image.native_id() {
+            return Err("runtime image differs from protected managed program".into());
+        }
+        let source = checked_runtime_metadata_source(&current)?;
+        program.recheck()?;
+        image.recheck()?;
+        Ok(source)
+    };
+    let source = check()?;
+    // The real image, background lease and checked program remain held across
+    // the callback; its checker borrows those pins, not a scripted verdict.
+    action(&source, &check)
+}
+
+#[cfg(windows)]
+fn with_windows_writer<T>(action: impl FnOnce(&mut WindowsWriterState) -> Result<T, String>) -> Result<T, String> {
+    let mut guard = CURRENT.lock().map_err(|_| "metadata writer lock poisoned")?;
+    let state = guard.get_or_insert_with(WindowsWriterState::default);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(state)));
+    drop(guard);
+    match result { Ok(value) => value, Err(payload) => std::panic::resume_unwind(payload) }
+}
+
+#[cfg(windows)]
+pub(crate) fn recheck_runtime_metadata_source(expected: &RuntimeMetadataSource) -> Result<(), String> {
+    if runtime_metadata_source()? != *expected { return Err("runtime metadata source changed".into()); }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn prepare_runtime_metadata(field: crate::windows_coordinator::windows_installation::UserMetadataField)
+    -> Result<RuntimeMetadataSource, String> {
+    with_runtime_metadata_source(|source, check| with_windows_writer(|state| {
+        state.prepare_metadata(field, source, check)?;
+        Ok(source.clone())
+    }))
+}
+
+#[cfg(windows)]
+pub(crate) fn retain_runtime_metadata_failure(mut failure: crate::windows_coordinator::windows_installation::MetadataFailure,
+    source: RuntimeMetadataSource) -> String {
+    let unwind = failure.unwind.take();
+    let finishes = match CURRENT.lock() {
+        Ok(mut guard) => {
+            let state = guard.get_or_insert_with(WindowsWriterState::default);
+            if let Some(receipt) = failure.pending.take() { state.pending.push(RuntimePendingMetadata { source: source.clone(), receipt }); }
+            state.live_resources.append(&mut failure.live);
+            state.secondary_unwinds.append(&mut failure.secondary_unwinds);
+            if unwind.is_none() { state.finish_live_resources() } else { Vec::new() }
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            let state = guard.get_or_insert_with(WindowsWriterState::default);
+            if let Some(receipt) = failure.pending.take() { state.pending.push(RuntimePendingMetadata { source, receipt }); }
+            state.live_resources.append(&mut failure.live);
+            state.secondary_unwinds.append(&mut failure.secondary_unwinds);
+            if unwind.is_none() { state.finish_live_resources() } else { Vec::new() }
+        }
+    };
+    if let Some(payload) = unwind { std::panic::resume_unwind(payload.0); }
+    let mut message = format!("{failure}; actual={}", failure.evidence);
+    if !finishes.is_empty() { message.push_str(&format!("; owned-resource receiving={finishes:?}")); }
+    message
+}
+
+#[cfg(windows)]
+pub(crate) fn finish_runtime_metadata() -> Result<(), String> {
+    let mut guard = CURRENT.lock().map_err(|_| "gate report writer lock poisoned")?;
+    let Some(state) = guard.as_mut() else { return Ok(()); };
+    let results = state.finish_live_resources();
+    let mut held = results.into_iter().filter_map(Result::err).collect::<Vec<_>>();
+    if !state.pending.is_empty() { held.push("pending canonical metadata receiving".into()); }
+    if held.is_empty() { Ok(()) } else { Err(format!("runtime metadata resources remain held: {}", held.join("; "))) }
+}
+
+#[cfg(windows)]
+static RUNTIME_IMAGE: std::sync::OnceLock<std::sync::Arc<crate::windows_coordinator::process_identity::CurrentImage>> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+pub(crate) fn receive_runtime_image(image: std::sync::Arc<crate::windows_coordinator::process_identity::CurrentImage>) -> Result<(), String> {
+    image.recheck()?;
+    RUNTIME_IMAGE.set(image).map_err(|_| "runtime image was already received".into())
+}
+
+/// Capture this producer's real process identity once, independently of desired
+/// settings timestamps or an older report belonging to the same executable.
+#[cfg(windows)]
+pub(crate) fn transport_started(active_config: crate::settings::ActiveTransportConfig) -> Result<TransportReport, String> {
+    let image = RUNTIME_IMAGE.get().ok_or("runtime image was not received")?;
+    image.recheck()?;
+    let process = image.process();
+    let report = TransportReport {
+        schema: 1,
+        instance: TransportInstance { pid: process.pid(), creation_time: process.creation() },
+        active_config,
+        observed: TransportCapabilities {
+            dns: if active_config.dns { CapabilityObservation::Starting } else { CapabilityObservation::Disabled },
+            tcp_proxy: if active_config.tcp_proxy { CapabilityObservation::Starting } else { CapabilityObservation::Disabled },
+            dns_alias: if active_config.dns_alias { CapabilityObservation::Starting } else { CapabilityObservation::Disabled },
+        },
+    };
+    report.validate()?;
+    image.recheck()?;
+    Ok(report)
+}
+
+#[cfg(windows)]
+fn transport_config_matches(before: &TransportReport, after: &TransportReport) -> bool {
+    before.instance.pid == after.instance.pid
+        && before.instance.creation_time == after.instance.creation_time
+        && before.active_config == after.active_config
+}
+
+#[cfg(windows)]
+pub(crate) fn recheck_transport_instance(expected: &TransportInstance) -> Result<(), String> {
+    let image = RUNTIME_IMAGE.get().ok_or("runtime image was not received")?;
+    image.recheck()?;
+    if expected.pid != image.process().pid() || expected.creation_time != image.process().creation() {
+        return Err("transport instance differs from held current image".into());
+    }
+    Ok(())
+}
+
+/// Publish through the existing protected Gate owner. A failed publication
+/// retains that owner's real pending/preimage obligations and returns the error.
+#[cfg(windows)]
+pub(crate) fn publish_transport(report: &TransportReport, proxy_blocker: Option<&Blocker>, dns_blocker: Option<&Blocker>, alias_blocker: Option<&Blocker>) -> Result<(), String> {
+    report.validate()?;
+    let image = RUNTIME_IMAGE.get().ok_or("runtime image was not received")?;
+    image.recheck()?;
+    if report.instance.pid != image.process().pid() || report.instance.creation_time != image.process().creation() {
+        return Err("transport producer instance differs from its held runtime image".into());
+    }
+    with_runtime_metadata_source(|source, check| {
+        let target = path().ok_or("gate report path unavailable")?;
+        with_windows_writer(|state| {
+            if let TransportObservation::Valid(before) = &state.report.transport {
+                if !transport_config_matches(before, report) {
+                    return Err("active transport configuration is immutable for this carrier instance".into());
+                }
+            }
+            state.write_gate_metadata(&target, source, check, |current| {
+                current.transport = TransportObservation::Valid(report.clone());
+                current.version = crate::dns_forwarder::RELAY_VERSION;
+                current.exe = image.path().to_string_lossy().into_owned();
+                current.loopback = matches!(report.observed.dns_alias, CapabilityObservation::Ready);
+                current.blockers.retain(|blocker| !matches!(blocker.what.as_str(), "proxy" | "dns" | "door"));
+                if let Some(blocker) = proxy_blocker { current.blockers.push(blocker.clone()); }
+                if let Some(blocker) = dns_blocker { current.blockers.push(blocker.clone()); }
+                if let Some(blocker) = alias_blocker { current.blockers.push(blocker.clone()); }
+            })
+        })
+    })
+}
+
+#[cfg(not(windows))]
 fn update(change: impl FnOnce(&mut Report)) {
     let snapshot = {
         let Ok(mut guard) = CURRENT.lock() else {
@@ -275,13 +866,25 @@ fn update(change: impl FnOnce(&mut Report)) {
     }
 }
 
+#[cfg(windows)]
+fn update(change: impl FnOnce(&mut Report)) {
+    let result = with_runtime_metadata_source(|source, check| {
+        let target = path().ok_or("gate report path unavailable")?;
+        with_windows_writer(|state| state.write_gate_metadata(&target, source, check, change))
+    });
+    if let Err(error) = result {
+        eprintln!("gate report persistence failed: {error}");
+        crate::dns_forwarder::log_gate_failure(&error);
+    }
+}
+
 /// What the relay is doing now, as one warm pass sees it.
 pub struct Now<'a> {
     pub route: Option<&'a str>,
     pub forced_for: Option<Duration>,
     pub stood_down: bool,
     pub loopback: bool,
-    pub tunnel: bool,
+    pub tunnel: Option<bool>,
     pub vpn_exit: &'a str,
     pub routes: Vec<crate::routes::Row>,
 }
@@ -632,11 +1235,10 @@ fn worth_sending(fresh: &View, shown: &View) -> bool {
     if relay_changed || fresh.net_ok != shown.net_ok {
         return true;
     }
-    let newer =
-        |a: Option<crate::ls_log::Sighting>, b: Option<crate::ls_log::Sighting>| match (a, b) {
-            (Some(a), Some(b)) => a.count != b.count || a.ago < b.ago,
-            (a, b) => a.is_some() != b.is_some(),
-        };
+    let newer = |a: Option<crate::ls_log::Sighting>, b: Option<crate::ls_log::Sighting>| match (a, b) {
+        (Some(a), Some(b)) => a.count != b.count || a.ago < b.ago,
+        (a, b) => a.is_some() != b.is_some(),
+    };
     let verify_changed = match (&fresh.verify, &shown.verify) {
         (Some(a), Some(b)) => a.url != b.url || a.ago < b.ago,
         (a, b) => a.is_some() != b.is_some(),
@@ -656,7 +1258,373 @@ fn worth_sending(fresh: &View, shown: &View) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_observation_codec_preserves_unknown() {
+        for (json, expected) in [(r#"{"tunnel":true}"#, Some(true)), (r#"{"tunnel":false}"#, Some(false)),
+            (r#"{}"#, None), (r#"{"tunnel":null}"#, None)] {
+            let report: Report = serde_json::from_str(json).unwrap();
+            assert_eq!(report.tunnel, expected);
+            let value = serde_json::to_value(report).unwrap();
+            if expected.is_none() { assert!(value.get("tunnel").is_none()); }
+        }
+        assert!(serde_json::from_str::<Report>(r#"{"tunnel":"false"}"#).is_err());
+        assert!(serde_json::from_str::<Report>(r#"{"tunnel":{}}"#).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn old_mac_boolean_is_not_a_current_measurement() {
+        let report = checked_report(Ok(r#"{"tunnel":false,"vpn_exit":"old"}"#.into())).unwrap().unwrap();
+        assert_eq!(report.tunnel, None);
+        assert!(report.vpn_exit.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transport_producer_binding_rejects_instance_or_configuration_change() {
+        let report = TransportReport { schema: 1, instance: TransportInstance { pid: 7, creation_time: 11 },
+            active_config: crate::settings::ActiveTransportConfig { profile: crate::settings::TransportProfile::SystemTcp,
+                dns: false, tcp_proxy: true, client_proxy: true, dns_alias: false },
+            observed: TransportCapabilities { dns: CapabilityObservation::Disabled, tcp_proxy: CapabilityObservation::Starting,
+                dns_alias: CapabilityObservation::Disabled } };
+        assert!(transport_config_matches(&report, &report));
+        let mut changed = report.clone();
+        changed.instance.creation_time += 1;
+        assert!(!transport_config_matches(&report, &changed));
+        let mut changed = report.clone();
+        changed.instance.pid += 1;
+        assert!(!transport_config_matches(&report, &changed));
+        let mut changed = report.clone();
+        changed.active_config.tcp_proxy = false;
+        assert!(!transport_config_matches(&report, &changed));
+        let mut configured = report.clone();
+        configured.active_config.profile = crate::settings::TransportProfile::ExistingConfigured;
+        configured.active_config.client_proxy = false;
+        assert!(configured.validate().is_ok());
+        let mut client_on = configured.clone();
+        client_on.active_config.client_proxy = true;
+        assert!(client_on.validate().is_ok());
+        assert!(!transport_config_matches(&configured, &client_on));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transport_report_wire_requires_complete_nonzero_identity() {
+        let old: Report = serde_json::from_str(r#"{"version":7}"#).unwrap();
+        assert!(matches!(old.transport, TransportObservation::Absent));
+        let json = r#"{"version":7,"route":"synthetic","transport":{"schema":1,"instance":{"pid":4242,"creation_time":18446744073709551615},"active_config":{"profile":"system_tcp","dns":false,"tcp_proxy":true,"client_proxy":true,"dns_alias":false},"observed":{"dns":"disabled","tcp_proxy":"ready","dns_alias":"disabled"}}}"#;
+        let report: Report = serde_json::from_str(json).unwrap();
+        let TransportObservation::Valid(ref observed) = report.transport else { panic!("valid wire rejected") };
+        assert_eq!(observed.instance.creation_time, u64::MAX);
+        let roundtrip: Report = serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+        assert!(matches!(roundtrip.transport, TransportObservation::Valid(ref item) if item.instance.creation_time == u64::MAX));
+        for mutate in ["pid", "creation_time", "schema", "active_config", "observed"] {
+            let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+            match mutate {
+                "pid" | "creation_time" => value["transport"]["instance"][mutate] = 0.into(),
+                _ => { value["transport"].as_object_mut().unwrap().remove(mutate); }
+            }
+            let decoded: Report = serde_json::from_value(value).unwrap();
+            assert!(matches!(decoded.transport, TransportObservation::Invalid(_)), "{mutate}");
+            assert_eq!(decoded.version, 7);
+            assert_eq!(decoded.route, "synthetic");
+            let again: Report = serde_json::from_slice(&serde_json::to_vec(&decoded).unwrap()).unwrap();
+            assert!(matches!(again.transport, TransportObservation::Invalid(_)));
+            assert_eq!(again.version, 7);
+            assert_eq!(again.route, "synthetic");
+        }
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        value["transport"]["active_config"]["dns"] = true.into();
+        let decoded: Report = serde_json::from_value(value).unwrap();
+        assert!(matches!(decoded.transport, TransportObservation::Invalid(_)));
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        value["transport"]["active_config"].as_object_mut().unwrap().remove("client_proxy");
+        let decoded: Report = serde_json::from_value(value).unwrap();
+        assert!(matches!(decoded.transport, TransportObservation::Invalid(_)));
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        value["transport"]["active_config"]["profile"] = "existing_configured".into();
+        value["transport"]["active_config"]["dns"] = true.into();
+        value["transport"]["active_config"]["client_proxy"] = false.into();
+        let decoded: Report = serde_json::from_value(value).unwrap();
+        assert!(matches!(decoded.transport, TransportObservation::Valid(_)), "DNS/route on with client off is valid");
+    }
+
+    #[cfg(windows)]
+    fn runtime_gate_fixture() -> (PathBuf, crate::windows_coordinator::windows_installation::CheckedPath,
+        crate::windows_coordinator::windows_installation::NativeObjectId) {
+        use crate::windows_coordinator::windows_installation as owner;
+        let parent = PathBuf::from(std::env::var_os("AG_BACKGROUND_NATIVE_FIXTURE_PARENT").expect("explicit qualified private fixture parent"));
+        let root = owner::context_fixture_directory(&parent).unwrap();
+        let program_path = root.join("runtime-program.bin");
+        owner::write_deployment_data(&program_path, b"owned private Gate runtime program").unwrap();
+        let program = owner::CheckedPath::open(&program_path, owner::PathKind::File, owner::PathPurpose::Executable).unwrap();
+        let target = root.join(FILE_NAME);
+        owner::write_deployment_data(&target, &serde_json::to_vec(&Report::default()).unwrap()).unwrap();
+        let original = owner::CheckedPath::open(&target, owner::PathKind::File, owner::PathPurpose::Review).unwrap().native_id();
+        (root, program, original)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "explicit qualified private fixture parent; real Gate publication/receiving, no runtime globals or installed state"]
+    fn runtime_gate_natural_write_receives_pending_without_replaying_old_rename() {
+        use crate::windows_coordinator::windows_installation as owner;
+        let (root, program, original) = runtime_gate_fixture();
+        let target = root.join(FILE_NAME);
+        let source = checked_runtime_metadata_source(&program).unwrap();
+        let check = || checked_runtime_metadata_source(&program);
+        let mut state = WindowsWriterState::default();
+        owner::test_reset_metadata_rename_trace();
+        owner::fail_next_metadata_post_publish();
+        let failure = state.write_gate_metadata(&target, &source, &check, |report| {
+            report.route = "first owned Gate update".into();
+            report.loopback = true;
+        }).unwrap_err();
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending[0].source == source);
+        let retained_failure = state.report.persistence_hold.clone().expect("real post-publication failure is retained");
+        assert!(failure.contains(&retained_failure));
+        let actual: serde_json::Value = serde_json::from_str(retained_failure.split_once("; actual=").unwrap().1).unwrap();
+        assert_eq!(actual["oldMoved"], true);
+        assert_eq!(actual["newPublished"], true);
+        assert_eq!(actual["oldRenameResult"], true);
+        assert_eq!(actual["stageRenameResult"], true);
+        assert!(actual["rollbackRenameResult"].is_null());
+        assert_eq!(owner::test_metadata_rename_count(&original), 1);
+        let first_published = state.pending[0].receipt.test_held_stage_id().unwrap();
+        assert_eq!(owner::test_metadata_rename_count(&first_published), 1);
+
+        // This is the same Gate entry used by production update: common prepare,
+        // source comparison, pending receiving/release, serialization and write.
+        state.write_gate_metadata(&target, &source, &check, |report| report.route = "second owned Gate update".into()).unwrap();
+        assert!(state.pending.is_empty() && state.live_resources.is_empty());
+        assert!(state.report.persistence_hold.is_none());
+        assert_eq!(owner::test_metadata_rename_count(&original), 1, "old A must not be renamed again during receipt");
+        assert_eq!(owner::test_metadata_rename_count(&first_published), 2, "new operation may retire B after its first publication");
+        let final_pin = owner::CheckedPath::open(&target, owner::PathKind::File, owner::PathPurpose::Review).unwrap();
+        assert!(final_pin.native_id() != first_published);
+        assert_eq!(owner::test_metadata_rename_count(&final_pin.native_id()), 1);
+        let report: Report = serde_json::from_slice(&owner::read_protected_user_metadata(&target).unwrap().unwrap()).unwrap();
+        assert_eq!(report.route, "second owned Gate update");
+        assert!(report.loopback);
+        assert!(matches!(report.installed_generation, InstalledGenerationObservation::Valid(binding)
+            if binding.program_native_id == source.program && binding.program_sha256 == source.sha256));
+        eprintln!("owned Gate natural re-entry root={}; original failure retained: {retained_failure}", root.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "explicit qualified private fixture parent; real changed checked source, no runtime globals or installed state"]
+    fn runtime_gate_changed_checked_program_holds_pending_without_native_moves() {
+        use crate::windows_coordinator::windows_installation as owner;
+        let (root, program, original) = runtime_gate_fixture();
+        let target = root.join(FILE_NAME);
+        let source = checked_runtime_metadata_source(&program).unwrap();
+        let check = || checked_runtime_metadata_source(&program);
+        let mut state = WindowsWriterState::default();
+        owner::test_reset_metadata_rename_trace();
+        owner::fail_next_metadata_post_publish();
+        state.write_gate_metadata(&target, &source, &check, |report| report.route = "owned pending Gate update".into()).unwrap_err();
+        let retained_failure = state.report.persistence_hold.clone().unwrap();
+        let before = std::fs::read(&target).unwrap();
+        let published = state.pending[0].receipt.test_held_stage_id().unwrap();
+        let old_moves = owner::test_metadata_rename_count(&original);
+        let published_moves = owner::test_metadata_rename_count(&published);
+
+        let changed_path = root.join("different-runtime-program.bin");
+        owner::write_deployment_data(&changed_path, b"a different actual checked runtime program").unwrap();
+        let changed = owner::CheckedPath::open(&changed_path, owner::PathKind::File, owner::PathPurpose::Executable).unwrap();
+        let changed_source = checked_runtime_metadata_source(&changed).unwrap();
+        assert!(source != changed_source);
+        let changed_check = || checked_runtime_metadata_source(&changed);
+        let held = state.write_gate_metadata(&target, &changed_source, &changed_check,
+            |_| panic!("a source conflict must not invoke the report change")).unwrap_err();
+        assert!(held.contains("pending metadata source differs from current protected program"));
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending[0].source == source);
+        assert_eq!(state.report.persistence_hold.as_deref(), Some(retained_failure.as_str()));
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+        assert_eq!(owner::test_metadata_rename_count(&original), old_moves);
+        assert_eq!(owner::test_metadata_rename_count(&published), published_moves);
+        assert_eq!(owner::test_metadata_rename_count(&changed_source.program), 0);
+
+        // Restore the fixture's actually retained original checked source, then
+        // settle through the same natural Gate call, never by extracting a receipt.
+        state.write_gate_metadata(&target, &source, &check, |report| report.route = "original checked source restored".into()).unwrap();
+        assert!(state.pending.is_empty() && state.live_resources.is_empty());
+        assert_eq!(owner::test_metadata_rename_count(&original), old_moves);
+        eprintln!("owned Gate source-hold root={}; held={held}; original failure={retained_failure}", root.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "owned private fixture; Gate old cleanup failure after published receiving"]
+    fn runtime_gate_cleanup_failure_does_not_hold_received_publication() {
+        use crate::windows_coordinator::windows_installation as owner;
+        let (root, program, _) = runtime_gate_fixture();
+        let target = root.join(FILE_NAME);
+        let source = checked_runtime_metadata_source(&program).unwrap();
+        let check = || checked_runtime_metadata_source(&program);
+        let mut state = WindowsWriterState::default();
+        owner::test_change_old_during_metadata_settlement();
+        let error = state.write_gate_metadata(&target, &source, &check, |_| {}).unwrap_err();
+        assert!(error.contains("displaced preimage changed"));
+        assert!(state.pending.is_empty());
+        assert!(!state.live_resources.is_empty());
+        assert!(owner::read_protected_user_metadata(&target).unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "owned private fixture; normal Gate settlement mismatch handoff"]
+    fn runtime_gate_settlement_mismatch_retains_accepted_publication() {
+        use crate::windows_coordinator::windows_installation as owner;
+        let (root, program, original) = runtime_gate_fixture();
+        let target = root.join(FILE_NAME);
+        let source = checked_runtime_metadata_source(&program).unwrap();
+        let check = || checked_runtime_metadata_source(&program);
+        let mut state = WindowsWriterState::default();
+        owner::test_reset_metadata_rename_trace();
+        owner::test_change_creation_during_metadata_settlement();
+        let error = state.write_gate_metadata(&target, &source, &check, |_| {}).unwrap_err();
+        assert!(error.contains("published metadata changed before settlement"));
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending[0].source == source);
+        let pending = &mut state.pending[0].receipt;
+        assert!(pending.test_accepted_transition_retained());
+        assert!(pending.test_stage_creation_differs_from_expected().unwrap());
+        let stage = pending.test_held_stage_id().unwrap();
+        let old_moves = owner::test_metadata_rename_count(&original);
+        let stage_moves = owner::test_metadata_rename_count(&stage);
+        assert!(state.write_gate_metadata(&target, &source, &check, |_| panic!("changed snapshot must hold")).is_err());
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.pending[0].receipt.test_held_stage_id().unwrap(), stage);
+        assert_eq!(owner::test_metadata_rename_count(&original), old_moves);
+        assert_eq!(owner::test_metadata_rename_count(&stage), stage_moves);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "explicit qualified private fixture parent; changed incomplete stage must remain held"]
+    fn runtime_gate_does_not_replay_changed_incompletely_received_stage() {
+        use crate::windows_coordinator::windows_installation as owner;
+        let (root, program, original) = runtime_gate_fixture();
+        let target = root.join(FILE_NAME);
+        let source = checked_runtime_metadata_source(&program).unwrap();
+        let check = || checked_runtime_metadata_source(&program);
+        let mut state = WindowsWriterState::default();
+        owner::test_reset_metadata_rename_trace();
+        owner::fail_metadata_rename_readback_after(2);
+        owner::change_creation_before_failed_metadata_rename_receiving();
+        state.write_gate_metadata(&target, &source, &check, |_| {}).unwrap_err();
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending[0].receipt.test_stage_creation_differs_from_expected().unwrap());
+        let stage = state.pending[0].receipt.test_held_stage_id().unwrap();
+        let old_moves = owner::test_metadata_rename_count(&original);
+        let stage_moves = owner::test_metadata_rename_count(&stage);
+        let held = state.write_gate_metadata(&target, &source, &check, |_| panic!("unreceived transition must hold")).unwrap_err();
+        assert!(held.contains("canonical metadata differs"));
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(owner::test_metadata_rename_count(&original), old_moves);
+        assert_eq!(owner::test_metadata_rename_count(&stage), stage_moves);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "explicit qualified private fixture parent; authentic observer and differing pending expectation"]
+    fn authentic_observation_does_not_resolve_different_pending_snapshot() {
+        use crate::windows_coordinator::windows_installation as owner;
+        let (root, program, original) = runtime_gate_fixture();
+        let target = root.join(FILE_NAME);
+        let source = checked_runtime_metadata_source(&program).unwrap();
+        let check = || checked_runtime_metadata_source(&program);
+        let mut state = WindowsWriterState::default();
+        owner::test_reset_metadata_rename_trace();
+        owner::fail_next_metadata_post_publish();
+        let first = state.write_gate_metadata(&target, &source, &check, |report| report.route = "fixture".into()).unwrap_err();
+        let stage = state.pending[0].receipt.test_held_stage_id().unwrap();
+        state.pending[0].receipt.test_invalidate_produced_snapshot();
+        assert!(matches!(receive_fixture_generation(&target, &program), BoundGeneration::Bound(value) if value == crate::dns_forwarder::RELAY_VERSION));
+        let old_moves = owner::test_metadata_rename_count(&original);
+        let stage_moves = owner::test_metadata_rename_count(&stage);
+        let held = state.write_gate_metadata(&target, &source, &check, |_| panic!("pending mismatch must hold")).unwrap_err();
+        assert!(held.contains("canonical metadata differs"), "actual held cause: {held}");
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.report.persistence_hold.as_ref().is_some_and(|cause| first.contains(cause)));
+        assert_eq!(owner::test_metadata_rename_count(&original), old_moves);
+        assert_eq!(owner::test_metadata_rename_count(&stage), stage_moves);
+        eprintln!("owned authentic-observation/pending-mismatch fixture root={}; actual held={held}", root.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "explicit qualified private fixture parent; real Gate foreign occupant, no runtime globals or installed state"]
+    fn runtime_gate_foreign_canonical_holds_pending_without_native_moves() {
+        use crate::windows_coordinator::windows_installation as owner;
+        let (root, program, original) = runtime_gate_fixture();
+        let target = root.join(FILE_NAME);
+        let source = checked_runtime_metadata_source(&program).unwrap();
+        let check = || checked_runtime_metadata_source(&program);
+        let mut state = WindowsWriterState::default();
+        owner::test_reset_metadata_rename_trace();
+        owner::occupy_next_metadata_vacancy();
+        let first = state.write_gate_metadata(&target, &source, &check, |report| report.route = "owned foreign fixture".into()).unwrap_err();
+        assert!(first.contains("os error 183"));
+        assert_eq!(state.pending.len(), 1);
+        let stage = state.pending[0].receipt.test_held_stage_id().unwrap();
+        let foreign = owner::CheckedPath::open(&target, owner::PathKind::File, owner::PathPurpose::Review).unwrap().native_id();
+        let before = std::fs::read(&target).unwrap();
+        assert_eq!(before, b"independent synthetic occupant");
+        let old_moves = owner::test_metadata_rename_count(&original);
+        let stage_moves = owner::test_metadata_rename_count(&stage);
+        let foreign_moves = owner::test_metadata_rename_count(&foreign);
+        let held = state.write_gate_metadata(&target, &source, &check,
+            |_| panic!("foreign canonical occupancy must not invoke report change")).unwrap_err();
+        assert!(held.contains("pending metadata restoration remains owed"));
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+        assert_eq!(owner::CheckedPath::open(&target, owner::PathKind::File, owner::PathPurpose::Review).unwrap().native_id(), foreign);
+        assert_eq!(owner::test_metadata_rename_count(&original), old_moves);
+        assert_eq!(owner::test_metadata_rename_count(&stage), stage_moves);
+        assert_eq!(owner::test_metadata_rename_count(&foreign), foreign_moves);
+        eprintln!("owned Gate foreign occupancy root={}; initial={first}; next={held}", root.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn optional_installed_generation_keeps_old_report_codec_compatible() {
+        let old: Report = serde_json::from_str(r#"{"version":7}"#).unwrap();
+        assert!(matches!(old.installed_generation, InstalledGenerationObservation::Absent));
+        let binding = InstalledGeneration { schema: 1, generation: 7,
+            program_native_id: crate::windows_coordinator::windows_installation::NativeObjectId { volume: 0, file: [0; 16] },
+            program_sha256: "0".repeat(64) };
+        let report = Report { version: 7, installed_generation: InstalledGenerationObservation::Valid(binding), ..Report::default() };
+        let encoded = serde_json::to_string(&report).unwrap();
+        eprintln!("synthetic report sample: {encoded}");
+        let decoded: Report = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(decoded.installed_generation, InstalledGenerationObservation::Valid(value) if value.generation == 7));
+        #[derive(Deserialize)]
+        struct OldReport { version: u32 }
+        assert_eq!(serde_json::from_str::<OldReport>(&encoded).unwrap().version, 7);
+        let mut malformed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        malformed["installed_generation"]["extra"] = true.into();
+        let decoded: Report = serde_json::from_value(malformed).unwrap();
+        assert_eq!(decoded.version, 7);
+        assert!(matches!(&decoded.installed_generation, InstalledGenerationObservation::Invalid(cause) if !cause.is_empty()));
+        assert!(serde_json::to_string(&decoded).is_err());
+    }
     use crate::ls_log::Sighting;
+
+    #[test]
+    fn checked_report_distinguishes_missing_invalid_and_io_failure() {
+        let encoded = serde_json::to_string(&Report::default()).unwrap();
+        assert!(checked_report(Ok(encoded)).unwrap().is_some());
+        assert!(checked_report(Err(std::io::ErrorKind::NotFound.into())).unwrap().is_none());
+        assert!(checked_report(Err(std::io::ErrorKind::PermissionDenied.into())).is_err());
+        assert!(checked_report(Ok(String::new())).is_err());
+        assert!(checked_report(Ok("{".into())).is_err());
+    }
 
     fn seen(ago: u64, count: usize) -> Option<Sighting> {
         Some(Sighting {
@@ -703,18 +1671,12 @@ mod tests {
             verify: link(10, "https://accounts.google.com/a"),
             ..shown.clone()
         };
-        assert!(
-            worth_sending(&asked, &shown),
-            "a verification demand appeared"
-        );
+        assert!(worth_sending(&asked, &shown), "a verification demand appeared");
         let aged = View {
             verify: link(13, "https://accounts.google.com/a"),
             ..shown.clone()
         };
-        assert!(
-            !worth_sending(&aged, &asked),
-            "the same demand, three seconds on"
-        );
+        assert!(!worth_sending(&aged, &asked), "the same demand, three seconds on");
         let again = View {
             verify: link(2, "https://accounts.google.com/b"),
             ..shown.clone()
@@ -856,21 +1818,9 @@ mod tests {
             ..Report::default()
         };
         assert!(r.cut_off());
-        assert!(!Report {
-            reached_at: now - 5,
-            ..r.clone()
-        }
-        .cut_off());
-        assert!(!Report {
-            started_at: now - 30,
-            ..r.clone()
-        }
-        .cut_off());
-        assert!(!Report {
-            version: 31,
-            ..r.clone()
-        }
-        .cut_off());
+        assert!(!Report { reached_at: now - 5, ..r.clone() }.cut_off());
+        assert!(!Report { started_at: now - 30, ..r.clone() }.cut_off());
+        assert!(!Report { version: 31, ..r.clone() }.cut_off());
         assert!(!Report { started_at: 0, ..r }.cut_off());
     }
 }

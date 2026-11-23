@@ -8,7 +8,7 @@
 //!
 //! The rules that shaped it, each one a bug that shipped before:
 //!
-//! * **"Работает" needs proof.** Only a model answer in the client's own log
+//! * **Green means a logged answer.** Only a model answer in the client's own log
 //!   turns the card green. Silence after a refusal used to read as "fixed" -
 //!   and silence is also exactly what a user who gave up produces (G50).
 //! * **One action at most, and a real one.** A card that says what is wrong
@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use crate::gate::View;
-use crate::ops::{Cap, Status};
+use crate::ops::{Cap, Status, VsCodeAntigravityObservation};
 
 /// How the card is coloured, and how loud it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +53,7 @@ pub enum Action {
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
-            Action::EnableAll => "Включить всё",
+            Action::EnableAll => if cfg!(windows) { "Применить выбранное" } else { "Включить всё" },
             Action::Elevate => "Перезапустить от имени администратора",
             Action::Repair => "Починить",
             Action::Verify => "Пройти верификацию в браузере",
@@ -81,10 +81,16 @@ pub struct Answered {
 /// state the window can be in.
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
+    observation_error: Option<String>,
+    #[cfg(windows)]
+    selected_delivery_error: Option<String>,
+    system_tcp: bool,
     /// Windows and elevated (or not Windows, where nothing needs it).
     pub admin: bool,
     /// At least one Antigravity install was found.
     pub installs_found: bool,
+    #[cfg(windows)]
+    installation_discovery_incomplete: bool,
     /// The account patch is on everywhere it can be.
     pub patch_on: bool,
     /// The 400 bypass is on: its DNS half, which everything else rides on - the
@@ -118,9 +124,8 @@ pub struct Facts {
     pub dns_blocked: Option<crate::gate::Blocker>,
     /// The relay has run for minutes and nothing on the internet answered it.
     pub cut_off: bool,
-    /// Whether this window itself reaches the internet - asked only while the
-    /// relay is cut off, and what tells "no internet" from "something blocks
-    /// the relay alone".
+    /// Result of the window's separate internet probe, requested while the
+    /// relay has received no upstream replies.
     pub net_ok: Option<bool>,
     /// The relay's own exe: the file an antivirus exception has to name.
     pub relay_exe: String,
@@ -171,6 +176,7 @@ impl Facts {
     /// differently.
     pub fn read(s: &Status, gate: &View, gate_age: Duration) -> Facts {
         let aged = |ago: Duration| ago + gate_age;
+        let system_tcp = cfg!(windows) && s.transport_view == crate::ops::TransportView::SystemTcp;
         // Newest over twelve hours, so an old refusal still outranks an older
         // answer; counted over the last ten minutes, which is what "it keeps
         // happening" means.
@@ -195,10 +201,9 @@ impl Facts {
                     bypassed: e.bypassed,
                 })
         });
-        // The path of the last answer when the relay saw one recently - and then
-        // exactly that, empty included: an answer no tunnel of ours carried went
-        // around us, and naming the route we would have used instead would be a
-        // claim about traffic that never touched it. Otherwise the route in force.
+        // Use the service's recent route observation, including an empty one,
+        // or its current route if it has none. The client log answer and the
+        // service route are separate observations.
         let route = relay.and_then(|r| {
             let recent_ok = r.last_ok.as_ref().filter(|ok| {
                 crate::gate::now_unix().saturating_sub(ok.at)
@@ -210,11 +215,20 @@ impl Facts {
             }
         });
         Facts {
+            observation_error: s.background_observation_error.clone(),
+            #[cfg(windows)]
+            selected_delivery_error: s.selected_delivery.as_ref().err().cloned(),
+            system_tcp,
             admin: s.admin || !cfg!(target_os = "windows"),
             installs_found: s.installs.iter().any(|r| r.path.is_some()),
+            #[cfg(windows)]
+            installation_discovery_incomplete: s.installs.iter().any(|row| row.discovery_note().is_some()),
             patch_on: s.client_patch.is_on(),
             bypass_on: s.bypass_on(),
             relay_running: s.relay_running,
+            #[cfg(windows)]
+            relay_outdated: matches!(&s.selected_delivery, Ok(true)),
+            #[cfg(not(windows))]
             relay_outdated: s.relay_outdated,
             // Rules are only owed while the DNS switch is on: a route running alone
             // (own proxy, group, exits) has none by design.
@@ -223,18 +237,15 @@ impl Facts {
             refusal,
             answer,
             answered,
-            route,
-            proxy_blocked: blocker(relay, "proxy"),
-            door_blocked: blocker(relay, "door"),
-            dns_blocked: blocker(relay, "dns"),
-            cut_off: relay.is_some_and(crate::gate::Report::cut_off),
+            route: if system_tcp { None } else { route },
+            proxy_blocked: if system_tcp { None } else { blocker(relay, "proxy") },
+            door_blocked: if system_tcp { None } else { blocker(relay, "door") },
+            dns_blocked: if system_tcp { None } else { blocker(relay, "dns") },
+            cut_off: !system_tcp && relay.is_some_and(crate::gate::Report::cut_off),
             net_ok: gate.net_ok,
             relay_exe: relay.map(|r| r.exe.clone()).unwrap_or_default(),
             verify: gate.verify.as_ref().map(|v| (aged(v.ago), v.url.clone())),
-            overloaded: gate
-                .overloaded
-                .as_ref()
-                .map(|o| (aged(o.ago), o.model.clone())),
+            overloaded: gate.overloaded.as_ref().map(|o| (aged(o.ago), o.model.clone())),
             unauthorized: gate.unauthorized.map(|u| (aged(u.ago), u.count)),
         }
     }
@@ -247,12 +258,6 @@ fn blocker(relay: Option<&crate::gate::Report>, what: &str) -> Option<crate::gat
 /// A provider's name as it is shown: an acronym stays one, anything else gets
 /// one capital.
 pub fn provider_name(name: &str) -> String {
-    // The two the pool carries are written the way their owners write them.
-    match name {
-        "dns-ai.ru" => return "DNS-AI.ru".to_string(),
-        "eu.geohide.ru" => return "eu.GeoHide.ru".to_string(),
-        _ => {}
-    }
     let lead: String = name.chars().take_while(|c| c.is_alphabetic()).collect();
     if lead.eq_ignore_ascii_case("dns") {
         return name.to_uppercase();
@@ -270,6 +275,15 @@ pub const BYPASS_TEXT: (&str, &str) = (
     "Сам находит рабочий путь до серверов Google и переключается, если путь \
      перестал работать — с VPN и без.",
 );
+
+/// Package presence under VS Code, as shown in both front ends and the report.
+pub fn vscode_antigravity_text(observation: &VsCodeAntigravityObservation) -> &'static str {
+    match observation {
+        VsCodeAntigravityObservation::Found => "Antigravity для VS Code: пакет найден",
+        VsCodeAntigravityObservation::NotFound => "Antigravity для VS Code: пакет не найден",
+        VsCodeAntigravityObservation::Incomplete => "Antigravity для VS Code: не удалось проверить",
+    }
+}
 
 /// What a switch is called and what it does, in both front ends.
 pub fn switch_text(cap: Cap) -> (&'static str, &'static str) {
@@ -292,6 +306,12 @@ pub fn switch_text(cap: Cap) -> (&'static str, &'static str) {
             "Соединения Antigravity с этими двумя серверами идут через посредника внутри \
              вашего компьютера: он выбирает путь, который реально работает, и переключается \
              сам. Содержимое не расшифровывается — посредник только передаёт байты.",
+        ),
+        Cap::BuiltinExits => (
+            "Встроенные выходы",
+            // Deliberately says what they are and never which they are: a
+            // free service that gets named publicly stops being free (I46).
+            "Запасной путь до серверов Google — через страну без ограничений.",
         ),
         Cap::GroupProxy => (
             "Прокси из группы",
@@ -381,9 +401,8 @@ fn blocked(b: &crate::gate::Blocker, exe: &str) -> Headline {
             format!("Порт {port} недоступен"),
             format!(
                 "Служба обхода не может открыть порт {port} ({}), поэтому {effect}. Нажмите \
-                 «Починить»; не помогло — {}",
-                b.error,
-                super::report::when_stuck()
+                 «Починить»; не помогло — «Сохранить отчёт» и пришлите файл с рабочего стола в группу.",
+                b.error
             ),
         ),
     };
@@ -424,9 +443,34 @@ pub fn blocker_line(b: &crate::gate::Blocker) -> String {
 }
 
 pub fn headline(f: &Facts) -> Headline {
+    let mut result = headline_inner(f);
+    #[cfg(windows)]
+    if let Some(error) = &f.selected_delivery_error {
+        if result.tone == Tone::Ok {
+            result.tone = Tone::Wait;
+        }
+        result.detail.push_str(&format!(" {}", crate::ops::selected_delivery_warning(error)));
+    }
+    result
+}
+
+fn headline_inner(f: &Facts) -> Headline {
+    if let Some(error) = &f.observation_error {
+        return Headline { tone: Tone::Wait, title: "Состояние службы не проверено".into(), detail: error.clone(),
+            action: Some(if f.admin { Action::Repair } else { Action::Elevate }) };
+    }
     // Nothing to work on. Said first: every other card assumes Antigravity is
     // installed, and a button that patches nothing is not an action.
     if !f.installs_found && !f.patch_on && !f.bypass_on {
+        #[cfg(windows)]
+        if f.installation_discovery_incomplete {
+            return Headline {
+                tone: Tone::Off,
+                title: "Не удалось проверить установки Antigravity".into(),
+                detail: "Укажите путь вручную, если установка уже есть.".into(),
+                action: None,
+            };
+        }
         return Headline {
             tone: Tone::Off,
             title: "Antigravity не найден".into(),
@@ -481,7 +525,9 @@ pub fn headline(f: &Facts) -> Headline {
     }
     // A refusal newer than the 503 is the news; the 503 was an earlier turn.
     let overloaded = f.overloaded.as_ref().filter(|(ago, _)| {
-        *ago <= crate::gate::RECENT && unanswered(*ago) && f.refusal.is_none_or(|(r, _)| r > *ago)
+        *ago <= crate::gate::RECENT
+            && unanswered(*ago)
+            && f.refusal.is_none_or(|(r, _)| r > *ago)
     });
     if let Some((ago, model)) = overloaded {
         let which = if model.is_empty() {
@@ -557,41 +603,22 @@ pub fn headline(f: &Facts) -> Headline {
     }
     // The DNS listener is the other half the relay cannot open by itself. Below
     // the proxy because the proxy carries everything while it is up, and above
-    // "cut off" because a dead `:53` is a named, fixable cause and being cut
-    // off is a guess.
+    // the upstream warning because it names a specific local listener failure.
     if let Some(b) = &f.dns_blocked {
         return blocked(b, &f.relay_exe);
     }
     if f.cut_off {
-        match f.net_ok {
-            Some(true) => {
-                return Headline {
-                    tone: Tone::Action,
-                    title: "Антивирус или файрвол не пропускает обход".into(),
-                    detail: format!(
-                        "Служба обхода уже несколько минут не может соединиться ни с одним \
-                         сервером, хотя у других программ интернет есть. Так бывает, когда её \
-                         блокирует антивирус или файрвол. Добавьте в исключения антивируса и в \
-                         разрешённые программы файрвола файл {} и нажмите «Починить».",
-                        exe_or_default(&f.relay_exe)
-                    ),
-                    action: Some(Action::Repair),
-                }
-            }
-            Some(false) => {
-                return Headline {
-                    tone: Tone::Off,
-                    title: "Нет подключения к интернету".into(),
-                    detail: "Ни служба обхода, ни анлокер не могут соединиться с серверами в \
-                             интернете. Проверьте подключение. Если интернет есть — антивирус \
-                             или файрвол мог заблокировать обе программы: добавьте их в \
-                             исключения."
-                        .into(),
-                    action: None,
-                }
-            }
-            None => {}
-        }
+        let probe = match f.net_ok {
+            Some(true) => "Отдельная проверка подключения из приложения прошла.",
+            Some(false) => "Отдельная проверка подключения из приложения не прошла.",
+            None => "Отдельная проверка подключения из приложения пока не подтверждена.",
+        };
+        return Headline {
+            tone: Tone::Action,
+            title: "Служба обхода не получает ответов".into(),
+            detail: format!("Служба обхода уже несколько минут не получает ответов от серверов в интернете. {probe}"),
+            action: None,
+        };
     }
 
     // A refusal newer than the newest answer is the live problem.
@@ -601,6 +628,11 @@ pub fn headline(f: &Facts) -> Headline {
         _ => false,
     };
     if refused_last {
+        if f.system_tcp {
+            return Headline { tone: Tone::Action, title: "Запрос завершился ошибкой 400".into(),
+                detail: "Локальное подключение проверяется отдельно от ответа Google. Повторите запрос и проверьте доступность сервиса и аккаунта.".into(),
+                action: None };
+        }
         // With the door shut, Antigravity's calls go around the bypass: that
         // is the cause, and «Чиним» would promise a fix the relay cannot make.
         if let Some(b) = &f.door_blocked {
@@ -627,9 +659,9 @@ pub fn headline(f: &Facts) -> Headline {
                 detail: format!(
                     "Последняя — {}. Обход перебирает пути сам, но ни один пока не сработал. \
                      Если у вас включён VPN или прокси, попробуйте выключить его или сменить сервер, \
-                     и отправьте сообщение ещё раз. Не помогло — {}",
-                    ago_text(ago),
-                    super::report::when_stuck()
+                     и отправьте сообщение ещё раз. Не помогло — нажмите «Сохранить отчёт» и \
+                     пришлите файл с рабочего стола в группу.",
+                    ago_text(ago)
                 ),
                 action: None,
             };
@@ -659,17 +691,22 @@ pub fn headline(f: &Facts) -> Headline {
         };
     }
 
+    if f.system_tcp {
+        return Headline { tone: Tone::Wait, title: "Локальный прокси готов".into(),
+            detail: "Локальный прокси подтверждён. Ответ модели проверяется отдельно в Antigravity.".into(), action: None };
+    }
+
     if let Some(ago) = f.answer {
         let route = f
             .route
             .as_deref()
             .filter(|r| !r.is_empty())
-            .map(|r| format!(" · путь: {r}"))
+            .map(|r| format!(" Маршрут по данным службы — {r}."))
             .unwrap_or_default();
         return Headline {
             tone: Tone::Ok,
-            title: "Работает".into(),
-            detail: format!("Модель ответила {}{route}.", ago_text(ago)),
+            title: "Ответ модели в журнале".into(),
+            detail: format!("Запись сделана {}.{route}", ago_text(ago)),
             action: None,
         };
     }
@@ -742,6 +779,22 @@ pub fn plural(n: u64, one: &'static str, few: &'static str, many: &'static str) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn vscode_antigravity_text_distinguishes_package_presence_and_incomplete_search() {
+        use VsCodeAntigravityObservation::{Found, Incomplete, NotFound};
+
+        for (observation, expected) in [
+            (Found, "пакет найден"),
+            (NotFound, "пакет не найден"),
+            (Incomplete, "не удалось проверить"),
+        ] {
+            assert_eq!(
+                vscode_antigravity_text(&observation).split_once(": "),
+                Some(("Antigravity для VS Code", expected))
+            );
+        }
+    }
+
     fn working() -> Facts {
         Facts {
             admin: true,
@@ -754,6 +807,20 @@ mod tests {
             relay_reporting: true,
             ..Facts::default()
         }
+    }
+
+    #[test]
+    fn system_tcp_reports_local_readiness_separately_from_model_response() {
+        let mut f = working();
+        f.system_tcp = true;
+        f.answer = Some(secs(20));
+        let h = headline(&f);
+        assert_eq!(h.title, "Локальный прокси готов");
+        assert_ne!(h.tone, Tone::Ok);
+        f.refusal = Some((secs(1), 12));
+        let h = headline(&f);
+        assert_eq!(h.title, "Запрос завершился ошибкой 400");
+        assert!(!h.detail.contains("выключить"));
     }
 
     fn secs(n: u64) -> Duration {
@@ -791,14 +858,13 @@ mod tests {
         };
         let h = headline(&f);
         assert_eq!(h.tone, Tone::Ok);
-        assert_eq!(h.title, "Работает");
-        assert!(h.detail.contains("1 минуту назад"), "{}", h.detail);
-        assert!(h.detail.contains("встроенный выход"), "{}", h.detail);
+        assert_eq!(h.title, "Ответ модели в журнале");
+        assert_eq!(h.detail, "Запись сделана 1 минуту назад. Маршрут по данным службы — встроенный выход.");
     }
 
     /// Found live: an answer, then a refusal, then quiet. Once the refusal is
-    /// older than the fixing window the card must not fall back to the answer
-    /// before it and say «Работает».
+    /// older than the fixing window the refusal still takes precedence over
+    /// the earlier logged answer.
     #[test]
     fn an_old_refusal_after_the_last_answer_asks_for_a_check_not_a_green_card() {
         let f = Facts {
@@ -809,7 +875,7 @@ mod tests {
         let h = headline(&f);
         assert_eq!(h.tone, Tone::Wait);
         assert_eq!(h.title, "Нужна проверка");
-        // And an answer after that same refusal is working again.
+        // A later logged answer can be shown again.
         let f = Facts {
             refusal: Some((secs(13 * 60), 0)),
             answer: Some(secs(60)),
@@ -864,12 +930,7 @@ mod tests {
         };
         let h = headline(&f);
         assert_eq!(h.tone, Tone::Action);
-        assert_eq!(
-            h.detail.contains("Сохранить отчёт"),
-            super::super::report::ENABLED,
-            "{}",
-            h.detail
-        );
+        assert!(h.detail.contains("Сохранить отчёт"), "{}", h.detail);
     }
 
     #[test]
@@ -934,8 +995,22 @@ mod tests {
     }
 
     #[test]
+    fn unknown_observation_precedes_stale_healthy_facts() {
+        for (admin, action) in [(true, Action::Repair), (false, Action::Elevate)] {
+            let f = Facts { observation_error: Some("наблюдение не удалось".into()),
+                answer: Some(secs(1)), admin, ..working() };
+            let h = headline(&f);
+            assert_eq!(h.tone, Tone::Wait);
+            assert_eq!(h.title, "Состояние службы не проверено");
+            assert_eq!(h.detail, "наблюдение не удалось");
+            assert_eq!(h.action, Some(action));
+        }
+    }
+
+    #[test]
     fn nothing_installed_is_said_without_a_button() {
-        let f = Facts {
+        #[allow(unused_mut)]
+        let mut f = Facts {
             installs_found: false,
             patch_on: false,
             bypass_on: false,
@@ -944,6 +1019,13 @@ mod tests {
         let h = headline(&f);
         assert_eq!(h.tone, Tone::Off);
         assert_eq!(h.action, None);
+        #[cfg(windows)]
+        {
+            f.installation_discovery_incomplete = true;
+            let incomplete = headline(&f);
+            assert_eq!(incomplete.title, "Не удалось проверить установки Antigravity");
+            assert_eq!(incomplete.action, None);
+        }
     }
 
     #[test]
@@ -970,10 +1052,9 @@ mod tests {
 
     #[test]
     fn an_acronym_stays_an_acronym_and_everything_else_gets_one_capital() {
-        assert_eq!(provider_name("dns-ai.ru"), "DNS-AI.ru");
-        assert_eq!(provider_name("eu.geohide.ru"), "eu.GeoHide.ru");
-        assert_eq!(provider_name("свой DNS"), "Свой DNS");
-        assert_eq!(provider_name("dns.example"), "DNS.EXAMPLE");
+        assert_eq!(provider_name("dns-ai.ru"), "DNS-AI.RU");
+        assert_eq!(provider_name("comss.one"), "Comss.one");
+        assert_eq!(provider_name("geohide.ru"), "Geohide.ru");
         // Must not panic on a name the pool could grow later.
         assert_eq!(provider_name(""), "");
         assert_eq!(provider_name("1.1.1.1"), "1.1.1.1");
@@ -1062,30 +1143,23 @@ mod tests {
         assert!(h.detail.contains("net stop winnat"), "{}", h.detail);
     }
 
-    /// A relay nothing answers: blocked if this window gets out, offline if it
-    /// does not, and no verdict before the window has asked.
     #[test]
-    fn a_cut_off_relay_is_told_apart_from_a_machine_with_no_internet() {
-        let blocked = Facts {
-            cut_off: true,
-            net_ok: Some(true),
-            ..working()
-        };
-        let h = headline(&blocked);
-        assert_eq!(h.title, "Антивирус или файрвол не пропускает обход");
-        assert_eq!(h.action, Some(Action::Repair));
-        let offline = Facts {
-            cut_off: true,
-            net_ok: Some(false),
-            ..working()
-        };
-        assert_eq!(headline(&offline).title, "Нет подключения к интернету");
-        let unasked = Facts {
-            cut_off: true,
-            net_ok: None,
-            ..working()
-        };
-        assert_eq!(headline(&unasked).title, "Всё включено");
+    fn upstream_warning_reports_probe_result_without_attributing_a_cause() {
+        for (net_ok, expected_probe) in [
+            (Some(true), "проверка подключения из приложения прошла"),
+            (Some(false), "проверка подключения из приложения не прошла"),
+            (None, "проверка подключения из приложения пока не подтверждена"),
+        ] {
+            let h = headline(&Facts { cut_off: true, net_ok, ..working() });
+            assert_eq!(h.tone, Tone::Action);
+            assert_eq!(h.action, None);
+            assert!(h.detail.contains("не получает ответов от серверов в интернете"), "{}", h.detail);
+            assert!(h.detail.contains(expected_probe), "{}", h.detail);
+            let visible = format!("{} {}", h.title, h.detail).to_lowercase();
+            for unsupported in ["антивирус", "файрвол", "брандмауэр", "исключен", "починить"] {
+                assert!(!visible.contains(unsupported), "{visible}");
+            }
+        }
     }
 
     /// Google stopped the account: the card says so above everything, red, with

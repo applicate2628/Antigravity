@@ -176,8 +176,8 @@ pub fn dev_break_frame() {
 // The record of what this machine can run
 // ---------------------------------------------------------------------------
 
-fn record_path() -> std::path::PathBuf {
-    crate::dns_forwarder::log_dir().join("renderer.txt")
+fn record_path() -> Result<std::path::PathBuf, String> {
+    crate::dns_forwarder::checked_log_dir().map(|dir| dir.join("renderer.txt"))
 }
 
 /// `ok <kind> <version>` or `trying <kind> <version>`, one line.
@@ -187,7 +187,7 @@ fn record_path() -> std::path::PathBuf {
 /// the software renderer by one bad start long ago. A machine that really
 /// cannot run DirectX 12 pays one relaunch per version for that.
 fn read_record() -> Option<(bool, Kind)> {
-    let text = std::fs::read_to_string(record_path()).ok()?;
+    let text = std::fs::read_to_string(record_path().ok()?).ok()?;
     let mut parts = text.split_whitespace();
     let (state, kind, version) = (parts.next()?, parts.next()?, parts.next()?);
     if version != crate::update::current_version() {
@@ -197,7 +197,7 @@ fn read_record() -> Option<(bool, Kind)> {
 }
 
 fn write_record(ok: bool, kind: Kind) {
-    let path = record_path();
+    let Ok(path) = record_path() else { return; };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
     }
@@ -209,7 +209,9 @@ fn write_record(ok: bool, kind: Kind) {
 }
 
 pub fn forget() {
-    std::fs::remove_file(record_path()).ok();
+    if let Ok(path) = record_path() {
+        std::fs::remove_file(path).ok();
+    }
 }
 
 /// Where this start begins. An explicit choice wins; then what the last start
