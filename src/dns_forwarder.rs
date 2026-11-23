@@ -2565,6 +2565,7 @@ fn spawn_proxy_env_maintainer(root: std::sync::Arc<crate::command_lifetime::Comm
             Ok(false) => {}
             Err(e) => log_proxy(&format!("прежняя HTTPS_PROXY не снята: {}", e)),
         }
+        #[cfg(not(target_os = "macos"))]
         let mut waiting_said = false;
         loop {
             // The port that answered is the one named: the proxy may have moved
@@ -2583,6 +2584,14 @@ fn spawn_proxy_env_maintainer(root: std::sync::Arc<crate::command_lifetime::Comm
                 environment_result = command.failure().map_or(Ok(()), Err);
                 if let Err(error) = &environment_result { log_proxy(&format!("поздний результат изменения среды: {error}")); }
             }
+            #[cfg(target_os = "macos")]
+            match crate::endpoint::reconcile_mac_proxy(crate::endpoint::MacProxyAction::Relay, None) {
+                Ok(true) => log_proxy(&format!("{}: среда локального прокси обновлена", var)),
+                Ok(false) => {},
+                Err(error) => log_proxy(&format!("{}: среда локального прокси не подтверждена: {error}", var)),
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
             let received_listener = proxy::wait_for_our_listener(&root, PROXY_START_BUDGET);
             let port = match received_listener {
                 Ok(Some(port)) => port,
@@ -2657,6 +2666,7 @@ fn spawn_proxy_env_maintainer(root: std::sync::Arc<crate::command_lifetime::Comm
                     Err(e) => log_proxy(&format!("{} не снята: {}", var, e)),
                 }
                 }
+            }
             }
             thread::sleep(proxy::REBIND_EVERY);
         }

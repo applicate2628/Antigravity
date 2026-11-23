@@ -4238,14 +4238,22 @@ fn save_received_settings(staged: &Settings) -> Result<Settings, String> {
 fn commit_transport(ctx: &mut Ctx, choices: impl IntoIterator<Item = TransportChoice>) -> Result<(), String> {
     let mut staged = ctx.settings.clone();
     let mut changed = false;
+    #[cfg(target_os = "macos")]
+    let mut proxy_intent_changed = false;
     for choice in choices {
         if matches!(choice, TransportChoice::BuiltinExits(true)) && !proxy::exits_available() {
             return Err("Встроенные выходы недоступны; включение не выполнено.".into());
         }
+        #[cfg(target_os = "macos")]
+        let proxy_choice = matches!(choice, TransportChoice::LocalProxy(_));
         let edit = staged.set_transport_choice(choice)?;
+        #[cfg(target_os = "macos")]
+        { proxy_intent_changed |= proxy_choice && (edit.value_changed || edit.presence_changed); }
         changed |= edit.value_changed || edit.presence_changed;
     }
     if changed {
+        #[cfg(target_os = "macos")]
+        let _proxy_guard = proxy_intent_changed.then(crate::instances::acquire_proxy_environment_writer).transpose()?;
         ctx.settings = save_received_settings(&staged)?;
     }
     Ok(())
@@ -5365,7 +5373,10 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
     #[cfg(windows)] plan: &AllTargetApplyPlan) -> Result<(), String> {
     if cancellation.load(Ordering::SeqCst) { return Ok(()); }
     #[cfg(target_os = "macos")]
-    let mac_relay = crate::proxy::checked_listener_answers()?;
+    let mac_proxy_wish = endpoint::mac_proxy_wish(wanted)?;
+    #[cfg(target_os = "macos")]
+    let mac_relay_migrated = mac_proxy_wish == Some(false)
+        && reconcile_mac_off_for_routes(ctx, routes_want_relay_without_proxy_var(wanted))?;
     #[cfg(windows)]
     let Some(mut native) = ctx.with_command(|owner| inspect_native_apply(owner, wanted, cancellation, ctx.lifetime.retained_image()))? else { return Ok(()); };
     #[cfg(windows)]
@@ -5447,32 +5458,27 @@ fn reconcile_native(ctx: &mut Ctx, wanted: &Settings, cancellation: &AtomicBool,
     }
     #[cfg(not(windows))]
     {
+    #[cfg(not(target_os = "macos"))]
     let rules = ctx.with_command(dns::is_nrpt_applied)?;
-    #[cfg(target_os = "macos")]
-    let relay = mac_relay;
     #[cfg(not(target_os = "macos"))]
     let relay = background::is_running();
-    #[cfg(target_os = "macos")]
-    let relay_outdated = if routes_want_relay(wanted) || (Cap::Dns.supported() && wanted.dns) {
-        background::checked_relay_outdated().map_err(|error| format!("Версия службы не подтверждена: {error}"))?
-    } else { false };
     #[cfg(not(target_os = "macos"))]
     let relay_outdated = background::relay_is_outdated();
+    #[cfg(not(target_os = "macos"))]
     if Cap::Dns.supported() && wanted.dns && (!rules || !relay || relay_outdated) {
         if cfg!(windows) && !is_admin() { ctx.log(Level::Warn, "Для применения DNS нужны права администратора."); }
         else { enable_dns_effect(ctx)?; }
     } else if Cap::Dns.supported() && !wanted.dns && rules { disable_dns_effect(ctx)?; }
     if cancellation.load(Ordering::SeqCst) { return Ok(()); }
+    #[cfg(not(target_os = "macos"))]
     let local_applied = endpoint::proxy_env_is_ours();
     #[cfg(target_os = "macos")]
     {
-        if mac_route_needs_relay(wanted, relay, relay_outdated) {
+        if routes_want_relay(wanted) && !mac_relay_migrated {
             background::ensure_running().map_err(|error| format!("Служба обхода не запустилась: {error}"))?;
         }
         if cancellation.load(Ordering::SeqCst) { return Ok(()); }
-        if wanted.local_proxy && (!local_applied || !relay || relay_outdated) {
-            enable_local_proxy_effect(ctx)?;
-        } else if !wanted.local_proxy && local_applied { disable_local_proxy_effect(ctx)?; }
+        if mac_proxy_wish == Some(true) { enable_local_proxy_effect(ctx)?; }
     }
     #[cfg(not(target_os = "macos"))]
     if wanted.local_proxy && (!local_applied || !background::is_running() || background::relay_is_outdated()) {
@@ -5550,6 +5556,10 @@ fn enable_all(ctx: &mut Ctx) -> Result<(), String> {
     // A proxy the user set up themselves stays theirs (G33): `enable_local_proxy`
     // says so and leaves ours off, which also keeps the loopback door shut.
     if !Cap::Dns.supported() {
+        #[cfg(target_os = "macos")]
+        if endpoint::mac_proxy_wish(&ctx.settings)?.is_none() {
+            commit_transport(ctx, [TransportChoice::LocalProxy(true)])?;
+        }
         ensure_route_carrier(ctx)?;
     } else if !ctx.proxy_env_is_ours()? {
         apply(ctx, Cap::LocalProxy, true)?;
@@ -5639,11 +5649,14 @@ fn repair(ctx: &mut Ctx) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
+        let proxy_wish = endpoint::mac_proxy_wish(&ctx.settings)?;
+        let other_route = routes_want_relay_without_proxy_var(&ctx.settings);
+        let migrated = proxy_wish == Some(false) && reconcile_mac_off_for_routes(ctx, other_route)?;
         if !routes_want_relay(&ctx.settings) {
             return Err("Нет выбранных поддерживаемых маршрутов для восстановления.".into());
         }
-        background::enable().map_err(|error| format!("Служба обхода не подготовлена: {error}"))?;
-        if ctx.settings.local_proxy {
+        if !migrated { background::enable().map_err(|error| format!("Служба обхода не подготовлена: {error}"))?; }
+        if proxy_wish == Some(true) {
             enable_local_proxy_effect(ctx)?;
         }
         return Ok(());
@@ -6115,7 +6128,7 @@ fn revert_client_primary(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&AllTargetA
         disable_local_proxy_effect(ctx)?;
     }
     #[cfg(target_os = "macos")]
-    if !ctx.settings.local_proxy {
+    if endpoint::mac_proxy_wish(&ctx.settings)? == Some(false) {
         disable_local_proxy_effect(ctx)?;
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
@@ -6339,12 +6352,39 @@ fn stop_relay_effect(ctx: &mut Ctx) -> Result<(), String> {
 /// Whether something other than the DNS rules needs the relay running: the
 /// proxy listener and every route it serves live inside it.
 fn routes_want_relay(s: &Settings) -> bool {
-    s.local_proxy || s.own_proxy_enabled || s.group_proxy || (s.builtin_exits && proxy::exits_available())
+    #[cfg(target_os = "macos")]
+    let local = endpoint::mac_proxy_wish(s) == Ok(Some(true));
+    #[cfg(not(target_os = "macos"))]
+    let local = s.local_proxy;
+    local || routes_want_relay_without_proxy_var(s)
 }
 
 #[cfg(target_os = "macos")]
-fn mac_route_needs_relay(s: &Settings, relay: bool, outdated: bool) -> bool {
-    routes_want_relay(s) && (!relay || outdated)
+fn receive_mac_off_for_routes(other_route: bool, mut off: impl FnMut() -> Result<bool, endpoint::MacProxyFailure>,
+    migrate: impl FnOnce() -> Result<(), String>) -> Result<bool, String>
+{
+    match off() {
+        Ok(_) => Ok(false),
+        Err(error @ endpoint::MacProxyFailure::LegacyUnbound) if other_route => {
+            migrate().map_err(|migration| format!("{error}; служба другого выбранного маршрута: {migration}"))?;
+            off().map_err(|retry| format!("служба маршрута получена, но прокси не снят: {retry}"))?;
+            Ok(true)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_mac_off_for_routes(ctx: &Ctx, other_route: bool) -> Result<bool, String> {
+    let cancel = &ctx.native_cancel;
+    let migrated = receive_mac_off_for_routes(other_route,
+        || endpoint::attempt_mac_proxy(endpoint::MacProxyAction::Disable, Some(cancel)),
+        || {
+            if cancel.load(Ordering::SeqCst) { return Err("Подготовка службы отменена.".into()); }
+            background::ensure_running()
+        })?;
+    ctx.log(Level::Ok, "Локальный прокси отключён.");
+    Ok(migrated)
 }
 
 /// A route that was switched on by itself has to have something to ride on.
@@ -6360,8 +6400,13 @@ fn ensure_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
     if cfg!(target_os = "windows") && !is_admin() {
         return Err("Служба обхода не запущена: нужны права администратора. Нажмите «Перезапустить от имени администратора».".into());
     }
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     if !ctx.settings.local_proxy {
+        commit_transport(ctx, [TransportChoice::LocalProxy(true)])?;
+        ctx.carrier_set_proxy = true;
+    }
+    #[cfg(target_os = "macos")]
+    if endpoint::mac_proxy_wish(&ctx.settings)? == Some(false) {
         commit_transport(ctx, [TransportChoice::LocalProxy(true)])?;
         ctx.carrier_set_proxy = true;
     }
@@ -6379,11 +6424,14 @@ fn ensure_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
     // this is set (`loopback::is_up`).
     #[cfg(windows)]
     let local_wanted = specified_wish(&ctx.settings.checked_transport_effects()?.local_proxy) == Some(true);
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     let local_wanted = true;
+    #[cfg(not(target_os = "macos"))]
     if local_wanted && !ctx.proxy_env_is_ours()? {
         enable_local_proxy_effect(ctx)?;
     }
+    #[cfg(target_os = "macos")]
+    if endpoint::mac_proxy_wish(&ctx.settings)? == Some(true) { enable_local_proxy_effect(ctx)?; }
     Ok(())
 }
 
@@ -6407,9 +6455,12 @@ fn release_route_carrier(ctx: &mut Ctx) -> Result<(), String> {
     if ctx.carrier_set_proxy {
         commit_transport(ctx, [TransportChoice::LocalProxy(false)])?;
         ctx.carrier_set_proxy = false;
+        #[cfg(not(target_os = "macos"))]
         if ctx.proxy_env_is_ours()? {
             disable_local_proxy_effect(ctx)?;
         }
+        #[cfg(target_os = "macos")]
+        disable_local_proxy_effect(ctx)?;
     }
     // The local proxy switched on by the user keeps the service.
     if ctx.settings.local_proxy {
@@ -6490,13 +6541,18 @@ fn enable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
     //    is not a "skip".
     #[cfg(windows)]
     let foreign = ctx.with_command(|owner| endpoint::foreign_proxy(owner, &url))?;
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     let foreign = endpoint::foreign_proxy(&url);
+    #[cfg(target_os = "macos")]
+    let foreign = endpoint::checked_mac_foreign_proxy(&url)?.then_some(());
     if foreign.is_some() {
         #[cfg(windows)]
         ctx.with_command(|owner| endpoint::remove_proxy(owner, &url, "")).map_err(|error| format!("Своя переменная прокси не снята при чужом прокси: {error}"))?;
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(target_os = "macos")))]
         endpoint::remove_proxy(&url, "").map_err(|error| format!("Своя переменная прокси не снята при чужом прокси: {error}"))?;
+        #[cfg(target_os = "macos")]
+        endpoint::reconcile_mac_proxy(endpoint::MacProxyAction::Foreign, Some(&ctx.native_cancel))
+            .map_err(|error| format!("Своя переменная прокси не снята при чужом прокси: {error}"))?;
         return Err("В системе задан свой прокси — наш не включён, чтобы не перехватывать чужой. Выбор сохранён.".into());
     }
 
@@ -6545,24 +6601,32 @@ fn enable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
     };
     #[cfg(windows)]
     if port == 0 { return Err("Получен недопустимый порт локального прокси.".into()); }
+    #[cfg(not(target_os = "macos"))]
     let url = proxy::url_at(port);
 
     #[cfg(windows)]
     ctx.with_command(|owner| endpoint::apply_proxy(owner, &url, "")).map_err(|error| format!("Локальный прокси не включён: {error}"))?;
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     endpoint::apply_proxy(&url, "").map_err(|error| format!("Локальный прокси не включён: {error}"))?;
+    #[cfg(target_os = "macos")]
+    endpoint::reconcile_mac_proxy(endpoint::MacProxyAction::Enable, Some(&ctx.native_cancel))
+        .map_err(|error| format!("Локальный прокси не включён: {error}"))?;
     ctx.log(Level::Ok, "Локальный прокси включён.");
     Ok(())
 }
 
 fn disable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
     let url = proxy::proxy_url();
     // I45 again: `remove_proxy` collects its own failures and joins them, so a
     // half-failed removal still takes off everything it can.
     #[cfg(windows)]
     ctx.with_command(|owner| endpoint::remove_proxy(owner, &url, "")).map_err(|error| format!("Снято не полностью: {error}"))?;
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     endpoint::remove_proxy(&url, "").map_err(|error| format!("Снято не полностью: {error}"))?;
+    #[cfg(target_os = "macos")]
+    endpoint::reconcile_mac_proxy(endpoint::MacProxyAction::Disable, Some(&ctx.native_cancel))
+        .map_err(|error| format!("Снято не полностью: {error}"))?;
     ctx.log(Level::Ok, "Локальный прокси отключён.");
     Ok(())
 }
@@ -7983,7 +8047,7 @@ mod tests {
         s.own_proxy_enabled = false;
         s.group_proxy = false;
         s.builtin_exits = false;
-        assert!(!mac_route_needs_relay(&s, false, false));
+        assert!(!routes_want_relay(&s));
         let selectors: [fn(&mut Settings); 2] = [
             |s: &mut Settings| s.own_proxy_enabled = true,
             |s: &mut Settings| s.group_proxy = true,
@@ -7991,13 +8055,11 @@ mod tests {
         for select in selectors {
             let mut wanted = s.clone();
             select(&mut wanted);
-            assert!(mac_route_needs_relay(&wanted, false, false));
-            assert!(mac_route_needs_relay(&wanted, true, true));
-            assert!(!mac_route_needs_relay(&wanted, true, false));
+            assert!(routes_want_relay(&wanted));
             assert!(!wanted.local_proxy);
         }
         s.builtin_exits = true;
-        assert_eq!(mac_route_needs_relay(&s, false, false), proxy::exits_available());
+        assert_eq!(routes_want_relay(&s), proxy::exits_available());
     }
 
     #[cfg(target_os = "macos")]
@@ -8012,10 +8074,9 @@ mod tests {
         off.own_proxy_enabled = false;
         off.group_proxy = false;
         off.builtin_exits = false;
-        assert!(!mac_route_needs_relay(&off, true, true));
+        assert!(!routes_want_relay(&off));
         off.group_proxy = true;
-        assert!(mac_route_needs_relay(&off, true, true));
-        assert!(!mac_route_needs_relay(&off, true, false));
+        assert!(routes_want_relay(&off));
     }
 
     /// Live: what a switch actually costs, which is the complaint this was built

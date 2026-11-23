@@ -363,14 +363,17 @@ impl ListenerGuard {
         }
         self.env_checked_at = Some(std::time::Instant::now());
         let url = crate::proxy::proxy_url();
+        #[cfg(not(target_os = "macos"))]
         let ca = crate::proxy::ca_cert_path().to_string_lossy().to_string();
         #[cfg(windows)]
         let removal = match root.call_with_outcome("watchdog proxy removal", |owner| crate::endpoint::remove_proxy_if_ours(owner, &url, &ca)) {
             Ok((result, receipt)) => { if receipt.pending() { self.pending_command = Some(receipt); } result },
             Err(error) => Err(error),
         };
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(target_os = "macos")))]
         let removal = { let _ = root; crate::endpoint::remove_proxy_if_ours(&url, &ca) };
+        #[cfg(target_os = "macos")]
+        let removal = { let _ = root; crate::endpoint::reconcile_mac_proxy(crate::endpoint::MacProxyAction::Watchdog, None) };
         #[cfg(windows)]
         { self.command_result = Some(removal.as_ref().map(|_| ()).map_err(Clone::clone)); }
         match removal {

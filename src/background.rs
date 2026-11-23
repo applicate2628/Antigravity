@@ -3523,6 +3523,14 @@ mod macos_impl {
         Ok(directory)
     }
 
+    pub(crate) fn in_owned_macos_directory<T>(path: &Path, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let uid = unsafe { libc::geteuid() };
+        let directory = owned_directory(path, uid)?;
+        let result = action()?;
+        recheck_directory(path, &directory, uid)?;
+        Ok(result)
+    }
+
     fn owned_child_directory(parent: &fs::File, parent_path: &Path, name: &str, uid: u32)
         -> Result<fs::File, String> {
         recheck_directory(parent_path, parent, uid)?;
@@ -3714,6 +3722,159 @@ mod macos_impl {
             if let Some(prior) = &self.prior { self.remove_exact(self.stage_name, prior)?; }
             Ok(())
         }
+    }
+
+    fn profile_snapshot(file: &fs::File) -> Result<(fs::Metadata, Vec<u8>), String> {
+        let mut input = file.try_clone().map_err(|error| error.to_string())?;
+        let before = input.metadata().map_err(|error| error.to_string())?;
+        input.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+        let mut content = Vec::new();
+        input.read_to_end(&mut content).map_err(|error| error.to_string())?;
+        let after = input.metadata().map_err(|error| error.to_string())?;
+        if !same_profile_stamp(&before, &after) {
+            return Err("файл изменился во время чтения".into());
+        }
+        Ok((after, content))
+    }
+
+    fn same_profile_metadata(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+        first.uid() == second.uid() && first.gid() == second.gid() && first.mode() == second.mode()
+            && first.mtime() == second.mtime() && first.mtime_nsec() == second.mtime_nsec()
+    }
+
+    fn same_profile_stamp(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+        same_profile_metadata(first, second) && first.len() == second.len()
+            && first.ctime() == second.ctime() && first.ctime_nsec() == second.ctime_nsec()
+    }
+
+    /// Reuse the checked same-directory publisher for one user-owned text file.
+    pub(crate) fn edit_owned_macos_file(
+        directory: &Path, name: &'static str, stage_name: &'static str, apply: bool,
+        edit: impl FnOnce(Option<&[u8]>) -> Result<Option<Vec<u8>>, String>,
+        before_publish: impl FnOnce() -> Result<(), String>,
+        after_publish: impl FnOnce() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let uid = unsafe { libc::geteuid() };
+        let parent = owned_directory(directory, uid)?;
+        let path = directory.join(name);
+        let component = std::ffi::CString::new(name).map_err(|_| "неверное имя профиля")?;
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), component.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        let prior = if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound { None }
+            else { return Err(format!("открытие профиля: {error}")); }
+        } else {
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            recheck_file(&path, &file, uid)?;
+            Some(file)
+        };
+        recheck_directory(directory, &parent, uid)?;
+        let snapshot = prior.as_ref().map(profile_snapshot).transpose()?;
+        let Some(replacement) = edit(snapshot.as_ref().map(|(_, bytes)| bytes.as_slice()))? else {
+            recheck_directory(directory, &parent, uid)?;
+            if let (Some(file), Some((metadata, bytes))) = (&prior, &snapshot) {
+                recheck_file(&path, file, uid)?;
+                let (current, content) = profile_snapshot(file)?;
+                if !same_profile_metadata(metadata, &current) || content != *bytes {
+                    return Err("содержимое профиля изменилось".into());
+                }
+            } else if entry_id(&path, uid)?.is_some() {
+                return Err("профиль появился во время проверки".into());
+            }
+            if apply { after_publish()?; }
+            return Ok(false);
+        };
+        if !apply { return Ok(true); }
+
+        let mut stage = StagedFile::create(&parent, directory, name, stage_name, prior, uid, 0o600)?;
+        let mut verified_publication = None;
+        let publication = (|| -> Result<(), String> {
+            write_stage(&mut stage, &replacement, 0o600)?;
+            if let (Some(file), Some((metadata, _))) = (&stage.prior, &snapshot) {
+                let status = unsafe { libc::fcopyfile(file.as_raw_fd(), stage.staged.as_raw_fd(),
+                    std::ptr::null_mut(), libc::COPYFILE_METADATA) };
+                if status != 0 { return Err(format!("копирование метаданных профиля: {}", std::io::Error::last_os_error())); }
+                let (staged_metadata, _) = profile_snapshot(&stage.staged)?;
+                if !same_profile_metadata(metadata, &staged_metadata) { return Err("метаданные профиля не сохранены".into()); }
+                stage.staged.sync_all().map_err(|error| error.to_string())?;
+            }
+            if let (Some(file), Some((metadata, bytes))) = (&stage.prior, &snapshot) {
+                let (current, content) = profile_snapshot(file)?;
+                if !same_profile_stamp(metadata, &current) || content != *bytes {
+                    return Err("исходный профиль изменился перед заменой".into());
+                }
+            }
+            before_publish()?;
+            // The boundary check may take time. Recheck the stable file stamp again
+            // immediately before exchanging names.
+            if let (Some(file), Some((metadata, _))) = (&stage.prior, &snapshot) {
+                let current = file.metadata().map_err(|error| error.to_string())?;
+                if !same_profile_stamp(metadata, &current) {
+                    return Err("исходный профиль изменился перед заменой".into());
+                }
+            }
+            stage.publish()?;
+            let verify = || -> Result<(fs::Metadata, Option<fs::Metadata>), String> {
+                recheck_file(&path, &stage.staged, uid)?;
+                let (published, actual) = profile_snapshot(&stage.staged)?;
+                if actual != replacement { return Err("новое содержимое профиля не подтверждено".into()); }
+                let previous = if let (Some(file), Some((metadata, bytes))) = (&stage.prior, &snapshot) {
+                    let (displaced, content) = profile_snapshot(file)?;
+                    if !same_profile_metadata(metadata, &published) || !same_profile_metadata(metadata, &displaced) || content != *bytes {
+                        return Err("метаданные или вытесненный профиль изменились при замене".into());
+                    }
+                    Some(displaced)
+                } else { None };
+                Ok((published, previous))
+            };
+            let (published, previous) = verify()?;
+            verified_publication = Some((published.clone(), previous.clone()));
+            after_publish()?;
+            let (current, displaced) = verify()?;
+            let same_displaced = match (previous, displaced) {
+                (Some(before), Some(after)) => same_profile_stamp(&before, &after),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same_profile_stamp(&published, &current) || !same_displaced {
+                return Err("состояние профиля изменилось до завершения операции".into());
+            }
+            Ok(())
+        })();
+        if let Err(primary) = publication {
+            let may_restore = stage.position().and_then(|position| {
+                if position != StagePosition::Published { return Ok(()); }
+                let (published, displaced) = verified_publication.as_ref()
+                    .ok_or("прежнее и опубликованное состояния не подтверждены")?;
+                recheck_file(&path, &stage.staged, uid)?;
+                let (metadata, current) = profile_snapshot(&stage.staged)?;
+                if current != replacement || !same_profile_stamp(published, &metadata) {
+                    return Err("опубликованный профиль изменился".into());
+                }
+                match (&stage.prior, &snapshot, displaced) {
+                    (Some(file), Some((_, before)), Some(stamp)) => {
+                        recheck_file(&stage.stage_path(), file, uid)?;
+                        let (metadata, contents) = profile_snapshot(file)?;
+                        if contents != *before || !same_profile_stamp(stamp, &metadata) {
+                            return Err("вытесненный исходный профиль изменился".into());
+                        }
+                    }
+                    (None, None, None) => {},
+                    _ => return Err("исходный профиль для восстановления не подтверждён".into()),
+                }
+                Ok(())
+            });
+            if let Err(readback) = may_restore {
+                return Err(format!("{primary}; восстановление не начато, файлы сохранены: {readback}"));
+            }
+            return match stage.rollback() {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(format!("{primary}; профиль не восстановлен: {rollback}; положение: {:?}", stage.position())),
+            };
+        }
+        stage.settle_success().map_err(|error| format!("новый профиль подтверждён, прежняя копия не закрыта: {error}"))?;
+        Ok(true)
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4355,6 +4516,49 @@ mod macos_impl {
         role_running(Role::Proxy, port, None)
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ProxyEnvironmentProfile { Qualified, LegacyUnbound }
+
+    /// Receive the proxy generation's settings owner without probing its listener.
+    pub(crate) fn check_proxy_environment_profile(home: &Path) -> Result<ProxyEnvironmentProfile, String> {
+        let profile = Profile::capture()?;
+        if Path::new(&profile.home) != home { return Err("Домашний каталог службы изменился.".into()); }
+        let role = Role::Proxy;
+        let uid = unsafe { libc::geteuid() };
+        let plist = profile.plist(role);
+        let helper = profile.install_dir().join(role.helper());
+        let job = received_job(role, uid, &plist, &helper, &profile)?;
+        if job.is_none() { return Ok(ProxyEnvironmentProfile::Qualified); }
+        let plist_file = optional_owned_file(&plist, uid)?;
+        let helper_file = optional_owned_file(&helper, uid)?;
+        check_generation_presence(role, helper_file.is_some(), plist_file.is_some(), job.is_some())?;
+        let binding = if let (Some(plist_file), Some(helper_file)) = (&plist_file, &helper_file) {
+            let plist_digest = file_digest(plist_file)?;
+            let document = read_plist(&plist, plist_file, uid)?;
+            let pair = plist_generation(role, &document, &helper, &profile.log(role), &profile)?
+                .ok_or("Поколение службы не подтверждено.")?;
+            if job.as_ref().is_some_and(|job| job.generation.as_ref() != Some(&pair))
+                || !pair.helper_matches(&file_digest(helper_file)?)
+            {
+                return Err("Поколение службы не совпадает с полученным профилем.".into());
+            }
+            recheck_file(&plist, plist_file, uid)?;
+            recheck_file(&helper, helper_file, uid)?;
+            if file_digest(plist_file)? != plist_digest {
+                return Err("Определение службы изменилось во время проверки.".into());
+            }
+            match pair.profile {
+                JobProfile::Bound { .. } => ProxyEnvironmentProfile::Qualified,
+                JobProfile::LegacyProxyUnbound => ProxyEnvironmentProfile::LegacyUnbound,
+            }
+        } else { return Err("Файлы зарегистрированной службы не подтверждены.".into()); };
+        let current = received_job(role, uid, &plist, &helper, &profile)?;
+        if current.as_ref().map(|job| &job.generation) != job.as_ref().map(|job| &job.generation) {
+            return Err("Регистрация службы изменилась во время проверки.".into());
+        }
+        Ok(binding)
+    }
+
     struct PriorWitness<'a> {
         plist: &'a fs::File, helper: &'a fs::File,
         plist_digest: &'a str, helper_digest: &'a str, pair: Option<&'a Generation>,
@@ -4824,6 +5028,19 @@ mod macos_impl {
         }
 
         #[test]
+        fn proxy_generation_compares_effective_xdg_profiles() {
+            let home = fixture_profile().home;
+            let default = Profile::from_values(Some(home.clone().into()), None).unwrap();
+            let explicit = Profile::from_values(Some(home.clone().into()), Some(default.xdg.clone().into())).unwrap();
+            let other = Profile::from_values(Some(home.clone().into()), Some(Path::new(&home).join("other-data").into_os_string())).unwrap();
+            let digest = "a".repeat(64);
+            let generation = |profile| definition_generation(Role::Proxy, Some(&digest), Some(&digest),
+                Some(&home), Some(&default.xdg), profile);
+            assert_eq!(generation(&default).unwrap(), generation(&explicit).unwrap());
+            assert!(generation(&other).is_err());
+        }
+
+        #[test]
         fn legacy_proxy_needs_migration_and_partial_profiles_never_gain_ownership() {
             let profile = fixture_profile();
             let helper = profile.install_dir().join(Role::Proxy.helper());
@@ -4943,6 +5160,71 @@ mod macos_impl {
             assert_eq!(stage_position(None, None, fresh, None), StagePosition::Conflict);
             assert_eq!(stage_position(Some(fresh), Some((7, 13)), fresh, Some(old)), StagePosition::Conflict);
             assert_eq!(stage_position(Some(old), Some(old), fresh, Some(old)), StagePosition::Conflict);
+        }
+
+        #[test]
+        #[ignore = "requires a private AG_MAC_PROFILE_TEST_ROOT"]
+        fn mac_profile_publisher_preserves_metadata_and_concurrent_preimage() {
+            use std::os::unix::fs::DirBuilderExt;
+
+            let parent = PathBuf::from(std::env::var_os("AG_MAC_PROFILE_TEST_ROOT").expect("private fixture parent"));
+            let owned_parent = owned_directory(&parent, unsafe { libc::geteuid() }).unwrap();
+            let root = parent.join(format!("ag-profile-fixture-{}", std::process::id()));
+            fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+            recheck_directory(&parent, &owned_parent, unsafe { libc::geteuid() }).unwrap();
+            let profile = root.join(".zprofile");
+            let stage_name = ".zprofile.agunlocker-stage";
+            fs::write(&profile, b"original\r\n").unwrap();
+            fs::set_permissions(&profile, fs::Permissions::from_mode(0o640)).unwrap();
+            let prior = fs::File::open(&profile).unwrap();
+            let key = c"com.agunlocker.synthetic-profile";
+            let attribute = b"fixture";
+            assert_eq!(unsafe { libc::fsetxattr(prior.as_raw_fd(), key.as_ptr(), attribute.as_ptr().cast(), attribute.len(), 0, 0) }, 0);
+            let metadata = prior.metadata().unwrap();
+
+            assert!(edit_owned_macos_file(&root, ".zprofile", stage_name, true, |bytes| {
+                assert_eq!(bytes, Some(b"original\r\n".as_slice()));
+                Ok(Some(b"new\r\n".to_vec()))
+            }, || Ok(()), || Ok(())).unwrap());
+            let published = fs::File::open(&profile).unwrap();
+            assert!(same_profile_metadata(&metadata, &published.metadata().unwrap()));
+            let mut copied = [0u8; 7];
+            assert_eq!(unsafe { libc::fgetxattr(published.as_raw_fd(), key.as_ptr(), copied.as_mut_ptr().cast(), copied.len(), 0, 0) }, 7);
+            assert_eq!(&copied, attribute);
+            assert_eq!(profile_snapshot(&prior).unwrap().1, b"original\r\n", "the open old descriptor retains its old inode");
+
+            let error = edit_owned_macos_file(&root, ".zprofile", stage_name, true,
+                |_| Ok(Some(b"temporary publication".to_vec())), || Ok(()), || {
+                    assert_eq!(fs::read(&profile).unwrap(), b"temporary publication");
+                    Err("synthetic later shared guard failure".into())
+                }).unwrap_err();
+            assert!(error.contains("synthetic later shared guard failure"));
+            assert_eq!(fs::read(&profile).unwrap(), b"new\r\n");
+            assert!(!root.join(stage_name).exists());
+
+            let error = edit_owned_macos_file(&root, ".zprofile", stage_name, true,
+                |_| Ok(Some(b"replacement".to_vec())),
+                || fs::write(&profile, b"concurrent edit").map_err(|error| error.to_string()),
+                || Ok(())).unwrap_err();
+            assert!(error.contains("исходный профиль изменился"));
+            assert_eq!(fs::read(&profile).unwrap(), b"concurrent edit");
+            assert!(!root.join(stage_name).exists());
+
+            let mut displaced_editor = fs::OpenOptions::new().read(true).write(true).open(&profile).unwrap();
+            let error = edit_owned_macos_file(&root, ".zprofile", stage_name, true,
+                |_| Ok(Some(b"published profile".to_vec())), || Ok(()), || {
+                    displaced_editor.set_len(0).unwrap();
+                    displaced_editor.write_all(b"external edit through retained descriptor").unwrap();
+                    displaced_editor.sync_all().unwrap();
+                    Err("synthetic later shared guard failure".into())
+                }).unwrap_err();
+            assert!(error.contains("synthetic later shared guard failure"));
+            assert!(error.contains("вытесненный исходный профиль изменился"));
+            assert_eq!(fs::read(&profile).unwrap(), b"published profile");
+            assert_eq!(fs::read(root.join(stage_name)).unwrap(), b"external edit through retained descriptor");
+            fs::remove_file(root.join(stage_name)).unwrap();
+            fs::remove_file(profile).unwrap();
+            fs::remove_dir(root).unwrap();
         }
 
         #[test]

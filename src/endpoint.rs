@@ -188,16 +188,28 @@ pub fn remove_ide(install: &Path) -> Result<(), String> {
 
 /// Removes the variable, but only when it still holds the value we wrote: a
 /// user (or another tool) may have pointed it somewhere themselves.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn remove_cli() -> Result<(), String> {
     if current_cli_endpoint().as_deref() != Some(DAILY_ENDPOINT) {
         return Ok(());
     }
-    #[cfg(target_os = "macos")]
-    {
-        set_env(CLI_ENV_VAR, None)?;
-    }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn remove_cli() -> Result<(), String> {
+    let (home, _guard) = crate::instances::acquire_proxy_environment_writer()?;
+    let live = mac_launch_value(CLI_ENV_VAR)?;
+    let mut receipt = MacEnvironmentReceipt::default();
+    let owns = |value: &str| value == DAILY_ENDPOINT;
+    let profiles = mac_profile_preflight(&home, CLI_ENV_VAR, None, owns, &mut receipt)?;
+    if live.as_deref() == Some(DAILY_ENDPOINT) {
+        if !receipt.record_launch_write(mac_write_launch_value(CLI_ENV_VAR, Some(DAILY_ENDPOINT), None, || Ok(()))) {
+            return receipt.finish().map(|_| ());
+        }
+    }
+    mac_publish_profiles(&home, profiles, || Ok(()), || Ok(()), &mut receipt);
+    receipt.finish().map(|_| ())
 }
 
 #[cfg(target_os = "windows")]
@@ -325,62 +337,6 @@ fn legacy_removals(https: Option<&str>, no_proxy: Option<&str>, url: &str) -> (b
     (drop_proxy, drop_proxy && no_proxy == Some(NO_PROXY_VALUE))
 }
 
-#[cfg(target_os = "macos")]
-fn sync_shell_file(path: &Path, name: &str, value: Option<&str>) -> std::io::Result<()> {
-    if !path.exists() && value.is_none() {
-        return Ok(());
-    }
-    let content = if path.exists() {
-        fs::read_to_string(path)?
-    } else {
-        String::new()
-    };
-    let start_marker = format!("# [{}_START]", name);
-    let end_marker = format!("# [{}_END]", name);
-
-    let mut new_lines: Vec<String> = Vec::new();
-    let mut skipping = false;
-    for line in content.lines() {
-        if line.trim() == start_marker {
-            skipping = true;
-            continue;
-        }
-        if line.trim() == end_marker {
-            skipping = false;
-            continue;
-        }
-        if !skipping {
-            new_lines.push(line.to_string());
-        }
-    }
-
-    if let Some(val) = value {
-        new_lines.push(start_marker);
-        new_lines.push(format!("export {}=\"{}\"", name, val));
-        new_lines.push(end_marker);
-    }
-
-    let mut result = new_lines.join("\n");
-    if !result.is_empty() && !result.ends_with('\n') {
-        result.push('\n');
-    }
-    fs::write(path, result)?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn sync_shell_env(name: &str, value: Option<&str>) {
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = PathBuf::from(home);
-        let zprofile = home_path.join(".zprofile");
-        let _ = sync_shell_file(&zprofile, name, value);
-        let zshrc = home_path.join(".zshrc");
-        if zshrc.exists() || value.is_none() {
-            let _ = sync_shell_file(&zshrc, name, value);
-        }
-    }
-}
-
 /// macOS leaves the standard proxy environment under the user's control.
 #[cfg(target_os = "macos")]
 pub fn remove_legacy_proxy_env(_url: &str) -> Result<bool, String> {
@@ -447,17 +403,407 @@ pub fn remove_legacy_proxy_env(url: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
-/// macOS: applies PROXY_ENV_VAR to launchd user session and shell profiles (~/.zprofile, ~/.zshrc).
 #[cfg(target_os = "macos")]
-pub fn apply_proxy(url: &str, ca_path: &str) -> Result<Outcome, String> {
-    if current_env(PROXY_ENV_VAR).as_deref() == Some(url) {
-        return Ok(Outcome::AlreadySet);
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MacProxyAction { Enable, Disable, Relay, Watchdog, Foreign }
+
+#[cfg(any(target_os = "macos", test))]
+fn mac_private_proxy(value: &str) -> bool {
+    value.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok())
+        .is_some_and(|port| port != 0 && crate::proxy::url_at(port) == value)
+}
+
+#[cfg(test)]
+fn mac_profile_replacement(bytes: &[u8], wanted: Option<&str>) -> Result<Option<Vec<u8>>, String> {
+    mac_managed_profile_replacement(bytes, PROXY_ENV_VAR, wanted, mac_private_proxy)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mac_managed_profile_replacement(bytes: &[u8], name: &str, wanted: Option<&str>, owned_value: impl Fn(&str) -> bool)
+    -> Result<Option<Vec<u8>>, String>
+{
+    let start_marker = format!("# [{name}_START]");
+    // Records that the one preceding LF was added to an unterminated line.
+    let joined_marker = format!("# [{name}_START_JOIN_LF]");
+    let end_marker = format!("# [{name}_END]");
+    let prefix = format!("export {name}=\"");
+    let reserved_markers = [format!("{name}_START"), format!("{name}_END")];
+
+    let mut lines = bytes.split_inclusive(|byte| *byte == b'\n');
+    let bare_len = |line: &[u8]| {
+        if line.ends_with(b"\r\n") { line.len() - 2 }
+        else if line.ends_with(b"\n") { line.len() - 1 } else { line.len() }
+    };
+    let mut position = 0;
+    let mut owned = None;
+    while let Some(line) = lines.next() {
+        let start = position;
+        position += line.len();
+        let marker = &line[..bare_len(line)];
+        if marker == start_marker.as_bytes() || marker == joined_marker.as_bytes() {
+            if owned.is_some() { return Err(format!("повторный блок {name}")); }
+            let export = lines.next().ok_or_else(|| format!("незавершённый блок {name}"))?;
+            let close = lines.next().ok_or_else(|| format!("незавершённый блок {name}"))?;
+            let export_end = bare_len(export);
+            let value = export[..export_end].strip_prefix(prefix.as_bytes()).and_then(|value| value.strip_suffix(b"\""))
+                .and_then(|value| std::str::from_utf8(value).ok()).filter(|value| owned_value(value))
+                .ok_or_else(|| format!("содержимое блока {name} не принадлежит программе"))?;
+            if &close[..bare_len(close)] != end_marker.as_bytes() || !close.ends_with(b"\n") {
+                return Err(format!("неверная граница блока {name}"));
+            }
+            position += export.len() + close.len();
+            let joined = marker == joined_marker.as_bytes();
+            if joined && (start < 2 || bytes[start - 2] == b'\n' || position != bytes.len()) {
+                return Err(format!("не подтверждён добавленный разделитель {name}"));
+            }
+            owned = Some((start - usize::from(joined), position, joined, value));
+        } else if marker.trim_ascii_start().starts_with(b"#") {
+            if reserved_markers.iter().any(|tag| marker.windows(tag.len()).any(|part| part == tag.as_bytes())) {
+                return Err(format!("неподтверждённая отметка блока {name}"));
+            }
+        } else if marker.windows(name.len()).enumerate().any(|(at, part)| {
+            if part != name.as_bytes() { return false; }
+            if at != 0 && (marker[at - 1].is_ascii_alphanumeric() || matches!(marker[at - 1], b'_' | b'$')) { return false; }
+            let tail = marker[at + name.len()..].trim_ascii_start();
+            tail.starts_with(b"=") || tail.starts_with(b"+=") || tail.starts_with(b"[")
+        }) {
+            return Err(format!("стороннее присваивание {name} вне управляемого блока"));
+        }
     }
-    set_env(PROXY_ENV_VAR, Some(url))?;
-    if !ca_path.is_empty() {
-        set_env(NODE_CA_ENV_VAR, Some(ca_path))?;
+
+    if owned.map(|(_, _, _, value)| value) == wanted { return Ok(None); }
+    let (start, end, joined) = owned.map(|(start, end, joined, _)| (start, end, joined))
+        .unwrap_or((bytes.len(), bytes.len(), !bytes.is_empty() && !bytes.ends_with(b"\n")));
+    let mut replacement = bytes[..start].to_vec();
+    if let Some(value) = wanted {
+        if !owned_value(value) { return Err(format!("неверное значение {name}")); }
+        if joined { replacement.push(b'\n'); }
+        replacement.extend(if joined { joined_marker.as_bytes() } else { start_marker.as_bytes() });
+        replacement.push(b'\n');
+        replacement.extend(prefix.as_bytes());
+        replacement.extend(value.as_bytes());
+        replacement.extend(b"\"\n");
+        replacement.extend(end_marker.as_bytes());
+        replacement.push(b'\n');
     }
-    Ok(Outcome::Applied)
+    replacement.extend(&bytes[end..]);
+    Ok(Some(replacement))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_proxy_check_cancel(cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
+    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+        return Err("Изменение локального прокси отменено.".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn mac_proxy_wish(settings: &crate::settings::Settings) -> Result<Option<bool>, String> {
+    use crate::settings::TransportWish::{Inactive, Set, Unspecified};
+    Ok(match settings.checked_transport_effects()?.local_proxy {
+        Set(value) => Some(value),
+        Inactive | Unspecified => None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn mac_saved_proxy_intent(cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<Option<bool>, String> {
+    mac_proxy_check_cancel(cancel)?;
+    match crate::settings::read() {
+        crate::settings::Read::Parsed(settings) => mac_proxy_wish(&settings),
+        crate::settings::Read::Missing => Ok(None),
+        _ => Err("Сохранённая настройка локального прокси не подтверждена.".into()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_launch_value(name: &str) -> Result<Option<String>, String> {
+    let output = std::process::Command::new("/bin/launchctl").args(["getenv", name])
+        .output().map_err(|error| format!("launchctl getenv: {error}"))?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(format!("launchctl getenv: {}", output.status));
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(|error| format!("launchctl getenv: {error}"))?;
+    let value = text.strip_suffix('\n').unwrap_or(text);
+    Ok((!value.is_empty()).then(|| value.to_owned()))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn checked_mac_foreign_proxy(ours: &str) -> Result<bool, String> {
+    let mut foreign = false;
+    for name in [LEGACY_PROXY_ENV_VAR, "https_proxy"] {
+        let live = mac_launch_value(name).map_err(|error| format!("{name}: {error}"))?;
+        foreign |= live.as_deref().is_some_and(|value| !value.trim().is_empty() && !is_our_proxy_value(value, ours));
+        if let Some(value) = std::env::var_os(name) {
+            foreign |= value.to_str().is_none_or(|value| !value.trim().is_empty() && !is_our_proxy_value(value, ours));
+        }
+    }
+    Ok(foreign || antigravity_proxy_setting(ours).is_some())
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+enum MacLaunchWriteFailure { Rejected(String), Unconfirmed(String) }
+
+#[cfg(any(target_os = "macos", test))]
+impl MacLaunchWriteFailure {
+    fn detail(&self) -> &str {
+        match self { Self::Rejected(error) | Self::Unconfirmed(error) => error }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mac_checked_launch_write(before: Option<&str>, wanted: Option<&str>,
+    mut read: impl FnMut() -> Result<Option<String>, String>, recheck: impl FnOnce() -> Result<(), String>,
+    write: impl FnOnce() -> Result<(), String>) -> Result<bool, MacLaunchWriteFailure>
+{
+    use MacLaunchWriteFailure::{Rejected, Unconfirmed};
+    if read().map_err(Rejected)?.as_deref() != before { return Err(Rejected("окружение launchd изменилось".into())); }
+    recheck().map_err(Rejected)?;
+    if before == wanted { return Ok(false); }
+    write().map_err(Rejected)?;
+    if read().map_err(Unconfirmed)?.as_deref() != wanted {
+        return Err(Unconfirmed("новое окружение launchd не совпадает с запрошенным".into()));
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_write_launch_value(name: &str, before: Option<&str>, wanted: Option<&str>, recheck: impl FnOnce() -> Result<(), String>)
+    -> Result<bool, MacLaunchWriteFailure>
+{
+    mac_checked_launch_write(before, wanted, || mac_launch_value(name), recheck, || {
+        let mut command = std::process::Command::new("/bin/launchctl");
+        if let Some(value) = wanted { command.args(["setenv", name, value]); }
+        else { command.args(["unsetenv", name]); }
+        let output = command.output().map_err(|error| format!("изменение среды launchd: {error}"))?;
+        if !output.status.success() || !output.stderr.is_empty() {
+            return Err(format!("изменение среды launchd: {}", output.status));
+        }
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct MacEnvironmentReceipt {
+    changed: Vec<&'static str>,
+    errors: Vec<String>,
+    launchd_unconfirmed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MacEnvironmentReceipt {
+    fn record(&mut self, surface: &'static str, result: Result<bool, String>) {
+        match result {
+            Ok(true) => self.changed.push(surface),
+            Ok(false) => {},
+            Err(error) => self.errors.push(format!("{surface}: {error}")),
+        }
+    }
+
+    fn note_launch_write(&mut self, result: &Result<bool, MacLaunchWriteFailure>) {
+        match result {
+            Ok(true) => self.changed.push("launchd"),
+            Err(MacLaunchWriteFailure::Unconfirmed(_)) => self.launchd_unconfirmed = true,
+            _ => {},
+        }
+    }
+
+    fn record_launch_write(&mut self, result: Result<bool, MacLaunchWriteFailure>) -> bool {
+        self.note_launch_write(&result);
+        if let Err(error) = result {
+            self.record("launchd", Err(error.detail().into()));
+            false
+        } else { true }
+    }
+
+    fn finish(mut self) -> Result<bool, String> {
+        if self.launchd_unconfirmed {
+            self.errors.push("Команда launchd выполнена; изменение могло произойти, итоговое значение не подтверждено.".into());
+        }
+        if self.errors.is_empty() { return Ok(!self.changed.is_empty()); }
+        if !self.changed.is_empty() {
+            self.errors.push(format!("Изменены и проверены: {}", self.changed.join(", ")));
+        }
+        Err(self.errors.join("; "))
+    }
+}
+
+#[cfg(target_os = "macos")]
+const MAC_SHELL_PROFILES: [(&str, &str); 2] = [
+    (".zprofile", ".zprofile.agunlocker-stage"), (".zshrc", ".zshrc.agunlocker-stage"),
+];
+
+#[cfg(target_os = "macos")]
+struct MacProfileEdit { before: Option<Vec<u8>>, replacement: Vec<u8> }
+
+#[cfg(target_os = "macos")]
+impl MacProfileEdit {
+    fn checked_replacement(self, current: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
+        if self.before.as_deref() == current { Ok(Some(self.replacement)) }
+        else { Err("профиль изменился после начальной проверки".into()) }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_profile_preflight(home: &Path, variable: &str, wanted: Option<&str>, owned_value: impl Fn(&str) -> bool,
+    receipt: &mut MacEnvironmentReceipt) -> Result<[Option<MacProfileEdit>; 2], String>
+{
+    let mut edits = [None, None];
+    for (index, (name, stage)) in MAC_SHELL_PROFILES.into_iter().enumerate() {
+        let mut conflict = None;
+        crate::background::edit_owned_macos_file(home, name, stage, false, |bytes| {
+            if bytes.is_none() && (index != 0 || wanted.is_none()) { return Ok(None); }
+            match mac_managed_profile_replacement(bytes.unwrap_or_default(), variable, wanted, &owned_value) {
+                Ok(Some(replacement)) => edits[index] = Some(MacProfileEdit { before: bytes.map(<[u8]>::to_vec), replacement }),
+                Ok(None) => {},
+                Err(error) => conflict = Some(error),
+            }
+            Ok(None)
+        }, || Ok(()), || Ok(())).map_err(|error| format!("{name}: {error}"))?;
+        if let Some(error) = conflict { receipt.record(name, Err(error)); }
+    }
+    Ok(edits)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_publish_profiles(home: &Path, edits: [Option<MacProfileEdit>; 2],
+    recheck: impl Fn() -> Result<(), String>, finish: impl FnOnce() -> Result<(), String>,
+    receipt: &mut MacEnvironmentReceipt)
+{
+    let [profile, rc] = edits;
+    let mut zshrc = false;
+    let next = || {
+        let (name, stage) = MAC_SHELL_PROFILES[1];
+        if let Some(edit) = rc {
+            zshrc = crate::background::edit_owned_macos_file(home, name, stage, true,
+                |bytes| edit.checked_replacement(bytes), &recheck, finish)
+                .map_err(|error| format!("{name}: {error}"))?;
+            Ok(())
+        } else { finish() }
+    };
+    let (name, stage) = MAC_SHELL_PROFILES[0];
+    if let Some(edit) = profile {
+        receipt.record(name, crate::background::edit_owned_macos_file(home, name, stage, true,
+            |bytes| edit.checked_replacement(bytes), &recheck, next));
+    } else if let Err(error) = next() { receipt.errors.push(error); }
+    receipt.record(MAC_SHELL_PROFILES[1].0, Ok(zshrc));
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub(crate) enum MacProxyFailure { LegacyUnbound, Failed(String) }
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for MacProxyFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LegacyUnbound => formatter.write_str("Каталог настроек прежней службы не подтверждён; её окружение сохранено."),
+            Self::Failed(error) => formatter.write_str(error),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<String> for MacProxyFailure {
+    fn from(error: String) -> Self { Self::Failed(error) }
+}
+
+#[cfg(target_os = "macos")]
+impl From<&str> for MacProxyFailure {
+    fn from(error: &str) -> Self { Self::Failed(error.into()) }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn reconcile_mac_proxy(action: MacProxyAction, cancel: Option<&std::sync::atomic::AtomicBool>)
+    -> Result<bool, String>
+{
+    attempt_mac_proxy(action, cancel).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn attempt_mac_proxy(action: MacProxyAction, cancel: Option<&std::sync::atomic::AtomicBool>)
+    -> Result<bool, MacProxyFailure>
+{
+    use crate::background::ProxyEnvironmentProfile::LegacyUnbound;
+    use MacProxyAction::{Disable, Enable, Foreign, Relay, Watchdog};
+
+    mac_proxy_check_cancel(cancel)?;
+    let (home, _guard) = crate::instances::acquire_proxy_environment_writer()?;
+    let Some(saved) = mac_saved_proxy_intent(cancel)? else {
+        return if matches!(action, Enable | Disable) { Err("Сохранённый выбор локального прокси отсутствует.".into()) }
+            else { Ok(false) };
+    };
+    if (action == Enable && !saved) || (action == Disable && saved) {
+        return Err("Сохранённая настройка локального прокси изменилась.".into());
+    }
+    let port = crate::proxy::port();
+    let url = crate::proxy::url_at(port);
+    let foreign = (action == Foreign || (saved && matches!(action, Enable | Relay))) && checked_mac_foreign_proxy(&url)?;
+    if action == Foreign && !foreign { return Err("Сторонний прокси больше не подтверждён.".into()); }
+    let enabling = saved && matches!(action, Enable | Relay) && !foreign;
+    if enabling && (port == 0 || !crate::background::owned_proxy_listener_at(port)?) {
+        return if action == Relay { Ok(false) } else { Err("Локальный прокси не отвечает.".into()) };
+    }
+    let wanted = enabling.then_some(url.as_str());
+    let mut receipt = MacEnvironmentReceipt::default();
+    let live = mac_launch_value(PROXY_ENV_VAR)?;
+    let edits = mac_profile_preflight(&home, PROXY_ENV_VAR, wanted, mac_private_proxy, &mut receipt)?;
+    let live_owned = live.as_deref().is_some_and(mac_private_proxy);
+    if live.is_some() && !live_owned {
+        receipt.record("launchd", Err("Стороннее значение AG_LS_PROXY сохранено.".into()));
+    }
+    if enabling && !receipt.errors.is_empty() { return receipt.finish().map_err(Into::into); }
+    if !enabling && !live_owned && edits.iter().all(Option::is_none) {
+        if action == Enable && foreign { receipt.errors.push("В системе задан свой прокси; выбор сохранён.".into()); }
+        return receipt.finish().map_err(Into::into);
+    }
+    if !enabling && crate::background::check_proxy_environment_profile(&home)? == LegacyUnbound {
+        return Err(MacProxyFailure::LegacyUnbound);
+    }
+    if action == Watchdog && saved && crate::proxy::checked_listener_answers()? { return Ok(false); }
+    let recheck = || -> Result<(), String> {
+        if mac_saved_proxy_intent(cancel)? != Some(saved) { return Err("Сохранённая настройка локального прокси изменилась.".into()); }
+        if enabling && (crate::proxy::port() != port || !crate::background::owned_proxy_listener_at(port)?) {
+            return Err("Слушатель локального прокси изменился.".into());
+        }
+        if action == Watchdog && saved && crate::proxy::checked_listener_answers()? {
+            return Err("Слушатель локального прокси восстановлен.".into());
+        }
+        if !enabling && crate::background::check_proxy_environment_profile(&home)? == LegacyUnbound {
+            return Err(MacProxyFailure::LegacyUnbound.to_string());
+        }
+        if (enabling || foreign) && checked_mac_foreign_proxy(&url)? != foreign {
+            return Err("Сторонняя настройка прокси изменилась; изменение остановлено.".into());
+        }
+        Ok(())
+    };
+    if !enabling && live_owned {
+        if !receipt.record_launch_write(mac_write_launch_value(PROXY_ENV_VAR, live.as_deref(), None, recheck)) {
+            return receipt.finish().map_err(Into::into);
+        }
+    }
+    let mut launch_write = None;
+    mac_publish_profiles(&home, edits, recheck, || {
+        if enabling {
+            let result = mac_write_launch_value(PROXY_ENV_VAR, live.as_deref(), wanted, recheck);
+            let error = result.as_ref().err().map(|error| format!("launchd: {}", error.detail()));
+            launch_write = Some(result);
+            if let Some(error) = error { return Err(error); }
+        } else {
+            recheck()?;
+            let expected = live.as_deref().filter(|_| !live_owned);
+            if mac_launch_value(PROXY_ENV_VAR)?.as_deref() != expected {
+                return Err("launchd: среда локального прокси изменилась".into());
+            }
+        }
+        Ok(())
+    }, &mut receipt);
+    if let Some(result) = &launch_write { receipt.note_launch_write(result); }
+    if action == Enable && foreign { receipt.errors.push("В системе задан свой прокси; выбор сохранён.".into()); }
+    receipt.finish().map_err(Into::into)
 }
 
 /// The Linux path uses **two** mechanisms so the language server the IDE spawns
@@ -537,15 +883,6 @@ pub fn remove_proxy(owner: &mut CommandOutcome, url: &str, ca_path: &str) -> Res
     remove_legacy_proxy_env(owner, url)?;
     clear_node_ca(owner, ca_path)?;
 
-    Ok(())
-}
-
-/// macOS proxy removal owns only the private proxy variable.
-#[cfg(target_os = "macos")]
-pub fn remove_proxy(_url: &str, _ca_path: &str) -> Result<(), String> {
-    if current_env(PROXY_ENV_VAR).is_some() {
-        set_env(PROXY_ENV_VAR, None)?;
-    }
     Ok(())
 }
 
@@ -783,7 +1120,7 @@ fn profile_root() -> Option<PathBuf> {
 /// proxy *after* being patched would silently keep going through ours. Menu 1
 /// catches that only if they run it again; this runs at every relay start, which
 /// is every boot, so at worst they are back on their own proxy after a restart.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn ensure_proxy_env(ours: &str) -> Result<Outcome, String> {
     if foreign_proxy(ours).is_some() {
         // Theirs, not ours - and ours would win over it, so it has to go.
@@ -818,7 +1155,7 @@ pub fn ensure_proxy_env(owner: &mut CommandOutcome, ours: &str) -> Result<Outcom
 /// The watchdog's primitive: it must never touch a value the user set. That is
 /// now true by the *name* - `PROXY_ENV_VAR` is written by nothing else - where it
 /// used to rest on matching the value under a shared name.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn remove_proxy_if_ours(url: &str, ca_path: &str) -> Result<bool, String> {
     if current_env(PROXY_ENV_VAR).is_none() {
         // Linux can still have a legacy pair without the private variable.
@@ -889,7 +1226,7 @@ fn is_our_proxy_value(value: &str, url: &str) -> bool {
 /// every Node process on the machine trusting a CA nothing uses any more -
 /// harmless today, and exactly the kind of leftover that is impossible to
 /// explain a year from now.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn clear_node_ca(ca_path: &str) -> Result<(), String> {
     if current_env(NODE_CA_ENV_VAR).as_deref() == Some(ca_path) {
         set_env(NODE_CA_ENV_VAR, None)?;
@@ -916,25 +1253,6 @@ fn set_env(owner: &mut CommandOutcome, name: &str, value: Option<&str>) -> Resul
     let receipt = powershell(owner, &script);
     receive_command(owner, receipt)?;
     drop(std::mem::take(owner));
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn set_env(name: &str, value: Option<&str>) -> Result<(), String> {
-    use std::process::Command;
-    match value {
-        Some(v) => {
-            Command::new("launchctl")
-                .args(["setenv", name, v])
-                .status()
-                .map_err(|e| format!("launchctl setenv: {}", e))?;
-            sync_shell_env(name, Some(v));
-        }
-        None => {
-            let _ = Command::new("launchctl").args(["unsetenv", name]).status();
-            sync_shell_env(name, None);
-        }
-    }
     Ok(())
 }
 
@@ -1091,6 +1409,80 @@ pub fn proxy_env_is_ours(owner: &mut CommandOutcome) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mac_launch_write_distinguishes_successful_command_from_failed_readback() {
+        let value = crate::proxy::url_at(53129);
+        for (before, wanted) in [(None, Some(value.as_str())), (Some(value.as_str()), None)] {
+            for mismatch in [false, true] {
+                let command_completed = std::cell::Cell::new(false);
+                let result = mac_checked_launch_write(before, wanted, || {
+                    if !command_completed.get() || mismatch { return Ok(before.map(str::to_owned)); }
+                    Err("synthetic readback failure".into())
+                }, || Ok(()), || { command_completed.set(true); Ok(()) });
+                assert!(command_completed.get());
+                assert!(matches!(result, Err(MacLaunchWriteFailure::Unconfirmed(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn mac_profile_round_trip_preserves_crlf_bytes_and_an_unterminated_tail() {
+        let value = crate::proxy::url_at(53129);
+        for before in [b"".as_slice(), b"safe\r\n\xff\r\n", b"safe\r\n\xff tail", b"bare carriage\r"] {
+            let after = mac_profile_replacement(before, Some(&value)).unwrap().unwrap();
+            assert!(after.starts_with(before));
+            assert_eq!(mac_profile_replacement(&after, Some(&value)).unwrap(), None);
+            assert_eq!(mac_profile_replacement(&after, None).unwrap().as_deref(), Some(before));
+        }
+    }
+
+    #[test]
+    fn mac_profile_rejects_malformed_duplicate_and_foreign_blocks() {
+        let value = crate::proxy::url_at(53129);
+        let owned = mac_profile_replacement(b"", Some(&value)).unwrap().unwrap();
+        let duplicate = [owned.as_slice(), owned.as_slice()].concat();
+        for conflict in [b"# [AG_LS_PROXY_START]\nexport OTHER=keep\n".as_slice(),
+            b" #[AG_LS_PROXY_END]\n", b"# [AG_LS_PROXY_START]\nexport AG_LS_PROXY=\"http://example.invalid:1\"\n# [AG_LS_PROXY_END]\n",
+            duplicate.as_slice()] {
+            assert!(mac_profile_replacement(conflict, None).is_err());
+            assert!(mac_profile_replacement(conflict, Some(&value)).is_err());
+        }
+    }
+
+    #[test]
+    fn mac_profile_updates_only_the_qualified_block_in_place() {
+        let before_url = crate::proxy::url_at(53129);
+        let next_url = crate::proxy::url_at(53130);
+        let block = mac_profile_replacement(b"", Some(&before_url)).unwrap().unwrap();
+        let before = [b"prefix\r\n".as_slice(), block.as_slice(), b"suffix\xff"].concat();
+        let after = mac_profile_replacement(&before, Some(&next_url)).unwrap().unwrap();
+        assert!(after.starts_with(b"prefix\r\n"));
+        assert!(after.ends_with(b"suffix\xff"));
+        assert_eq!(mac_profile_replacement(&after, None).unwrap().as_deref(), Some(b"prefix\r\nsuffix\xff".as_slice()));
+    }
+
+    #[test]
+    fn mac_profile_never_overrides_an_outside_assignment() {
+        let value = crate::proxy::url_at(53129);
+        for assignment in [b"AG_LS_PROXY=\"mine\"\r\n".as_slice(),
+            b"export  AG_LS_PROXY=mine\n", b"typeset -x AG_LS_PROXY+=mine\n"] {
+            assert!(mac_profile_replacement(assignment, Some(&value)).is_err());
+        }
+        let harmless = b"# AG_LS_PROXY=example\r\nprintf '%s' \"$AG_LS_PROXY\"";
+        let appended = mac_profile_replacement(harmless, Some(&value)).unwrap().unwrap();
+        assert_eq!(mac_profile_replacement(&appended, None).unwrap().as_deref(), Some(harmless.as_slice()));
+    }
+
+    #[test]
+    fn mac_cli_cleanup_removes_only_its_legacy_endpoint_block() {
+        let block = format!("# [{CLI_ENV_VAR}_START]\nexport {CLI_ENV_VAR}=\"{DAILY_ENDPOINT}\"\n# [{CLI_ENV_VAR}_END]\n");
+        let before = [b"preserve\r\n".as_slice(), block.as_bytes(), b"\xff tail"].concat();
+        assert_eq!(mac_managed_profile_replacement(&before, CLI_ENV_VAR, None, |value| value == DAILY_ENDPOINT)
+            .unwrap().as_deref(), Some(b"preserve\r\n\xff tail".as_slice()));
+        let malformed = b"# [CLOUD_CODE_URL_START]\nexport OTHER=preserve\n";
+        assert!(mac_managed_profile_replacement(malformed, CLI_ENV_VAR, None, |value| value == DAILY_ENDPOINT).is_err());
+    }
 
     /// The user's own `http.proxy` is read as intent: set means set, empty or
     /// commented out means nothing, and a URL's own `//` is not a comment.

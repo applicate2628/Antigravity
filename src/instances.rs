@@ -131,6 +131,16 @@ mod platform {
         Ok(file)
     }
 
+    pub(crate) fn acquire_proxy_environment_writer() -> Result<(std::path::PathBuf, File), String> {
+        let home = crate::dns_forwarder::unix_user_home()?;
+        if !home.is_absolute() { return Err("домашний каталог для блокировки прокси должен быть абсолютным".into()); }
+        let guard = crate::background::in_owned_macos_directory(&home, || {
+            acquire_writer(&home, ".agunlocker-proxy-environment.lock", libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK)
+        })
+            .map_err(|error| format!("блокировка среды прокси: {error}"))?;
+        Ok((home, guard))
+    }
+
     fn acquire_writer(directory: &std::path::Path, name: &str, flags: i32) -> Result<File, String> {
         let path = directory.join(name);
         let file = OpenOptions::new().read(true).write(true).create(true).mode(0o600)
@@ -162,6 +172,9 @@ pub use platform::acquire_gui_writer;
 
 #[cfg(target_os = "macos")]
 pub use platform::acquire_watchdog_worker;
+
+#[cfg(target_os = "macos")]
+pub(crate) use platform::acquire_proxy_environment_writer;
 
 #[cfg(test)]
 mod tests {
