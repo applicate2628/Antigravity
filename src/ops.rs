@@ -2617,7 +2617,7 @@ fn run_worker(
                 ctx.settings.save();
                 ctx.log(
                     Level::Info,
-                    match first_enabled_provider(&ctx.settings) {
+                    match crate::resolvers::first_usable_provider(&ctx.settings) {
                         Some(n) => format!("Порядок DNS изменён, первый — {}", n),
                         None => "Порядок DNS изменён.".to_string(),
                     },
@@ -2627,10 +2627,11 @@ fn run_worker(
                 push_status(&mut ctx, Scan::Settings);
             }
             Cmd::SetProvider(name, on) => {
+                let had_usable_provider = !on && crate::resolvers::first_usable_provider(&ctx.settings).is_some();
                 ctx.settings.set_provider_enabled(&name, on);
-                // Never let the last one go: an empty pool is a dead DNS layer
-                // that still draws as installed.
-                if all_providers_disabled(&ctx.settings) {
+                // A configured but empty Custom slot cannot replace the last
+                // provider that can actually answer.
+                if had_usable_provider && crate::resolvers::first_usable_provider(&ctx.settings).is_none() {
                     ctx.settings.set_provider_enabled(&name, true);
                     ctx.log(
                         Level::Warn,
@@ -2729,12 +2730,6 @@ fn startup_housekeeping(ctx: &mut Ctx) {
     }
 }
 
-fn all_providers_disabled(s: &Settings) -> bool {
-    crate::resolvers::provider_names()
-        .iter()
-        .all(|n| !s.provider_enabled(n))
-}
-
 /// Whether the selection would leave the NRPT rule with no nameserver.
 ///
 /// The pool would still resolve — the head of the list speaks DoH through the
@@ -2745,15 +2740,6 @@ fn no_usable_nameserver(s: &Settings) -> bool {
     crate::resolvers::udp_provider_names()
         .iter()
         .all(|n| !s.provider_enabled(n))
-}
-
-/// The one that answers when rotation is off: first in pool order that the user
-/// has not switched off. Pool order is by measured substitution, so its head is
-/// the one most likely to still be substituting.
-fn first_enabled_provider(s: &Settings) -> Option<&'static str> {
-    crate::resolvers::ordered_provider_names()
-        .into_iter()
-        .find(|n| s.provider_enabled(n))
 }
 
 // ---------------------------------------------------------------------------
@@ -3323,12 +3309,12 @@ impl Status {
             // Naming the one that will answer is the whole point of switching
             // rotation off, so the switch says which it is rather than leaving
             // the user to count down the list.
-            State::OffNote(match first_enabled_provider(s) {
+            State::OffNote(match crate::resolvers::first_usable_provider(s) {
                 Some(name) => format!("используется только {}", name),
-                None => "ни один сервер не включён".to_string(),
+                None => "нет доступных DNS-серверов".to_string(),
             })
         };
-        self.providers = crate::resolvers::ordered_provider_names()
+        self.providers = crate::resolvers::ordered_provider_names(&s.provider_order)
             .iter()
             .map(|n| ProviderRow {
                 name: (*n).to_string(),
@@ -4583,12 +4569,12 @@ fn apply(ctx: &mut Ctx, cap: Cap, on: bool) -> Result<(), String> {
                     "Ротация включена — запрос идёт ко всем включённым серверам, ответ сверяется с эталонным."
                         .to_string()
                 } else {
-                    match first_enabled_provider(&ctx.settings) {
+                    match crate::resolvers::first_usable_provider(&ctx.settings) {
                         Some(name) => format!(
                             "Ротация выключена — используется только {}. Запасных серверов не будет.",
                             name
                         ),
-                        None => "Ротация выключена, но все серверы отключены.".to_string(),
+                        None => "Ротация выключена, но нет доступных DNS-серверов.".to_string(),
                     }
                 },
             );
@@ -6708,7 +6694,6 @@ fn set_custom_dns(ctx: &mut Ctx, text: &str) {
     let text = text.trim();
     if text.is_empty() {
         ctx.settings.custom_dns.clear();
-        ctx.settings.set_provider_enabled("свой DNS", true);
         ctx.log(Level::Ok, "Свой DNS убран.");
         return;
     }
@@ -7977,18 +7962,19 @@ mod tests {
         assert!(names.len() >= 2, "the test needs a pool to narrow");
 
         let mut s = Settings::default();
-        assert_eq!(first_enabled_provider(&s), Some(names[0]));
+        assert_eq!(crate::resolvers::first_usable_provider(&s), Some(names[0]));
 
         // Turning the head off must move the choice down the list, not leave it
         // pointing at a provider that is switched off.
         s.set_provider_enabled(names[0], false);
-        assert_eq!(first_enabled_provider(&s), Some(names[1]));
+        assert_eq!(crate::resolvers::first_usable_provider(&s), Some(names[1]));
 
         for n in &names {
             s.set_provider_enabled(n, false);
         }
-        assert_eq!(first_enabled_provider(&s), None);
-        assert!(all_providers_disabled(&s));
+        s.set_provider_enabled("свой DNS", true);
+        assert!(s.provider_enabled("свой DNS"));
+        assert_eq!(crate::resolvers::first_usable_provider(&s), None);
     }
 
     #[test]
@@ -8271,6 +8257,9 @@ mod tests {
     fn custom_dns_setting_validates_every_address_and_collapses_duplicates() {
         let (shared, events) = probe_test_ctx();
         let mut ctx = shared.lock().unwrap();
+        let order = vec!["свой DNS".to_string(), "dns-ai.ru".to_string()];
+        ctx.settings.provider_order = order.clone();
+        ctx.settings.rotate_providers = false;
         ctx.settings.custom_dns = "9.9.9.9".into();
         ctx.settings.set_provider_enabled("свой DNS", false);
 
@@ -8289,13 +8278,23 @@ mod tests {
 
         set_custom_dns(&mut ctx, " \t ");
         assert!(ctx.settings.custom_dns.is_empty());
-        assert!(ctx.settings.provider_enabled("свой DNS"));
+        assert!(!ctx.settings.provider_enabled("свой DNS"));
         assert!(matches!(events.try_recv(), Ok(Event::Log(Level::Ok, _))));
 
         ctx.settings.set_provider_enabled("свой DNS", false);
         set_custom_dns(&mut ctx, "8.8.4.4, 1.1.1.1; 8.8.4.4\t9.9.9.9 1.1.1.1");
         assert_eq!(ctx.settings.custom_dns, "8.8.4.4 1.1.1.1 9.9.9.9");
         assert!(ctx.settings.provider_enabled("свой DNS"));
+        assert!(matches!(events.try_recv(), Ok(Event::Log(Level::Ok, _))));
+
+        set_custom_dns(&mut ctx, "");
+        assert!(ctx.settings.custom_dns.is_empty());
+        assert!(ctx.settings.provider_enabled("свой DNS"));
+        assert_eq!(ctx.settings.provider_order, order);
+        let status = blank_status().with_settings_switches(&ctx.settings);
+        assert!(matches!(status.dns_rotation, State::OffNote(note) if note == "используется только dns-ai.ru"));
+        assert_eq!(status.providers[0].name, "свой DNS");
+        assert!(status.providers[0].enabled);
         assert!(matches!(events.try_recv(), Ok(Event::Log(Level::Ok, _))));
     }
 

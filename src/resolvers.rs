@@ -280,8 +280,8 @@ pub enum Transport {
     Udp,
     /// DNS-over-HTTPS. Reachable only through the relay, never by Windows.
     Doh(&'static crate::doh::Endpoint),
-    /// The user's own DNS server(s), read from `settings.custom_dns` at query
-    /// time (`custom_dns_servers`). Like a DoH provider it carries empty `v4`/`v6`:
+    /// The user's own DNS server(s), captured from `settings.custom_dns` with
+    /// the selected providers. Like a DoH provider it carries empty `v4`/`v6`:
     /// the addresses are not ours to put into an NRPT rule, only the relay asks.
     Custom,
 }
@@ -317,10 +317,6 @@ fn parse_custom_dns_input(text: &str) -> (Vec<Ipv4Addr>, bool) {
         }
     }
     (servers, all_valid)
-}
-
-pub fn custom_dns_servers() -> Vec<Ipv4Addr> {
-    parse_custom_dns(&crate::settings::custom_dns_cached())
 }
 
 /// One unblock service. Addresses are tried in order; the first that answers
@@ -663,6 +659,7 @@ pub(crate) fn test_source_witness_with_providers(names: &[&str], rotate: bool) -
     settings.disabled_providers = PROVIDERS.iter().filter(|provider|
         !names.iter().any(|name| provider.name.eq_ignore_ascii_case(name))).map(|provider| provider.name.to_owned()).collect();
     settings.rotate_providers = rotate;
+    settings.custom_dns = "192.0.2.53".into();
     witness_from_read(crate::settings::Read::Parsed(settings), DnsMissingPolicy::RequireSettings).expect("synthetic settings")
 }
 
@@ -703,13 +700,13 @@ fn witness_from_read(read: crate::settings::Read, policy: DnsMissingPolicy) -> R
 }
 
 fn witness_from_settings(settings: &crate::settings::Settings, missing_defaults: bool) -> DnsSourceWitness {
-    let mut selected: Vec<usize> = in_order(&settings.provider_order).into_iter()
-        .filter(|p| settings.provider_enabled(p.name))
+    let custom = parse_custom_dns(&settings.custom_dns);
+    let mut selected: Vec<usize> = usable_providers(settings, !custom.is_empty())
         .filter_map(|p| provider_index(p.name))
         .collect();
     if !settings.rotate_providers { selected.truncate(1); }
     let custom = if selected.iter().any(|idx| matches!(&PROVIDERS[*idx].transport, Transport::Custom)) {
-        parse_custom_dns(&settings.custom_dns)
+        custom
     } else { Vec::new() };
     DnsSourceWitness { selected, custom, missing_defaults, rotate: settings.rotate_providers }
 }
@@ -1624,33 +1621,18 @@ fn warm_with_work(names: &[&str], if_index: u32, work: Option<&ResolverWork>) ->
     check_resolver_work(work)
 }
 
-/// Sends `query` to every address of one provider in turn, stopping at the
-/// first that answers.
-/// Whether the user switched this provider off in the window.
-///
-/// Checked here, at the single point every racing path goes through, rather than
-/// by rebuilding the candidate list in each of them — the loops index `PROVIDERS`
-/// directly in half a dozen places and one of them would have been missed. A
-/// provider that is off simply never answers, which is a state the race already
-/// handles: it is what a dead front-end looks like.
-///
-/// The deny-list only ever *subtracts*, which is what keeps this safe: I22 says a
-/// rule's fallbacks list only providers measured to substitute that name, and a
-/// subset of a measured set is still measured. Adding one would not be.
-///
-/// Takes the settings cache's own lock and calls back into nothing, so it cannot
-/// take part in the reentrancy that I50 forbids.
-/// With rotation off, only this provider may answer: the first one in pool order
-/// the user has not switched off.
-///
-/// Pool order, not "whichever answered last" — the list is ordered by measured
-/// substitution, so its head is the one most likely to still be substituting.
-fn only_provider() -> Option<&'static str> {
-    let disabled = crate::settings::disabled_providers_cached();
-    in_user_order()
-        .into_iter()
+fn usable_providers(settings: &crate::settings::Settings, custom_usable: bool) -> impl Iterator<Item = &'static Provider> + '_ {
+    in_order(&settings.provider_order).into_iter().filter(move |p| {
+        settings.provider_enabled(p.name) && (custom_usable || !matches!(&p.transport, Transport::Custom))
+    })
+}
+
+/// The provider that would answer with rotation disabled. An empty Custom slot
+/// keeps its saved position and switch but has no address to ask.
+pub(crate) fn first_usable_provider(settings: &crate::settings::Settings) -> Option<&'static str> {
+    usable_providers(settings, !parse_custom_dns(&settings.custom_dns).is_empty())
+        .next()
         .map(|p| p.name)
-        .find(|n| !disabled.iter().any(|d| d.eq_ignore_ascii_case(n)))
 }
 
 /// The pool laid out the way the user arranged it.
@@ -1716,8 +1698,8 @@ pub fn udp_provider_names() -> Vec<&'static str> {
 }
 
 /// The provider names in the user's order — what the window's list draws.
-pub fn ordered_provider_names() -> Vec<&'static str> {
-    in_user_order().into_iter().map(|p| p.name).collect()
+pub fn ordered_provider_names(order: &[String]) -> Vec<&'static str> {
+    in_order(order).into_iter().map(|p| p.name).collect()
 }
 
 /// Switched off by name in the window.
@@ -1725,19 +1707,6 @@ fn denied(name: &str) -> bool {
     crate::settings::disabled_providers_cached()
         .iter()
         .any(|d| d.eq_ignore_ascii_case(name))
-}
-
-fn provider_disabled(name: &str) -> bool {
-    if denied(name) {
-        return true;
-    }
-    // Rotation off: everything below the head of the list is treated exactly the
-    // way a switched-off provider is, so the race, the fallback list and the
-    // NRPT nameservers all narrow together instead of disagreeing.
-    if !crate::settings::rotation_enabled() {
-        return only_provider() != Some(name);
-    }
-    false
 }
 
 fn ask_provider(
@@ -1768,11 +1737,15 @@ fn ask_provider_with_inputs(provider: &Provider, query: &[u8], if_index: u32, ti
     let stopped = || cancelled.is_some_and(ResolverCancellation::is_cancelled);
     let remaining = || deadline.map_or(timeout, |until| timeout.min(until.saturating_duration_since(Instant::now())));
     if stopped() { return None; }
-    let disabled = match witness {
-        Some(witness) => !provider_index(provider.name).is_some_and(|idx| witness.selected.contains(&idx)),
-        None => provider_disabled(provider.name),
+    let legacy_inputs;
+    let inputs = match witness {
+        Some(inputs) => inputs,
+        None => {
+            legacy_inputs = legacy_inputs_for_work(None);
+            &legacy_inputs
+        }
     };
-    if disabled {
+    if !provider_index(provider.name).is_some_and(|idx| inputs.selected.contains(&idx)) {
         return None;
     }
     match provider.transport {
@@ -1792,8 +1765,7 @@ fn ask_provider_with_inputs(provider: &Provider, query: &[u8], if_index: u32, ti
             None
         }
         Transport::Custom => {
-            let servers = witness.map_or_else(custom_dns_servers, |inputs| inputs.custom.clone());
-            query_custom_with_inputs(&servers, timeout, cancelled, deadline, |ip, left| {
+            query_custom_with_inputs(&inputs.custom, timeout, cancelled, deadline, |ip, left| {
                 if let Some(started) = started.as_deref_mut() { *started = true; }
                 dns_client::query_raw_via(query, ip, if_index, left).ok()
             })
@@ -2811,10 +2783,40 @@ mod tests {
         let custom = PROVIDERS.iter().position(|provider| matches!(&provider.transport, Transport::Custom)).unwrap();
         settings.provider_order = vec![PROVIDERS[custom].name.to_string(), LEAD_PROVIDER.to_string()];
         settings.rotate_providers = false;
-        settings.custom_dns = "192.168.1.53".to_string();
-        let inputs = witness_from_read(crate::settings::Read::Parsed(settings), DnsMissingPolicy::RequireSettings).unwrap();
+        settings.custom_dns = "192.0.2.53 junk 192.0.2.53 127.0.0.53; 198.51.100.53".to_string();
+        let inputs = witness_from_read(crate::settings::Read::Parsed(settings.clone()), DnsMissingPolicy::RequireSettings).unwrap();
         assert_eq!(inputs.selected, vec![custom]);
-        assert_eq!(inputs.custom, vec![Ipv4Addr::new(192, 168, 1, 53)]);
+        assert_eq!(inputs.custom, vec![Ipv4Addr::new(192, 0, 2, 53), Ipv4Addr::new(198, 51, 100, 53)]);
+
+        settings.set_provider_enabled(PROVIDERS[custom].name, false);
+        let inputs = witness_from_read(crate::settings::Read::Parsed(settings), DnsMissingPolicy::RequireSettings).unwrap();
+        assert_eq!(inputs.selected, vec![provider_index(LEAD_PROVIDER).unwrap()]);
+        assert!(inputs.custom.is_empty());
+    }
+
+    #[test]
+    fn unusable_custom_does_not_displace_the_next_provider() {
+        let custom = PROVIDERS.iter().position(|provider| matches!(&provider.transport, Transport::Custom)).unwrap();
+        let lead = provider_index(LEAD_PROVIDER).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.provider_order = vec![PROVIDERS[custom].name.to_string(), LEAD_PROVIDER.to_string()];
+        settings.rotate_providers = false;
+        for text in [" \t ", "junk 127.0.0.53 0.0.0.0 224.0.0.1"] {
+            settings.custom_dns = text.into();
+            let strict = witness_from_read(crate::settings::Read::Parsed(settings.clone()), DnsMissingPolicy::RequireSettings).unwrap();
+            let mut work = ResolverWork::new(thread::current());
+            work.legacy_settings = Some(settings.clone());
+            let legacy = legacy_inputs_for_work(Some(&work));
+            assert_eq!(strict.selected, [lead]);
+            assert!(strict.custom.is_empty());
+            assert!(legacy == strict);
+            assert!(settings.provider_enabled(PROVIDERS[custom].name));
+        }
+
+        settings.rotate_providers = true;
+        let rotated = witness_from_settings(&settings, false);
+        assert_eq!(rotated.selected.first(), Some(&lead));
+        assert!(!rotated.selected.contains(&custom));
     }
 
     #[test]

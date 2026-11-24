@@ -787,10 +787,6 @@ fn cached_from_disk() -> Settings {
     fresh
 }
 
-pub fn custom_dns_cached() -> String {
-    cached().custom_dns
-}
-
 pub fn disabled_providers_cached() -> Vec<String> {
     cached().disabled_providers
 }
