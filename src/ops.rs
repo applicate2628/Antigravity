@@ -6712,18 +6712,13 @@ fn set_custom_dns(ctx: &mut Ctx, text: &str) {
         ctx.log(Level::Ok, "Свой DNS убран.");
         return;
     }
-    let found = crate::resolvers::parse_custom_dns(text);
-    let words = text
-        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-        .filter(|w| !w.is_empty())
-        .count();
-    if found.is_empty() || found.len() < words {
+    let Some(found) = crate::resolvers::parse_custom_dns_setting(text) else {
         ctx.log(
             Level::Err,
             "Нужны IPv4-адреса DNS-серверов через пробел или запятую (не 127.x и не 0.0.0.0), например 77.88.8.8.",
         );
         return;
-    }
+    };
     ctx.settings.custom_dns = found
         .iter()
         .map(|ip| ip.to_string())
@@ -8269,6 +8264,39 @@ mod tests {
             proxy_var_carried: None, proxy_var_retryable: false, patched_seen: HashMap::new(), vpn: Some(VpnSeen::None),
             relay_egress: Some(crate::egress::ClientEgress::Physical), last: Some(blank_status()), dns_probe: initial_dns_probe(), carrier_set_proxy: false };
         (Mutex::new(ctx), receiver)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn custom_dns_setting_validates_every_address_and_collapses_duplicates() {
+        let (shared, events) = probe_test_ctx();
+        let mut ctx = shared.lock().unwrap();
+        ctx.settings.custom_dns = "9.9.9.9".into();
+        ctx.settings.set_provider_enabled("свой DNS", false);
+
+        for invalid in [
+            "8.8.4.4 junk 8.8.4.4",
+            "8.8.4.4 127.0.0.53",
+            "8.8.4.4 0.0.0.0",
+            "8.8.4.4 224.0.0.1",
+            ", ;",
+        ] {
+            set_custom_dns(&mut ctx, invalid);
+            assert_eq!(ctx.settings.custom_dns, "9.9.9.9");
+            assert!(!ctx.settings.provider_enabled("свой DNS"));
+            assert!(matches!(events.try_recv(), Ok(Event::Log(Level::Err, _))));
+        }
+
+        set_custom_dns(&mut ctx, " \t ");
+        assert!(ctx.settings.custom_dns.is_empty());
+        assert!(ctx.settings.provider_enabled("свой DNS"));
+        assert!(matches!(events.try_recv(), Ok(Event::Log(Level::Ok, _))));
+
+        ctx.settings.set_provider_enabled("свой DNS", false);
+        set_custom_dns(&mut ctx, "8.8.4.4, 1.1.1.1; 8.8.4.4\t9.9.9.9 1.1.1.1");
+        assert_eq!(ctx.settings.custom_dns, "8.8.4.4 1.1.1.1 9.9.9.9");
+        assert!(ctx.settings.provider_enabled("свой DNS"));
+        assert!(matches!(events.try_recv(), Ok(Event::Log(Level::Ok, _))));
     }
 
     #[cfg(windows)]

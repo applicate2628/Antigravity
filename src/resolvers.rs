@@ -290,20 +290,33 @@ pub enum Transport {
 /// semicolons. Loopback, unspecified and multicast addresses are dropped - the
 /// relay itself listens on 127.0.0.53, and pointing it at itself would loop.
 pub fn parse_custom_dns(text: &str) -> Vec<Ipv4Addr> {
-    let mut out: Vec<Ipv4Addr> = Vec::new();
-    for part in text.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Ok(ip) = part.parse::<Ipv4Addr>() {
-            if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() && !out.contains(&ip)
-            {
-                out.push(ip);
+    parse_custom_dns_input(text).0
+}
+
+/// A nonblank setting must supply at least one server and every token must be valid.
+/// Repeated addresses are kept once, in first occurrence order.
+pub(crate) fn parse_custom_dns_setting(text: &str) -> Option<Vec<Ipv4Addr>> {
+    let (servers, all_valid) = parse_custom_dns_input(text);
+    (all_valid && !servers.is_empty()).then_some(servers)
+}
+
+fn parse_custom_dns_input(text: &str) -> (Vec<Ipv4Addr>, bool) {
+    let mut servers = Vec::new();
+    let mut all_valid = true;
+    for part in text
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|part| !part.is_empty())
+    {
+        match part.parse::<Ipv4Addr>() {
+            Ok(ip) if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() => {
+                if !servers.contains(&ip) {
+                    servers.push(ip);
+                }
             }
+            _ => all_valid = false,
         }
     }
-    out
+    (servers, all_valid)
 }
 
 pub fn custom_dns_servers() -> Vec<Ipv4Addr> {
