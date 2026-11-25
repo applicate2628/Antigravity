@@ -40,7 +40,7 @@
 use std::cell::RefCell;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The routes a gate host can take, as the proxy knows them. `Exits` is the
@@ -62,7 +62,14 @@ pub enum Kind {
     Vpn,
 }
 
-pub const ALL: [Kind; 6] = [Kind::Own, Kind::Group, Kind::Exits, Kind::Relay, Kind::Direct, Kind::Vpn];
+pub const ALL: [Kind; 6] = [
+    Kind::Own,
+    Kind::Group,
+    Kind::Exits,
+    Kind::Relay,
+    Kind::Direct,
+    Kind::Vpn,
+];
 const N: usize = ALL.len();
 
 impl Kind {
@@ -91,12 +98,23 @@ impl Kind {
     }
 }
 
-/// The default order within a tier for routes without latency evidence.
-const DEFAULT_ORDER: [Kind; N] = [Kind::Group, Kind::Own, Kind::Relay, Kind::Exits, Kind::Direct, Kind::Vpn];
-
-/// Direct participates in the normal tiers on Windows and macOS. Linux,
-/// including WSL, keeps Direct in the fallback tier.
-const DIRECT_USES_NORMAL_TIERS: bool = cfg!(any(target_os = "windows", target_os = "macos"));
+/// The order before anything has been measured. Own first; the owner's
+/// dedicated group server (Group) next; then the authenticated CONNECT relay
+/// (relay.xbox-dns.ru) which has dedicated permitted-region egress and zero
+/// region-400s; then built-in foreign exits; the user's VPN next; and direct
+/// DNS substitution last as fallback when proxy routes are not usable.
+///
+/// Every OS has the direct route: on Linux/macOS the proxy resolves the gate
+/// hosts through the provider pool itself and dials only a substituted address
+/// (`proxy::gate_direct_addrs`), so nothing demotes it there any more.
+const DEFAULT_ORDER: [Kind; N] = [
+    Kind::Group,
+    Kind::Own,
+    Kind::Relay,
+    Kind::Exits,
+    Kind::Direct,
+    Kind::Vpn,
+];
 
 /// Routes taken first whenever usable and not benched, ahead of anything
 /// measured (owner, 2026-10-05: «если активен прокси от моей группы - то все
@@ -117,7 +135,7 @@ fn pinned_now() -> [Kind; 2] {
 }
 
 /// A measurement older than this says nothing about the route now. Probes run
-/// every two minutes; three misses in a row and the route is unmeasured again.
+/// every ten minutes; a stale sample is forgotten between checks.
 const SAMPLE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// How much faster a challenger must measure to take the lead, in percent.
@@ -208,7 +226,7 @@ const STUMBLE_FOR: Duration = Duration::from_secs(60);
 /// cannot answer a probe out of the way until one succeeds, and no longer: the
 /// first successful probe `record`s a sample, and the stumble expires on its
 /// own.
-const PROBE_STUMBLE_FOR: Duration = Duration::from_secs(3 * 60);
+const PROBE_STUMBLE_FOR: Duration = Duration::from_secs(12 * 60);
 
 /// How long a route whose live tunnel went **silent** sits behind the others:
 /// it opened, the client spoke, and nothing came back before the tunnel closed.
@@ -233,93 +251,6 @@ const SILENT_MAX_BYTES: u64 = 64;
 struct Sample {
     latency: Duration,
     at: Instant,
-}
-
-struct DnsEndpoint {
-    host: String,
-    candidate: crate::resolvers::DnsCandidate,
-    generation: u64,
-    checked: Option<Instant>,
-    latency: Duration,
-    reachable: bool,
-    refusal_at: Option<Instant>,
-    refusal_blocking: bool,
-    model_proven: bool,
-    model_seen: Option<Instant>,
-    silent_until: Option<Instant>,
-    silent_streak: u8,
-    drop_streak: usize,
-    drop_continuity: Option<(crate::ls_log::LogSourceId, u64)>,
-    last_event_at: Option<Instant>,
-    last_event_source: Option<crate::ls_log::LogSourceId>,
-}
-
-struct DnsState {
-    generation: u64,
-    #[cfg(target_os = "macos")]
-    mac_generation: Option<u64>,
-    #[cfg(target_os = "macos")]
-    mac_last_confirmed: Option<crate::netif::MacRelayEgress>,
-    witness: Option<crate::resolvers::DnsSourceWitness>,
-    allow_missing_defaults: bool,
-    network: Option<u64>,
-    pending: Vec<String>,
-    entries: Vec<DnsEndpoint>,
-    hosts: Vec<DnsHostWork>,
-    next_host: usize,
-    maintenance_thread: Option<std::thread::Thread>,
-    consumed: Vec<DnsSourceCursor>,
-}
-
-struct DnsSourceCursor { source: crate::ls_log::LogSourceId, end: u64, boundary: Option<u64>, observed: Instant }
-
-impl DnsState {
-    const fn new() -> Self {
-        Self { generation: 0, witness: None, allow_missing_defaults: false, network: None,
-            #[cfg(target_os = "macos")]
-            mac_generation: None,
-            #[cfg(target_os = "macos")]
-            mac_last_confirmed: None,
-            pending: Vec::new(), entries: Vec::new(), hosts: Vec::new(), next_host: 0, maintenance_thread: None, consumed: Vec::new() }
-    }
-
-    fn advance_generation(&mut self) -> Result<(), String> {
-        self.generation = self.generation.checked_add(1).ok_or("DNS generation exhausted")?;
-        self.pending.clear();
-        self.hosts.clear();
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct DnsStateTestLease { saved: Option<DnsState>, context: u64 }
-
-#[cfg(test)]
-impl Drop for DnsStateTestLease {
-    fn drop(&mut self) {
-        if let Ok(mut table) = TABLE.lock() {
-            if let Some(saved) = self.saved.take() { table.dns = saved; }
-            table.context = self.context;
-            DNS_CHANGED.notify_all();
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn lease_test_dns_state() -> Result<DnsStateTestLease, String> {
-    let mut table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    let context = table.context;
-    table.context = 0;
-    let saved = std::mem::replace(&mut table.dns, DnsState::new());
-    Ok(DnsStateTestLease { saved: Some(saved), context })
-}
-
-struct DnsHostWork {
-    host: String,
-    cursor: Option<crate::resolvers::DnsDiscoveryCursor>,
-    queued: Vec<crate::resolvers::DnsCandidate>,
-    exhausted: bool,
-    finished_at: Option<Instant>,
 }
 
 /// Everything the table knows, behind one lock: consulted on the path of every
@@ -365,7 +296,6 @@ struct Table {
     last_used: Option<(Kind, Instant)>,
     /// The network the evidence was gathered on (`set_context`).
     context: u64,
-    dns: DnsState,
 }
 
 static TABLE: Mutex<Table> = Mutex::new(Table {
@@ -383,28 +313,7 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
     leader: None,
     last_used: None,
     context: 0,
-    dns: DnsState::new(),
 });
-static DNS_CHANGED: Condvar = Condvar::new();
-
-/// A newly received Own endpoint must not inherit another endpoint's ranking.
-pub(crate) fn reset_own_projection() -> Result<(), String> {
-    {
-        let mut t = TABLE.lock().map_err(|_| "route table unavailable".to_string())?;
-        let i = Kind::Own.index();
-        t.samples[i] = None;
-        t.penalised[i] = None;
-        t.ok_at[i] = None;
-        t.bad_at[i] = None;
-        t.refused_at[i] = None;
-        t.streak[i] = 0;
-        t.stumbled[i] = None;
-        t.silent[i] = None;
-        t.silent_streak[i] = 0;
-        if t.leader == Some(Kind::Own) { t.leader = None; }
-    }
-    Ok(())
-}
 
 /// Records one measurement of a route. Blended with the previous fresh one, so
 /// a single slow probe does not by itself hand the lead to somebody else.
@@ -447,6 +356,9 @@ pub fn record_failure(kind: Kind) {
 /// Not for a probe that was never applicable - a VPN row with no tunnel up is
 /// unmeasured, not failing - only for one that tried and got nothing.
 pub fn probe_failed(kind: Kind) {
+    // Background checks use separate connections. A failed new connection is
+    // weaker evidence than a model answer on the still-open current one.
+    if is_streaming(kind) { return; }
     record_failure(kind);
     stumble_for(kind, PROBE_STUMBLE_FOR);
 }
@@ -629,10 +541,6 @@ pub fn set_context(fingerprint: u64) -> bool {
     let Ok(mut t) = TABLE.lock() else {
         return false;
     };
-    set_context_locked(&mut t, fingerprint)
-}
-
-fn set_context_locked(t: &mut Table, fingerprint: u64) -> bool {
     if t.context == fingerprint {
         return false;
     }
@@ -661,60 +569,15 @@ fn set_context_locked(t: &mut Table, fingerprint: u64) -> bool {
         t.stumbled = [None; N];
         t.silent = [None; N];
         t.silent_streak = [0; N];
-        (t.penalised[g], t.streak[g], t.bad_at[g], t.refused_at[g], t.bad_count[g]) = kept;
+        (
+            t.penalised[g],
+            t.streak[g],
+            t.bad_at[g],
+            t.refused_at[g],
+            t.bad_count[g],
+        ) = kept;
     }
     !first
-}
-
-fn current_dns_context(table: &Table) -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    if table.dns.mac_last_confirmed.is_some() && table.dns.mac_generation.is_none() {
-        return None;
-    }
-    (table.context != 0).then_some(table.context)
-}
-
-/// Change the Mac socket policy and the DNS proof owner under the same lock.
-/// Keep shared route history during an unmeasured period; a new confirmed
-/// network resets it through the same owner used by the other platforms.
-#[cfg(target_os = "macos")]
-pub(crate) fn set_mac_egress(observation: Option<crate::netif::MacRelayEgress>) -> Result<bool, String> {
-    let mut table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    let last_confirmed = table.dns.mac_last_confirmed.as_ref();
-    let current = if table.dns.mac_generation.is_some() { last_confirmed } else { None };
-    if current == observation.as_ref() { return Ok(false); }
-    let confirmed_change = observation.is_some() && observation.as_ref() != last_confirmed;
-    let pin = observation.as_ref().map_or(0, crate::netif::MacRelayEgress::pin);
-    table.dns.advance_generation()?;
-    let generation = table.dns.generation;
-    table.dns.mac_generation = observation.as_ref().map(|_| generation);
-    if confirmed_change {
-        set_context_locked(&mut table, generation);
-        table.dns.mac_last_confirmed = observation;
-    }
-    table.dns.network = current_dns_context(&table);
-    // A refusal in the superseded generation cannot veto a new qualification.
-    for entry in &mut table.dns.entries { entry.refusal_blocking = false; }
-    crate::proxy::set_vpn_exit(None);
-    crate::net::set_pin_interface(pin);
-    DNS_CHANGED.notify_all();
-    Ok(true)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn mac_vpn_generation() -> Option<u64> {
-    let table = TABLE.lock().ok()?;
-    if crate::net::tunnel_up() { table.dns.mac_generation } else { None }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn receive_mac_vpn_exit(generation: u64, publish: impl FnOnce()) -> bool {
-    let Ok(table) = TABLE.lock() else { return false; };
-    if table.dns.mac_generation != Some(generation) || !crate::net::tunnel_up() {
-        return false;
-    }
-    publish();
-    true
 }
 
 /// The order to try routes in for the next connection, best first, among those
@@ -729,29 +592,14 @@ pub fn order(usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
         return if usable(k) { vec![k] } else { Vec::new() };
     }
     let s = snapshot();
-    order_with(&s, DIRECT_USES_NORMAL_TIERS, usable)
-}
-
-/// Orders current health evidence using the caller's already captured settings.
-/// The settings values are fixed for one connection; route health remains live.
-pub(crate) fn order_for_profile(
-    debug_route: &str,
-    own_first: bool,
-    usable: impl Fn(Kind) -> bool,
-) -> Vec<Kind> {
-    if !debug_route.trim().is_empty() {
-        return match forced(debug_route) {
-            Some(k) if usable(k) => vec![k],
-            _ => Vec::new(),
-        };
+    let mut ordered = order_with(&s, usable);
+    if let Some(leader) = s.leader.filter(|k| is_streaming(*k)) {
+        if let Some(pos) = ordered.iter().position(|k| *k == leader) {
+            ordered.remove(pos);
+            ordered.insert(0, leader);
+        }
     }
-    let pinned = if own_first {
-        [Kind::Own, Kind::Group]
-    } else {
-        [Kind::Group, Kind::Own]
-    };
-    let s = snapshot_with_pinned(pinned);
-    order_with(&s, DIRECT_USES_NORMAL_TIERS, usable)
+    ordered
 }
 
 /// The route a diagnostic run pinned in `settings.json` (`debug_route`).
@@ -785,10 +633,6 @@ struct Snapshot {
 
 /// What the table holds right now, without holding it.
 fn snapshot() -> Snapshot {
-    snapshot_with_pinned(pinned_now())
-}
-
-fn snapshot_with_pinned(pinned: [Kind; 2]) -> Snapshot {
     match TABLE.lock() {
         Ok(t) => Snapshot {
             samples: t.samples,
@@ -801,7 +645,7 @@ fn snapshot_with_pinned(pinned: [Kind; 2]) -> Snapshot {
             stumbled: t.stumbled,
             silent: t.silent,
             leader: t.leader,
-            pinned,
+            pinned: pinned_now(),
         },
         Err(_) => Snapshot {
             samples: [None; N],
@@ -814,7 +658,7 @@ fn snapshot_with_pinned(pinned: [Kind; 2]) -> Snapshot {
             stumbled: [None; N],
             silent: [None; N],
             leader: None,
-            pinned,
+            pinned: pinned_now(),
         },
     }
 }
@@ -829,7 +673,8 @@ pub fn leader() -> Option<Kind> {
 /// in the log when it changed. Run once per warm pass, after the probes.
 pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
     let s = snapshot();
-    let order = order_with(&s, DIRECT_USES_NORMAL_TIERS, usable);
+    if s.leader.is_some_and(is_streaming) { return; }
+    let order = order_with(&s, usable);
     let Some(&best) = order.first() else {
         return;
     };
@@ -859,7 +704,6 @@ pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
 /// Group, then Own, first when usable and not benched (`PINNED`). Then four tiers, each in the default
 /// order inside itself unless measured: proven (fastest first, the sitting
 /// leader kept unless clearly beaten), measured, unmeasured, penalised.
-/// Platforms where Direct is fallback-only place it in the penalised tier.
 ///
 /// A benched Own joins the benched tier like any other route. Putting it first
 /// regardless meant a region 400 through the user's proxy was answered by
@@ -867,7 +711,7 @@ pub fn refresh_leader(usable: impl Fn(Kind) -> bool) {
 /// said «следующее соединение пойдёт другим» and the next one went the same
 /// way, refusal after refusal. The bench ends, or an answer lifts it, and Own
 /// is first again.
-fn order_with(s: &Snapshot, direct_uses_normal_tiers: bool, usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
+fn order_with(s: &Snapshot, usable: impl Fn(Kind) -> bool) -> Vec<Kind> {
     let benched = |k: Kind| {
         penalised(&s.penalised, k) || penalised(&s.stumbled, k) || penalised(&s.silent, k)
     };
@@ -878,9 +722,8 @@ fn order_with(s: &Snapshot, direct_uses_normal_tiers: bool, usable: impl Fn(Kind
     // usable route has: the pin is an owner's preference for a road that works,
     // not for one that keeps drawing region-400 while the VPN carries the model.
     let other_proven = |k: Kind| {
-        ALL.iter().any(|&o| {
-            o != k && usable(o) && !benched(o) && proven(&s.ok_at, &s.bad_at, o)
-        })
+        ALL.iter()
+            .any(|&o| o != k && usable(o) && !benched(o) && proven(&s.ok_at, &s.bad_at, o))
     };
     for k in s.pinned {
         let refused_unproven = s.refused_at[k.index()].is_some() && !proven(&s.ok_at, &s.bad_at, k);
@@ -896,7 +739,7 @@ fn order_with(s: &Snapshot, direct_uses_normal_tiers: bool, usable: impl Fn(Kind
         .collect();
 
     let tier = |k: Kind| -> u8 {
-        if benched(k) || (k == Kind::Direct && !direct_uses_normal_tiers) {
+        if benched(k) {
             3
         } else if proven(&s.ok_at, &s.bad_at, k) {
             0
@@ -1026,11 +869,15 @@ impl Activity {
 struct Tunnel {
     id: u64,
     kind: Kind,
-    own: Option<std::sync::Weak<crate::upstream::OwnContext>>,
     /// Which gate host it carries. The client keeps a pool per host, and the two
     /// pools can sit on different routes - an event about one host must not be
     /// pinned on the other's tunnel.
     host: String,
+    /// Kept after close, so delayed client log lines still identify a DNS IP.
+    peer: Option<std::net::Ipv4Addr>,
+    /// The source address of the outbound socket, used to identify its interface.
+    #[cfg(not(target_os = "windows"))]
+    source: Option<std::net::IpAddr>,
     opened: Instant,
     closed: Option<Instant>,
     /// When a model answer was attributed to *this* tunnel. The one fact that
@@ -1047,370 +894,6 @@ struct Tunnel {
     /// the client side left the other direction blocked on an idle Google
     /// connection for minutes (G52).
     upstream: Option<TcpStream>,
-    dns_binding: Option<DnsBinding>,
-    dns_peer: Option<DnsPeerIdentity>,
-    // Conservative protection for an original plausible answer-bearing stream;
-    // this is not a per-tunnel claim that the model actually answered here.
-    dns_answered: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DnsAdmission {
-    pub(crate) ip: std::net::Ipv4Addr,
-    pub(crate) generation: u64,
-    #[cfg(target_os = "macos")]
-    interface: u32,
-}
-
-impl DnsAdmission {
-    // The production caller holds TABLE across the generation and Mac pin read.
-    fn new(ip: std::net::Ipv4Addr, generation: u64) -> Self {
-        Self {
-            ip,
-            generation,
-            #[cfg(target_os = "macos")]
-            interface: crate::net::pin_interface(),
-        }
-    }
-
-    pub(crate) fn pin_interface(self) -> u32 {
-        #[cfg(target_os = "macos")]
-        { self.interface }
-        #[cfg(not(target_os = "macos"))]
-        { crate::net::pin_interface() }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DnsPeerIdentity { pub(crate) host: String, pub(crate) ip: std::net::Ipv4Addr, pub(crate) generation: u64 }
-
-pub(crate) enum DnsSelection {
-    Ready(Vec<(DnsAdmission, crate::resolvers::DnsCandidate)>),
-    Pending,
-    NoEligible,
-}
-
-/// Called with the producer's freshly received settings witness. This counter
-/// represents observed changes only; it is not a cross-process mutation log.
-pub(crate) fn begin_dns_maintenance(host: &str, witness: &crate::resolvers::DnsSourceWitness, allow_missing_defaults: bool) -> Result<u64, String> {
-    if !crate::gate_hosts::is_public_dns_target(host, 443) { return Err("DNS candidate host denied".into()); }
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let live: Vec<DnsPeerIdentity> = TUNNELS.lock().map_err(|_| "tunnel state unavailable")?.iter()
-        .filter(|tunnel| tunnel.closed.is_none()).filter_map(|tunnel| tunnel.dns_peer.clone()).collect();
-    let mut table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    // Retain active peers, fresh qualifications, and refusal/model history for
-    // the existing proof-retention interval; expired input supplies no authority.
-    table.dns.entries.retain(|entry| entry.checked.is_some_and(|at| at.elapsed() < SAMPLE_TTL)
-        || entry.refusal_at.is_some_and(|at| at.elapsed() < PROOF_TTL)
-        || entry.model_seen.is_some_and(|at| at.elapsed() < PROOF_TTL)
-        || live.iter().any(|peer| peer.host == entry.host && peer.ip == entry.candidate.ip && peer.generation == entry.generation));
-    let network = current_dns_context(&table);
-    if table.dns.witness.as_ref() != Some(witness) || table.dns.network != network || table.dns.allow_missing_defaults != allow_missing_defaults {
-        table.dns.advance_generation()?;
-        table.dns.witness = Some(witness.clone());
-        table.dns.allow_missing_defaults = allow_missing_defaults;
-        table.dns.network = network;
-    }
-    if !table.dns.hosts.iter().any(|work| work.host == host) {
-        table.dns.hosts.push(DnsHostWork { host: host.clone(), cursor: Some(Default::default()),
-            queued: Vec::new(), exhausted: false, finished_at: None });
-    }
-    let has_ready = table.dns.entries.iter().any(|entry| entry.host == host && entry.generation == table.dns.generation
-        && entry.reachable && entry.checked.is_some_and(|at| at.elapsed() < SAMPLE_TTL)
-        && entry.silent_until.is_none_or(|until| Instant::now() >= until)
-        && (!entry.refusal_blocking || entry.refusal_at.is_none_or(|at| at.elapsed() >= FIRST_PENALTY)));
-    let retry_after = if has_ready { SAMPLE_TTL } else { crate::dns_forwarder::WARM_EVERY };
-    let work = table.dns.hosts.iter_mut().find(|work| work.host == host).expect("DNS host work inserted");
-    if work.exhausted && work.finished_at.is_some_and(|at| at.elapsed() >= retry_after) {
-        work.cursor = Some(Default::default());
-        work.exhausted = false;
-        work.finished_at = None;
-    }
-    let pending = !work.exhausted || !work.queued.is_empty();
-    if pending && !table.dns.pending.contains(&host) { table.dns.pending.push(host); }
-    Ok(table.dns.generation)
-}
-
-pub(crate) enum DnsMaintenanceWork {
-    Discover(crate::resolvers::DnsDiscoveryCursor),
-    Probe(crate::resolvers::DnsCandidate),
-    Complete,
-}
-
-pub(crate) fn dns_maintenance_host() -> Result<&'static str, String> {
-    let hosts: Vec<_> = crate::gate_hosts::public_dns_hosts().collect();
-    let mut table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    let host = hosts[table.dns.next_host % hosts.len()];
-    table.dns.next_host = (table.dns.next_host + 1) % hosts.len();
-    Ok(host)
-}
-
-pub(crate) fn seed_dns_candidates(host: &str, generation: u64, candidates: Vec<crate::resolvers::DnsCandidate>) -> Result<bool, String> {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let mut table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    if table.dns.generation != generation { return Ok(false); }
-    for candidate in candidates {
-        let existing = table.dns.entries.iter_mut().find(|entry| entry.host == host && entry.generation == generation && entry.candidate.ip == candidate.ip);
-        if let Some(entry) = existing {
-            if entry.candidate.merge(candidate.clone()) && entry.checked.is_some_and(|at| at.elapsed() < PROBE_STUMBLE_FOR) { continue; }
-        }
-        let work = table.dns.hosts.iter_mut().find(|work| work.host == host).ok_or("DNS maintenance host missing")?;
-        if let Some(queued) = work.queued.iter_mut().find(|queued| queued.ip == candidate.ip) {
-            if !queued.merge(candidate.clone()) { work.queued.push(candidate); }
-        } else { work.queued.push(candidate); }
-    }
-    let queued = table.dns.hosts.iter().find(|work| work.host == host).is_some_and(|work| !work.queued.is_empty());
-    if queued && !table.dns.pending.contains(&host) { table.dns.pending.push(host); }
-    Ok(true)
-}
-
-pub(crate) fn take_dns_maintenance(host: &str, generation: u64) -> Result<Option<DnsMaintenanceWork>, String> {
-    let mut table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    if table.dns.generation != generation { return Ok(None); }
-    let work = table.dns.hosts.iter_mut().find(|work| work.host == host).ok_or("DNS maintenance host missing")?;
-    if !work.queued.is_empty() { return Ok(Some(DnsMaintenanceWork::Probe(work.queued.remove(0)))); }
-    if work.exhausted { return Ok(Some(DnsMaintenanceWork::Complete)); }
-    Ok(work.cursor.take().map(DnsMaintenanceWork::Discover))
-}
-
-pub(crate) fn receive_dns_discovery(host: &str, generation: u64, cursor: crate::resolvers::DnsDiscoveryCursor,
-    exhausted: bool) -> Result<bool, String> {
-    let mut table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    if table.dns.generation != generation { return Ok(false); }
-    let work = table.dns.hosts.iter_mut().find(|work| work.host == host).ok_or("DNS maintenance host missing")?;
-    if work.cursor.is_some() { return Err("DNS discovery cursor already owned".into()); }
-    work.cursor = Some(cursor);
-    work.exhausted = exhausted;
-    Ok(true)
-}
-
-/// The caller verifies the captured source witness against a fresh settings
-/// read before publication; this owner rejects a superseded local generation.
-pub(crate) fn publish_dns_candidate(host: &str, generation: u64, candidate: crate::resolvers::DnsCandidate,
-    result: Result<crate::proxy::CandidateProbe, String>) -> Result<bool, String> {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if !crate::gate_hosts::is_public_dns_target(&host, 443) || !crate::resolvers::is_public_v4(candidate.ip) {
-        return Err("DNS candidate host or address denied".into());
-    }
-    let peer = DnsPeerIdentity { host: host.clone(), ip: candidate.ip, generation };
-    let protected = live_dns_answer(&peer);
-    let mut table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    if table.dns.generation != generation || table.dns.network != current_dns_context(&table) { return Ok(false); }
-    if protected && !matches!(&result, Ok(crate::proxy::CandidateProbe::Reachable(_))) { return Ok(true); }
-    let pos = table.dns.entries.iter().position(|entry| entry.host == host && entry.candidate.ip == candidate.ip);
-    let entry = match pos {
-        Some(pos) => &mut table.dns.entries[pos],
-        None => {
-            table.dns.entries.push(DnsEndpoint { host, candidate: candidate.clone(), generation,
-                checked: None, latency: Duration::MAX, reachable: false, refusal_at: None, refusal_blocking: false, model_proven: false, model_seen: None,
-                silent_until: None, silent_streak: 0, drop_streak: 0, drop_continuity: None, last_event_at: None, last_event_source: None });
-            table.dns.entries.last_mut().expect("inserted DNS endpoint")
-        }
-    };
-    if entry.generation != generation {
-        entry.model_proven = false;
-        entry.reachable = false;
-        entry.silent_until = None;
-        entry.silent_streak = 0;
-        entry.drop_streak = 0;
-        entry.drop_continuity = None;
-        entry.last_event_at = None;
-        entry.last_event_source = None;
-        entry.candidate = candidate;
-    } else if !entry.candidate.merge(candidate.clone()) {
-        entry.candidate = candidate;
-    }
-    entry.generation = generation;
-    entry.checked = Some(Instant::now());
-    match result {
-        Ok(crate::proxy::CandidateProbe::Reachable(latency)) => { entry.reachable = true; entry.latency = latency; }
-        Ok(crate::proxy::CandidateProbe::Refused) => { entry.reachable = false; entry.refusal_at = Some(Instant::now()); entry.refusal_blocking = true; entry.model_proven = false; }
-        Err(_) => { entry.reachable = false; }
-    }
-    DNS_CHANGED.notify_all();
-    Ok(true)
-}
-
-pub(crate) fn finish_dns_maintenance(host: &str, generation: u64) {
-    if let Ok(mut table) = TABLE.lock() {
-        if table.dns.generation == generation {
-            let host = host.trim_end_matches('.').to_ascii_lowercase();
-            table.dns.pending.retain(|pending| pending != &host);
-            if let Some(work) = table.dns.hosts.iter_mut().find(|work| work.host == host) { work.finished_at = Some(Instant::now()); }
-            DNS_CHANGED.notify_all();
-        }
-    }
-}
-
-pub(crate) fn abandon_dns_maintenance(host: &str, generation: u64) {
-    if let Ok(mut table) = TABLE.lock() {
-        if table.dns.generation == generation {
-            table.dns.pending.retain(|pending| pending != host);
-            table.dns.hosts.retain(|work| work.host != host);
-            DNS_CHANGED.notify_all();
-        }
-    }
-}
-
-pub(crate) fn suspend_dns_maintenance() {
-    if let Ok(mut table) = TABLE.lock() {
-        table.dns.witness = None;
-        table.dns.pending.clear();
-        table.dns.hosts.clear();
-        DNS_CHANGED.notify_all();
-    }
-}
-
-pub(crate) fn dns_has_pending_maintenance() -> bool {
-    TABLE.lock().ok().is_some_and(|table| !table.dns.pending.is_empty())
-}
-
-pub(crate) fn register_dns_maintenance_thread() {
-    if let Ok(mut table) = TABLE.lock() { table.dns.maintenance_thread = Some(std::thread::current()); }
-}
-
-pub(crate) fn unregister_dns_maintenance_thread() {
-    if let Ok(mut table) = TABLE.lock() {
-        if table.dns.maintenance_thread.as_ref().is_some_and(|thread| thread.id() == std::thread::current().id()) {
-            table.dns.maintenance_thread = None;
-        }
-    }
-}
-
-pub(crate) fn request_dns_refresh(host: &str) {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if !crate::gate_hosts::is_public_dns_target(&host, 443) { return; }
-    let wake = TABLE.lock().ok().and_then(|mut table| {
-        for entry in &mut table.dns.entries { if entry.host == host { entry.reachable = false; } }
-        if let Some(work) = table.dns.hosts.iter_mut().find(|work| work.host == host) {
-            if work.exhausted { work.cursor = Some(Default::default()); work.exhausted = false; work.finished_at = None; }
-        }
-        if !table.dns.pending.contains(&host) { table.dns.pending.push(host); }
-        table.dns.maintenance_thread.clone()
-    });
-    if let Some(wake) = wake { wake.unpark(); }
-}
-
-pub(crate) fn wait_dns_change(budget: Duration) -> Result<(), String> {
-    let table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    let _guard = DNS_CHANGED.wait_timeout(table, budget).map_err(|_| "route state unavailable")?;
-    Ok(())
-}
-
-pub(crate) fn dns_selection(host: &str, witness: &crate::resolvers::DnsSourceWitness) -> Result<DnsSelection, String> {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let table = TABLE.lock().map_err(|_| "route state unavailable")?;
-    let network = current_dns_context(&table);
-    if table.dns.witness.as_ref() != Some(witness) || table.dns.network != network { return Ok(DnsSelection::Pending); }
-    let generation = table.dns.generation;
-    let mut ready: Vec<_> = table.dns.entries.iter().filter(|entry| entry.host == host && entry.generation == generation
-        && entry.reachable && entry.checked.is_some_and(|at| at.elapsed() < SAMPLE_TTL)
-        && entry.silent_until.is_none_or(|until| Instant::now() >= until)
-        && (!entry.refusal_blocking || entry.refusal_at.is_none_or(|at| at.elapsed() >= FIRST_PENALTY)))
-        .map(|entry| (entry.model_proven && network.is_some(), entry.latency, entry.candidate.clone())).collect();
-    ready.sort_by_key(|(proven, latency, _)| (!*proven, *latency));
-    if !ready.is_empty() {
-        return Ok(DnsSelection::Ready(ready.into_iter().map(|(_, _, candidate)|
-            (DnsAdmission::new(candidate.ip, generation), candidate)).collect()));
-    }
-    if table.dns.pending.contains(&host) { Ok(DnsSelection::Pending) } else { Ok(DnsSelection::NoEligible) }
-}
-
-pub(crate) fn dns_admission_current(host: &str, admission: DnsAdmission, witness: &crate::resolvers::DnsSourceWitness) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let Ok(table) = TABLE.lock() else { return false; };
-    let network = current_dns_context(&table);
-    #[cfg(target_os = "macos")]
-    if admission.interface != crate::net::pin_interface() { return false; }
-    table.dns.generation == admission.generation && table.dns.network == network && table.dns.witness.as_ref() == Some(witness)
-        && table.dns.entries.iter().any(|entry| entry.host == host && entry.generation == admission.generation
-            && entry.candidate.ip == admission.ip && entry.reachable && entry.checked.is_some_and(|at| at.elapsed() < SAMPLE_TTL)
-            && entry.silent_until.is_none_or(|until| Instant::now() >= until)
-            && (!entry.refusal_blocking || entry.refusal_at.is_none_or(|at| at.elapsed() >= FIRST_PENALTY)))
-}
-
-pub(crate) fn dns_maintenance_pending(host: &str, witness: &crate::resolvers::DnsSourceWitness) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    TABLE.lock().ok().is_some_and(|table| table.dns.witness.as_ref() == Some(witness)
-        && table.dns.network == current_dns_context(&table) && table.dns.pending.contains(&host))
-}
-
-#[cfg(test)]
-fn apply_dns_feedback(dns: &mut DnsState, peer: &DnsPeerIdentity, answered: bool) -> bool {
-    let network_measured = dns.network.is_some();
-    if let Some(entry) = dns.entries.iter_mut().find(|entry|
-        entry.generation == peer.generation && entry.host == peer.host && entry.candidate.ip == peer.ip) {
-        if answered {
-            entry.model_seen = Some(Instant::now());
-            if network_measured { entry.model_proven = true; entry.refusal_blocking = false; entry.silent_until = None; entry.silent_streak = 0; }
-        } else { entry.model_proven = false; entry.refusal_at = Some(Instant::now()); entry.refusal_blocking = true; }
-        true
-    } else { false }
-}
-
-pub(crate) enum LogFeedback {
-    Direct { applied: bool, tunnel: u64 },
-    Other(Option<(Kind, u64)>),
-    Ambiguous,
-}
-
-/// Aggregate observations retain their legacy path only for non-Direct routes.
-/// Direct authority comes exclusively from the separately received batch.
-pub(crate) fn receive_log_feedback(at: Instant, route_host: Option<&str>, _endpoint_host: Option<&str>, _answered: Option<bool>) -> LogFeedback {
-    let host = route_host.map(|h| h.trim_end_matches('.').to_ascii_lowercase());
-    let Ok(list) = TUNNELS.lock() else { return LogFeedback::Ambiguous; };
-    let mut direct = false;
-    let mut other = false;
-    let mut newest: Option<&Tunnel> = None;
-    for tunnel in list.iter().filter(|t| host.as_ref().is_none_or(|h| *h == t.host))
-        .filter(|t| t.opened <= at + ATTRIBUTION_SLACK)
-        .filter(|t| t.closed.is_none_or(|closed| closed + ATTRIBUTION_SLACK >= at)) {
-        if tunnel.kind == Kind::Direct { direct = true; } else { other = true; }
-        if newest.is_none_or(|old| old.opened <= tunnel.opened) { newest = Some(tunnel); }
-    }
-    if direct && other { return LogFeedback::Ambiguous; }
-    let carried = newest.map(|t| (t.kind, t.id));
-    if let Some((Kind::Direct, tunnel)) = carried {
-        LogFeedback::Direct { applied: false, tunnel }
-    } else { LogFeedback::Other(carried) }
-}
-
-fn live_dns_answer(peer: &DnsPeerIdentity) -> bool {
-    TUNNELS.lock().ok().is_some_and(|list| list.iter().any(|t|
-        t.closed.is_none() && t.dns_answered && t.dns_peer.as_ref() == Some(peer)))
-}
-
-fn apply_dns_silence(dns: &mut DnsState, peer: &DnsPeerIdentity, protected: bool) -> Option<Duration> {
-    if dns.generation != peer.generation || protected { return None; }
-    let measured = dns.network.is_some();
-    let entry = dns.entries.iter_mut().find(|entry|
-        entry.generation == peer.generation && entry.host == peer.host && entry.candidate.ip == peer.ip)?;
-    if entry.silent_until.is_some_and(|until| Instant::now() < until)
-        || (entry.refusal_blocking && entry.refusal_at.is_some_and(|at| at.elapsed() < FIRST_PENALTY))
-        || (measured && entry.model_proven && entry.model_seen.is_some_and(|at| at.elapsed() < PROOF_PROTECTS_FOR)) {
-        return None;
-    }
-    let index = (entry.silent_streak as usize).min(SILENT_STEPS.len() - 1);
-    let duration = SILENT_STEPS[index];
-    entry.silent_until = Instant::now().checked_add(duration);
-    if entry.silent_until.is_none() { return None; }
-    entry.silent_streak = entry.silent_streak.saturating_add(1);
-    Some(duration)
-}
-
-/// A silent tunnel may affect only its own currently witnessed endpoint.
-fn dns_silence(peer: &DnsPeerIdentity, binding: &DnsBinding) -> Option<Duration> {
-    let protected = live_dns_answer(peer);
-    let policy = if binding.allow_missing_defaults { crate::resolvers::DnsMissingPolicy::LegacyDefaults } else { crate::resolvers::DnsMissingPolicy::RequireSettings };
-    let fresh = crate::resolvers::current_witness(policy).ok()?;
-    if fresh != binding.witness || !crate::resolvers::source_is_current(&binding.candidate, &fresh).ok()? { return None; }
-    let mut table = TABLE.lock().ok()?;
-    let network = current_dns_context(&table);
-    if table.dns.generation != peer.generation || table.dns.network != network || table.dns.witness.as_ref() != Some(&fresh) { return None; }
-    if !crate::resolvers::source_is_current(&binding.candidate, &fresh).ok()? { return None; }
-    let current = table.dns.entries.iter().find(|entry| entry.generation == peer.generation && entry.host == peer.host && entry.candidate.ip == peer.ip)?;
-    if !crate::resolvers::source_is_current(&current.candidate, &fresh).ok()? { return None; }
-    apply_dns_silence(&mut table.dns, peer, protected)
 }
 
 static TUNNELS: Mutex<Vec<Tunnel>> = Mutex::new(Vec::new());
@@ -1427,16 +910,6 @@ struct Serving {
     tunnel: Option<u64>,
     /// Handed to the pump by `serving_activity` once `note_used` has made one.
     activity: Option<Arc<Activity>>,
-    own: Option<Arc<crate::upstream::OwnContext>>,
-    dns_binding: Option<DnsBinding>,
-}
-
-#[derive(Clone)]
-struct DnsBinding {
-    admission: DnsAdmission,
-    candidate: crate::resolvers::DnsCandidate,
-    witness: crate::resolvers::DnsSourceWitness,
-    allow_missing_defaults: bool,
 }
 
 thread_local! {
@@ -1456,61 +929,9 @@ pub fn begin_gate_connection(client: &TcpStream, host: &str) -> GateConnection {
             host: host.trim_end_matches('.').to_ascii_lowercase(),
             tunnel: None,
             activity: None,
-            own: None,
-            dns_binding: None,
         })
     });
     GateConnection { _private: () }
-}
-
-pub(crate) fn bind_serving_own(own: Arc<crate::upstream::OwnContext>) {
-    SERVING.with(|s| { if let Some(serving) = s.borrow_mut().as_mut() { serving.own = Some(own); } });
-}
-
-pub(crate) fn bind_serving_dns(admission: DnsAdmission, candidate: crate::resolvers::DnsCandidate,
-    witness: crate::resolvers::DnsSourceWitness, allow_missing_defaults: bool) -> bool {
-    SERVING.with(|s| {
-        let mut state = s.borrow_mut();
-        let Some(serving) = state.as_mut() else { return false; };
-        serving.dns_binding = Some(DnsBinding { admission, candidate, witness, allow_missing_defaults });
-        true
-    })
-}
-
-/// Revalidate a selected candidate against fresh inputs and the real socket
-/// immediately before any CONNECT response bytes. Non-candidate paths are
-/// unchanged and return Ok without manufacturing a binding.
-pub(crate) fn validate_serving_dns(socket: &TcpStream) -> Result<(), String> {
-    let binding = SERVING.with(|s| s.borrow().as_ref().and_then(|serving| serving.dns_binding.clone()));
-    let Some(binding) = binding else { return Ok(()); };
-    let policy = if binding.allow_missing_defaults { crate::resolvers::DnsMissingPolicy::LegacyDefaults } else { crate::resolvers::DnsMissingPolicy::RequireSettings };
-    let fresh = crate::resolvers::current_witness(policy).map_err(|_| "DNS source settings unavailable")?;
-    let source_current = crate::resolvers::source_is_current(&binding.candidate, &fresh).map_err(|error| format!("DNS source check failed before commit: {error:?}"))?;
-    if fresh != binding.witness || !source_current {
-        return Err("DNS candidate source changed".into());
-    }
-    let host = SERVING.with(|s| s.borrow().as_ref().map(|serving| serving.host.clone())).ok_or("DNS serving context missing")?;
-    if !dns_admission_current(&host, binding.admission, &fresh) { return Err("DNS candidate eligibility changed".into()); }
-    let expected = std::net::SocketAddr::from((binding.admission.ip, 443));
-    if socket.peer_addr().ok() != Some(expected) { return Err("DNS candidate peer changed".into()); }
-    Ok(())
-}
-
-/// The last check at the Mac write boundary uses only current route state.
-/// Source settings and the peer socket were checked before preparing transfer.
-#[cfg(target_os = "macos")]
-pub(crate) fn validate_mac_serving_generation() -> Result<(), String> {
-    SERVING.with(|state| {
-        let serving = state.borrow();
-        if let Some(serving) = serving.as_ref() {
-            if let Some(binding) = serving.dns_binding.as_ref() {
-                if !dns_admission_current(&serving.host, binding.admission, &binding.witness) {
-                    return Err("DNS candidate generation or interface changed before CONNECT write".into());
-                }
-            }
-        }
-        Ok(())
-    })
 }
 
 /// Ends the current thread's gate-connection record when dropped.
@@ -1531,60 +952,44 @@ pub fn attach_upstream(upstream: &TcpStream) {
     let Some(id) = SERVING.with(|s| s.borrow().as_ref().and_then(|s| s.tunnel)) else {
         return;
     };
-    let peer = upstream.peer_addr().ok();
     let Ok(clone) = upstream.try_clone() else {
         return;
     };
     if let Ok(mut list) = TUNNELS.lock() {
         if let Some(t) = list.iter_mut().find(|t| t.id == id && t.closed.is_none()) {
-            if t.kind == Kind::Direct {
-                if let (Some(binding), Some(std::net::SocketAddr::V4(actual))) = (t.dns_binding.as_ref(), peer) {
-                    let admission = binding.admission;
-                    if *actual.ip() == admission.ip && actual.port() == 443 {
-                        t.dns_peer = Some(DnsPeerIdentity { host: t.host.clone(), ip: admission.ip, generation: admission.generation });
-                    }
-                }
-            }
+            t.peer = upstream.peer_addr().ok().and_then(|a| match a.ip() {
+                std::net::IpAddr::V4(ip) => Some(ip),
+                _ => None,
+            });
             t.upstream = Some(clone);
+            #[cfg(not(target_os = "windows"))]
+            {
+                t.source = upstream.local_addr().ok().map(|addr| addr.ip());
+            }
         }
     }
 }
 
 /// Ends the current thread's gate-connection record.
 fn end_gate_connection() {
-    let serving = SERVING.with(|s| s.borrow_mut().take());
-    let Some(serving) = serving else { return };
-    let Some(id) = serving.tunnel else { return };
+    let tunnel = SERVING.with(|s| s.borrow_mut().take().and_then(|s| s.tunnel));
+    let Some(id) = tunnel else { return };
     let mut went_silent = None;
-    let mut direct_silent = None;
     if let Ok(mut list) = TUNNELS.lock() {
         if let Some(t) = list.iter_mut().find(|t| t.id == id) {
             t.closed = Some(Instant::now());
             t.client = None;
             t.upstream = None;
             let (to_client, to_upstream) = t.activity.bytes();
-            if t.kind != Kind::Direct && is_silent(to_client, to_upstream) && t.answered_at.is_none() {
+            if is_silent(to_client, to_upstream) && t.answered_at.is_none() {
                 went_silent = Some(t.kind);
-            } else if t.kind == Kind::Direct && is_silent(to_client, to_upstream) && !t.dns_answered {
-                direct_silent = t.dns_peer.clone().zip(t.dns_binding.clone());
             }
         }
         prune(&mut list);
     }
-    if let Some((peer, binding)) = direct_silent {
-        if let Some(bench) = dns_silence(&peer, &binding) {
-            note(&format!("DNS Direct: проверенный адрес не ответил — отложен на {} мин", bench.as_secs() / 60));
-        }
-    }
     // After `TUNNELS` is released: the two locks are never held together (G30).
     if let Some(kind) = went_silent {
-        let bench = if kind == Kind::Own {
-            serving.own.as_ref().and_then(|own| {
-                let streaming = live_answer_own(own).is_some();
-                own.if_current(|| silence(kind, streaming)).flatten()
-            })
-        } else { silence(kind, live_answer(kind).is_some()) };
-        if let Some(bench) = bench {
+        if let Some(bench) = silence(kind, live_answer(kind).is_some()) {
             note(&format!(
                 "{}: соединение открылось, но Google не ответил ни байта — маршрут отложен на {} мин, следующие соединения идут другим путём",
                 kind.label(),
@@ -1637,8 +1042,11 @@ pub fn bench_dropping(kind: Kind) -> Option<Duration> {
 /// goes out, i.e. once the route is the one the client is actually on.
 pub fn note_used(kind: Kind) {
     let now = Instant::now();
+    if let Ok(mut t) = TABLE.lock() {
+        t.last_used = Some((kind, now));
+    }
     let id = NEXT_TUNNEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (client, host, own, dns_binding) = SERVING
+    let (client, host) = SERVING
         .with(|s| {
             let mut s = s.borrow_mut();
             let serving = s.as_mut()?;
@@ -1646,15 +1054,9 @@ pub fn note_used(kind: Kind) {
             Some((
                 serving.client.as_ref().and_then(|c| c.try_clone().ok()),
                 serving.host.clone(),
-                if kind == Kind::Own { serving.own.clone() } else { None },
-                if kind == Kind::Direct { serving.dns_binding.clone() } else { None },
             ))
         })
         .unwrap_or_default();
-    let publish = || { if let Ok(mut t) = TABLE.lock() { t.last_used = Some((kind, now)); } };
-    if kind == Kind::Own {
-        if let Some(bound) = own.as_ref() { bound.if_current(publish); }
-    } else { publish(); }
     let activity = Arc::new(Activity::default());
     SERVING.with(|s| {
         if let Some(serving) = s.borrow_mut().as_mut() {
@@ -1665,17 +1067,16 @@ pub fn note_used(kind: Kind) {
         list.push(Tunnel {
             id,
             kind,
-            own: own.as_ref().map(Arc::downgrade),
             host,
+            peer: None,
+            #[cfg(not(target_os = "windows"))]
+            source: None,
             opened: now,
             closed: None,
             answered_at: None,
             activity,
             client,
             upstream: None,
-            dns_binding,
-            dns_peer: None,
-            dns_answered: false,
         });
         prune(&mut list);
     }
@@ -1712,6 +1113,31 @@ pub fn open_counts() -> [u32; N] {
     out
 }
 
+#[cfg(not(target_os = "windows"))]
+pub fn note_upstream_source(upstream: &TcpStream) {
+    let Some(id) = SERVING.with(|s| s.borrow().as_ref().and_then(|s| s.tunnel)) else {
+        return;
+    };
+    if let Ok(mut list) = TUNNELS.lock() {
+        if let Some(tunnel) = list.iter_mut().find(|t| t.id == id && t.closed.is_none()) {
+            tunnel.source = upstream.local_addr().ok().map(|addr| addr.ip());
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn open_upstream_sources() -> Vec<std::net::IpAddr> {
+    TUNNELS.lock().map_or_else(
+        |_| Vec::new(),
+        |list| {
+            list.iter()
+                .filter(|t| t.closed.is_none())
+                .filter_map(|t| t.source)
+                .collect()
+        },
+    )
+}
+
 /// Closes every open gate tunnel on `kind`. The splice under each ends on the
 /// shutdown, the client sees its connection go and dials again - and its next
 /// connection is offered to the table afresh.
@@ -1734,20 +1160,16 @@ fn cut_tunnels(kind: Kind) {
 /// Closes every open gate tunnel on `kind`, answered or not. Only for the user's
 /// own switch-off of a route: D32 guards a live answer against *our* mistaken
 /// cuts, and a route the user turned off must not keep carrying traffic.
-pub(crate) fn cut_absent_own() -> Result<(), String> {
-    let sockets = crate::upstream::while_own_absent(|| {
-        let mut list = TUNNELS.lock().map_err(|_| "tunnel owner unavailable".to_string())?;
-        Ok::<_, String>(list.iter_mut().filter(|t| t.kind == Kind::Own && t.closed.is_none())
-            .flat_map(|t| [t.client.take(), t.upstream.take()].into_iter().flatten()).collect::<Vec<_>>())
-    })?;
-    if let Some(sockets) = sockets {
-        for sock in sockets? {
-            if let Err(error) = sock.shutdown(std::net::Shutdown::Both) {
-                crate::dns_forwarder::log_proxy(&format!("own tunnel shutdown failed: {error}"));
-            }
+pub fn cut_kind(kind: Kind) {
+    let Ok(mut list) = TUNNELS.lock() else { return };
+    for t in list
+        .iter_mut()
+        .filter(|t| t.kind == kind && t.closed.is_none())
+    {
+        for sock in [t.client.take(), t.upstream.take()].into_iter().flatten() {
+            sock.shutdown(std::net::Shutdown::Both).ok();
         }
     }
-    Ok(())
 }
 
 /// The route that carried a request answered at `at`: the one with a tunnel
@@ -1777,393 +1199,6 @@ pub fn attribute_tunnel(at: Instant, host: Option<&str>) -> Option<(Kind, u64)> 
         .map(|t| (t.kind, t.id))
 }
 
-/// Endpoint evidence is valid only if every plausible tunnel names the same
-/// actual checked peer and admission generation. Aggregate attribution remains
-/// unchanged for the existing route-level controls.
-fn matching_dns_tunnels<'a>(list: &'a [Tunnel], at: Instant, host: &str) -> Option<(DnsPeerIdentity, Vec<&'a Tunnel>)> {
-    let mut matches = list.iter().filter(|t| t.host == host)
-        .filter(|t| t.opened <= at + ATTRIBUTION_SLACK)
-        .filter(|t| t.closed.is_none_or(|closed| closed + ATTRIBUTION_SLACK >= at));
-    let first = matches.next()?;
-    let peer = first.dns_peer.clone()?;
-    let mut found = vec![first];
-    for tunnel in matches {
-        if tunnel.dns_peer.as_ref() != Some(&peer) { return None; }
-        found.push(tunnel);
-    }
-    Some((peer, found))
-}
-
-#[cfg(test)]
-fn unique_dns_peer(at: Instant, host: Option<&str>) -> Option<DnsPeerIdentity> {
-    let host = host?.trim_end_matches('.').to_ascii_lowercase();
-    let list = TUNNELS.lock().ok()?;
-    matching_dns_tunnels(&list, at, &host).map(|(peer, _)| peer)
-}
-
-fn dns_feedback_bindings(at: Instant, host: Option<&str>) -> Option<(DnsPeerIdentity, Vec<(u64, DnsBinding)>)> {
-    let host = host?.trim_end_matches('.').to_ascii_lowercase();
-    let list = TUNNELS.lock().ok()?;
-    let (peer, plausible) = matching_dns_tunnels(&list, at, &host)?;
-    let bindings = plausible.into_iter().map(|tunnel| tunnel.dns_binding.clone().map(|binding| (tunnel.id, binding))).collect::<Option<Vec<_>>>()?;
-    Some((peer, bindings))
-}
-
-pub(crate) enum ShutdownSide {
-    Succeeded,
-    Missing,
-    Failed(std::io::Error),
-}
-
-pub(crate) enum DirectBatchEffect {
-    NoAction(&'static str),
-    StateChanged,
-    Protected,
-    AlreadyClosed,
-    Shutdown { client: ShutdownSide, upstream: ShutdownSide },
-}
-
-struct PreparedDirect {
-    peer: DnsPeerIdentity,
-    ids: Vec<u64>,
-    witness: crate::resolvers::DnsSourceWitness,
-    needs_explicit: bool,
-    needs_legacy: bool,
-}
-
-fn prepare_direct_signal(signal: &crate::ls_log::DirectSignal,
-    initial_explicit: Option<&crate::resolvers::DnsSourceWitness>, initial_legacy: Option<&crate::resolvers::DnsSourceWitness>) -> Option<PreparedDirect> {
-    if signal.conflicting_record || signal.source.is_none() || signal.record_start >= signal.record_end { return None; }
-    let at = signal.at?;
-    if at > Instant::now() || at.elapsed() > TUNNEL_MEMORY { return None; }
-    let host = signal.host.as_deref()?;
-    if !crate::gate_hosts::is_public_dns_target(host, 443) { return None; }
-    let (peer, bindings) = dns_feedback_bindings(at, Some(host))?;
-    let mut witness = None;
-    let mut needs_explicit = false;
-    let mut needs_legacy = false;
-    for (_, binding) in &bindings {
-        needs_explicit |= !binding.allow_missing_defaults;
-        needs_legacy |= binding.allow_missing_defaults;
-        let fresh = if binding.allow_missing_defaults { initial_legacy? } else { initial_explicit? };
-        if *fresh != binding.witness || !crate::resolvers::source_is_current(&binding.candidate, fresh).ok()? { return None; }
-        if witness.as_ref().is_some_and(|previous| previous != fresh) { return None; }
-        witness = Some(fresh.clone());
-    }
-    Some(PreparedDirect { peer, ids: bindings.into_iter().map(|(id, _)| id).collect(), witness: witness?, needs_explicit, needs_legacy })
-}
-
-struct DirectCutPlan { peer: DnsPeerIdentity, id: u64, witness: crate::resolvers::DnsSourceWitness }
-
-#[cfg(test)]
-static DIRECT_PREPARED_TEST_PAUSE: Mutex<Option<(std::sync::mpsc::Sender<bool>, std::sync::mpsc::Receiver<()>)>> = Mutex::new(None);
-
-/// Receive a complete drain once. Only this owner applies Direct state and
-/// recovers the exact original sockets; no aggregate Direct fallback follows.
-pub(crate) fn receive_direct_batch(signals: &[crate::ls_log::DirectSignal]) -> Vec<DirectBatchEffect> {
-    use crate::ls_log::{DirectSignalKind, SignalContinuity};
-    if signals.is_empty() { return Vec::new(); }
-    let initial_explicit = crate::resolvers::current_witness(crate::resolvers::DnsMissingPolicy::RequireSettings).ok();
-    let initial_legacy = crate::resolvers::current_witness(crate::resolvers::DnsMissingPolicy::LegacyDefaults).ok();
-    let mut order: Vec<_> = signals.iter().collect();
-    order.sort_by_key(|signal| signal.at);
-    let mut tied = vec![false; order.len()];
-    let mut start = 0;
-    while start < order.len() {
-        let mut end = start + 1;
-        while end < order.len() && order[end].at == order[start].at { end += 1; }
-        if order[start].at.is_some() && order[start..end].iter().any(|signal| signal.source != order[start].source) {
-            tied[start..end].fill(true);
-        } else {
-            order[start..end].sort_by_key(|signal| signal.record_start);
-        }
-        start = end;
-    }
-    let mut binding_cache: std::collections::HashMap<(String, Instant), Option<Arc<PreparedDirect>>> = std::collections::HashMap::new();
-    let prepared: Vec<_> = order.iter().enumerate().map(|(index, signal)| {
-        if (tied[index] && !matches!(&signal.kind, DirectSignalKind::Answer))
-            || signal.conflicting_record || signal.source.is_none() || signal.record_start >= signal.record_end {
-            return None;
-        }
-        let key = (signal.host.as_ref()?.clone(), signal.at?);
-        binding_cache.entry(key).or_insert_with(|| prepare_direct_signal(signal, initial_explicit.as_ref(), initial_legacy.as_ref()).map(Arc::new)).clone()
-    }).collect();
-    #[cfg(test)]
-    {
-        let pause = DIRECT_PREPARED_TEST_PAUSE.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some((entered, release)) = pause {
-            if entered.send(prepared.iter().any(Option::is_some)).is_ok() { let _ = release.recv_timeout(Duration::from_secs(10)); }
-        }
-    }
-    // A final uncached observation occurs after preparation and immediately
-    // before entering the in-memory batch transaction.
-    let requires_settings = prepared.iter().flatten().any(|item| item.needs_explicit);
-    let allows_legacy = prepared.iter().flatten().any(|item| item.needs_legacy);
-    let current_explicit = requires_settings.then(|| crate::resolvers::current_witness(crate::resolvers::DnsMissingPolicy::RequireSettings));
-    let current_legacy = allows_legacy.then(|| crate::resolvers::current_witness(crate::resolvers::DnsMissingPolicy::LegacyDefaults));
-    let mut results = Vec::new();
-    let mut plans: Vec<DirectCutPlan> = Vec::new();
-    let mut sockets: Vec<(Option<TcpStream>, Option<TcpStream>)> = Vec::new();
-    {
-        // Existing lock order: tunnel owner before routes table. No I/O while
-        // locked; original handles are taken only after the whole drain.
-        let Ok(mut tunnels) = TUNNELS.lock() else { return vec![DirectBatchEffect::NoAction("tunnel state unavailable")]; };
-        let Ok(mut table) = TABLE.lock() else { return vec![DirectBatchEffect::NoAction("route state unavailable")]; };
-        let expired: Vec<_> = table.dns.consumed.iter().filter(|cursor| cursor.observed.elapsed() >= TUNNEL_MEMORY)
-            .map(|cursor| cursor.source.clone()).collect();
-        table.dns.consumed.retain(|cursor| cursor.observed.elapsed() < TUNNEL_MEMORY);
-        for entry in &mut table.dns.entries {
-            if entry.drop_continuity.as_ref().is_some_and(|(source, _)| expired.contains(source)) { entry.drop_continuity = None; }
-        }
-        // Admit exact source spans against the committed pre-batch cursor in
-        // physical order. Chronological evaluation below cannot advance that
-        // cursor past another still-unprocessed fresh record.
-        let mut sources: std::collections::HashMap<crate::ls_log::LogSourceId, Vec<usize>> = std::collections::HashMap::new();
-        for (index, signal) in order.iter().enumerate() {
-            if let Some(source) = signal.source.as_ref() { sources.entry(source.clone()).or_default().push(index); }
-        }
-        let mut admitted = vec![false; order.len()];
-        let mut boundary = vec![None; order.len()];
-        for (source, mut indices) in sources {
-            indices.sort_by_key(|index| (order[*index].record_start, order[*index].record_end));
-            let mut overlaps = std::collections::HashSet::new();
-            let mut widest: Option<usize> = None;
-            for &index in &indices {
-                if let Some(prior) = widest {
-                    let a = order[prior]; let b = order[index];
-                    if b.record_start < a.record_end && (a.record_start, a.record_end) != (b.record_start, b.record_end) {
-                        overlaps.insert(prior); overlaps.insert(index);
-                    }
-                    if b.record_end > a.record_end { widest = Some(index); }
-                } else { widest = Some(index); }
-            }
-            let cursor = table.dns.consumed.iter().position(|cursor| cursor.source == source);
-            let mut end = cursor.map_or(0, |index| table.dns.consumed[index].end);
-            let mut latest_boundary = cursor.and_then(|index| table.dns.consumed[index].boundary);
-            let mut advanced = false;
-            for index in indices {
-                let signal = order[index];
-                if signal.record_start >= signal.record_end { continue; }
-                if signal.record_start < end {
-                    if overlaps.contains(&index) && signal.record_end > end {
-                        end = signal.record_end;
-                        advanced = true;
-                    }
-                    continue;
-                }
-                if overlaps.contains(&index) {
-                    end = signal.record_end;
-                    advanced = true;
-                    latest_boundary = Some(signal.record_start);
-                    continue;
-                }
-                admitted[index] = true;
-                end = signal.record_end;
-                advanced = true;
-                if signal.continuity == SignalContinuity::Fence || prepared[index].is_none() {
-                    latest_boundary = Some(signal.record_start);
-                }
-                boundary[index] = latest_boundary;
-            }
-            if advanced {
-                if let Some(index) = cursor {
-                    table.dns.consumed[index].end = end;
-                    table.dns.consumed[index].boundary = latest_boundary;
-                    table.dns.consumed[index].observed = Instant::now();
-                } else {
-                    table.dns.consumed.push(DnsSourceCursor { source, end, boundary: latest_boundary, observed: Instant::now() });
-                }
-            }
-        }
-        for (index, (signal, prepared)) in order.into_iter().zip(prepared).enumerate() {
-            let Some(source) = signal.source.as_ref() else {
-                for entry in &mut table.dns.entries { entry.drop_continuity = None; }
-                results.push(DirectBatchEffect::NoAction("source identity unavailable"));
-                continue;
-            };
-            if !admitted[index] { results.push(DirectBatchEffect::NoAction("invalid, overlapping or consumed record")); continue; }
-            let Some(prepared) = prepared else { results.push(DirectBatchEffect::NoAction("event binding unavailable or ambiguous")); continue; };
-            let at = signal.at.expect("prepared timestamp");
-            if (prepared.needs_explicit && !matches!(current_explicit.as_ref(), Some(Ok(witness)) if witness == &prepared.witness))
-                || (prepared.needs_legacy && !matches!(current_legacy.as_ref(), Some(Ok(witness)) if witness == &prepared.witness)) {
-                results.push(DirectBatchEffect::NoAction("settings changed before batch")); continue;
-            }
-            let network = current_dns_context(&table);
-            if table.dns.generation != prepared.peer.generation || table.dns.network != network || table.dns.witness.as_ref() != Some(&prepared.witness)
-                {
-                results.push(DirectBatchEffect::NoAction("source or context changed")); continue;
-            }
-            let still_plausible = matching_dns_tunnels(&tunnels, at, &prepared.peer.host)
-                .is_some_and(|(peer, plausible)| peer == prepared.peer && plausible.len() == prepared.ids.len()
-                    && plausible.iter().all(|tunnel| prepared.ids.contains(&tunnel.id)));
-            if !still_plausible { results.push(DirectBatchEffect::NoAction("plausible tunnel set changed")); continue; }
-            let mut ids = Vec::new();
-            let mut invalid = false;
-            for id in &prepared.ids {
-                let Some(tunnel) = tunnels.iter().find(|tunnel| tunnel.id == *id) else { invalid = true; break; };
-                if tunnel.opened > at + ATTRIBUTION_SLACK || tunnel.dns_peer.as_ref() != Some(&prepared.peer)
-                    || tunnel.dns_binding.as_ref().is_none_or(|binding| binding.witness != prepared.witness
-                        || !matches!(crate::resolvers::source_is_current(&binding.candidate, &prepared.witness), Ok(true))) {
-                    invalid = true; break;
-                }
-                ids.push(*id);
-            }
-            if invalid { results.push(DirectBatchEffect::NoAction("original tunnel changed")); continue; }
-            let peer_protected = tunnels.iter().any(|tunnel| tunnel.closed.is_none() && tunnel.dns_answered && tunnel.dns_peer.as_ref() == Some(&prepared.peer));
-            let measured = table.dns.network.is_some();
-            let Some(entry) = table.dns.entries.iter_mut().find(|entry| entry.generation == prepared.peer.generation
-                && entry.host == prepared.peer.host && entry.candidate.ip == prepared.peer.ip) else {
-                results.push(DirectBatchEffect::NoAction("endpoint no longer current")); continue;
-            };
-            let unordered = entry.last_event_at.is_some_and(|previous| {
-                let gap = if previous > at { previous.duration_since(at) } else { at.duration_since(previous) };
-                let same_ordered_source = signal.continuity == SignalContinuity::Proven
-                    && entry.last_event_source.as_ref() == Some(source);
-                (gap < Duration::from_secs(1) && !same_ordered_source)
-                    || (previous > at && (gap >= Duration::from_secs(1) || !same_ordered_source))
-            });
-            if !matches!(crate::resolvers::source_is_current(&entry.candidate, &prepared.witness), Ok(true)) {
-                results.push(DirectBatchEffect::NoAction("stale endpoint source")); continue;
-            }
-            if unordered {
-                if matches!(&signal.kind, DirectSignalKind::Answer) {
-                    // Unresolved ordering cannot justify a cut, but the valid
-                    // original answer still conservatively protects its IDs.
-                    plans.retain(|plan| plan.peer != prepared.peer || !ids.contains(&plan.id));
-                    entry.model_seen = Some(entry.model_seen.map_or(at, |previous| previous.max(at)));
-                    for id in &ids {
-                        if let Some(tunnel) = tunnels.iter_mut().find(|tunnel| tunnel.id == *id && tunnel.closed.is_none()) { tunnel.dns_answered = true; }
-                    }
-                    results.push(DirectBatchEffect::StateChanged);
-                } else {
-                    results.push(DirectBatchEffect::NoAction("stale or unordered endpoint event"));
-                }
-                continue;
-            }
-            entry.last_event_source = Some(source.clone());
-            match &signal.kind {
-                DirectSignalKind::Answer => {
-                    entry.last_event_at = Some(at);
-                    entry.drop_streak = 0;
-                    entry.drop_continuity = Some((source.clone(), signal.record_end));
-                    entry.model_seen = Some(at);
-                    if measured { entry.model_proven = true; entry.refusal_blocking = false; entry.silent_until = None; entry.silent_streak = 0; }
-                    plans.retain(|plan| plan.peer != prepared.peer || !ids.contains(&plan.id));
-                    for id in &ids {
-                        if let Some(tunnel) = tunnels.iter_mut().find(|tunnel| tunnel.id == *id && tunnel.closed.is_none()) { tunnel.dns_answered = true; }
-                    }
-                    results.push(DirectBatchEffect::StateChanged);
-                }
-                DirectSignalKind::Refusal => {
-                    entry.last_event_at = Some(at);
-                    let already_penalized = entry.refusal_blocking && entry.refusal_at.is_some_and(|previous|
-                        at.checked_duration_since(previous).is_some_and(|elapsed| elapsed < FIRST_PENALTY));
-                    if !already_penalized { entry.refusal_at = Some(at); }
-                    if !peer_protected { entry.model_proven = false; entry.refusal_blocking = true; }
-                    for id in ids { if !plans.iter().any(|plan| plan.id == id) {
-                        plans.push(DirectCutPlan { peer: prepared.peer.clone(), id, witness: prepared.witness.clone() });
-                    } }
-                    results.push(DirectBatchEffect::StateChanged);
-                }
-                DirectSignalKind::Drop => {
-                    let continuous = signal.continuity == SignalContinuity::Proven && entry.drop_continuity.as_ref()
-                        .is_some_and(|(previous, end)| previous == source && *end <= signal.record_start
-                            && boundary[index].is_none_or(|start| *end > start));
-                    entry.drop_streak = if continuous { entry.drop_streak.saturating_add(1) } else { 1 };
-                    entry.drop_continuity = Some((source.clone(), signal.record_end));
-                    entry.last_event_at = Some(at);
-                    if entry.drop_streak >= crate::dns_forwarder::DROP_BENCH_AT {
-                        if !peer_protected && entry.silent_until.is_none_or(|until| Instant::now() >= until) {
-                            let index = (entry.silent_streak as usize).min(SILENT_STEPS.len() - 1);
-                            entry.silent_until = at.checked_add(SILENT_STEPS[index]);
-                            entry.silent_streak = entry.silent_streak.saturating_add(1);
-                        }
-                        for id in ids { if !plans.iter().any(|plan| plan.id == id) {
-                            plans.push(DirectCutPlan { peer: prepared.peer.clone(), id, witness: prepared.witness.clone() });
-                        } }
-                    }
-                    results.push(DirectBatchEffect::StateChanged);
-                }
-            }
-        }
-        for plan in plans {
-                let id = plan.id;
-                let Some(tunnel) = tunnels.iter_mut().find(|tunnel| tunnel.id == id && tunnel.dns_peer.as_ref() == Some(&plan.peer)) else {
-                    results.push(DirectBatchEffect::NoAction("original tunnel missing")); continue;
-                };
-                let network = current_dns_context(&table);
-                if table.dns.generation != plan.peer.generation || table.dns.network != network || table.dns.witness.as_ref() != Some(&plan.witness)
-                    || tunnel.dns_binding.as_ref().is_none_or(|binding| binding.witness != plan.witness
-                        || !matches!(crate::resolvers::source_is_current(&binding.candidate, &plan.witness), Ok(true)))
-                    || !table.dns.entries.iter().any(|entry| entry.generation == plan.peer.generation && entry.host == plan.peer.host
-                        && entry.candidate.ip == plan.peer.ip && matches!(crate::resolvers::source_is_current(&entry.candidate, &plan.witness), Ok(true))) {
-                    results.push(DirectBatchEffect::NoAction("original binding no longer current")); continue;
-                }
-                if tunnel.dns_answered { results.push(DirectBatchEffect::Protected); continue; }
-                if tunnel.closed.is_some() { results.push(DirectBatchEffect::AlreadyClosed); continue; }
-                sockets.push((tunnel.client.take(), tunnel.upstream.take()));
-        }
-    }
-    let shutdown = |socket: Option<TcpStream>| match socket {
-        None => ShutdownSide::Missing,
-        Some(socket) => match socket.shutdown(std::net::Shutdown::Both) {
-            Ok(()) => ShutdownSide::Succeeded,
-            Err(error) => ShutdownSide::Failed(error),
-        },
-    };
-    for (client, upstream) in sockets {
-        results.push(DirectBatchEffect::Shutdown { client: shutdown(client), upstream: shutdown(upstream) });
-    }
-    results
-}
-
-fn tunnel_own(id: u64) -> Option<Arc<crate::upstream::OwnContext>> {
-    TUNNELS.lock().ok()?.iter().find(|t| t.id == id)?.own.as_ref()?.upgrade()
-}
-
-pub(crate) fn own_attributed_drops(id: u64, count: usize, clear: bool) -> Option<usize> {
-    let own = tunnel_own(id)?;
-    own.if_current(|| if clear { own.clear_drops(); 0 } else { own.add_drops(count) })
-}
-
-pub(crate) fn credit_attributed(kind: Kind, id: u64) -> bool {
-    if kind != Kind::Own { credit(kind); return true; }
-    tunnel_own(id).and_then(|own| own.if_current(|| credit(kind))).is_some()
-}
-
-pub(crate) fn bench_dropping_attributed(kind: Kind, id: u64) -> Option<Option<Duration>> {
-    if kind != Kind::Own { return Some(bench_dropping(kind)); }
-    let own = tunnel_own(id)?;
-    let streaming = live_answer_own(&own).is_some();
-    own.if_current(|| silence(kind, streaming))
-}
-
-pub(crate) fn blame_attributed(kind: Kind, id: u64) -> Option<Blamed> {
-    if kind != Kind::Own { return Some(blame(kind)); }
-    let own = tunnel_own(id)?;
-    let streaming = live_answer_own(&own);
-    let outcome = own.if_current(|| blame_table(kind, streaming))?;
-    if !matches!(outcome, Blamed::Proven(_) | Blamed::Streaming { .. }) {
-        cut_own_tunnels(&own);
-    }
-    Some(outcome)
-}
-
-fn cut_own_tunnels(own: &Arc<crate::upstream::OwnContext>) {
-    let sockets = {
-        let Ok(mut list) = TUNNELS.lock() else { return };
-        list.iter_mut().filter(|t| t.kind == Kind::Own && t.closed.is_none()
-            && t.answered_at.is_none() && t.own.as_ref().and_then(|bound| bound.upgrade()).is_some_and(|bound| Arc::ptr_eq(&bound, own)))
-            .flat_map(|t| [t.client.take(), t.upstream.take()].into_iter().flatten())
-            .collect::<Vec<_>>()
-    };
-    for sock in sockets {
-        if let Err(error) = sock.shutdown(std::net::Shutdown::Both) {
-            crate::dns_forwarder::log_proxy(&format!("own tunnel shutdown failed: {error}"));
-        }
-    }
-}
-
 /// Marks the tunnel a model answer came through. Closed tunnels are marked too:
 /// the log line is read seconds after the answer started, and a short answer is
 /// over by then - what matters is that the credit lands on the right record.
@@ -2173,6 +1208,22 @@ pub fn credit_tunnel(id: u64) {
             t.answered_at = Some(Instant::now());
         }
     }
+}
+
+pub fn dns_endpoint(id: u64) -> Option<(String, std::net::Ipv4Addr)> {
+    let list = TUNNELS.lock().ok()?;
+    let tunnel = list.iter().find(|t| t.id == id && t.kind == Kind::Direct)?;
+    Some((tunnel.host.clone(), tunnel.peer?))
+}
+
+pub fn streaming_dns_endpoints(host: &str) -> Vec<std::net::Ipv4Addr> {
+    let Ok(list) = TUNNELS.lock() else { return Vec::new(); };
+    list.iter().filter(|t| t.kind == Kind::Direct && t.host == host
+        && t.closed.is_none() && t.answered_at.is_some()).filter_map(|t| t.peer).collect()
+}
+
+pub fn is_streaming(kind: Kind) -> bool {
+    live_answer(kind).is_some()
 }
 
 /// What one gate connection looks like, for the line the log writes when a
@@ -2246,16 +1297,15 @@ pub fn cut_tunnel(id: u64) -> bool {
 /// guarantees that subsequent requests sent into it will also fail. Closing it
 /// forces the client to open a fresh connection on the best available route.
 pub fn cut_refused_tunnel(id: u64) -> bool {
-    let sockets = {
-        let Ok(mut list) = TUNNELS.lock() else { return false; };
-        let Some(t) = list.iter_mut().find(|t| t.id == id && t.closed.is_none()) else { return false; };
-        [t.client.take(), t.upstream.take()]
+    let Ok(mut list) = TUNNELS.lock() else {
+        return false;
+    };
+    let Some(t) = list.iter_mut().find(|t| t.id == id && t.closed.is_none()) else {
+        return false;
     };
     let mut cut = false;
-    for sock in sockets.into_iter().flatten() {
-        if let Err(error) = sock.shutdown(std::net::Shutdown::Both) {
-            crate::dns_forwarder::log_proxy(&format!("refused tunnel shutdown failed: {error}"));
-        }
+    for sock in [t.client.take(), t.upstream.take()].into_iter().flatten() {
+        sock.shutdown(std::net::Shutdown::Both).ok();
         cut = true;
     }
     cut
@@ -2278,14 +1328,6 @@ fn live_answer(kind: Kind) -> Option<(Duration, u64)> {
         })
         // The liveliest of them: with several open, one gone quiet says nothing
         // while another is still handing the client bytes.
-        .min_by_key(|(idle, _)| *idle)
-}
-
-fn live_answer_own(own: &Arc<crate::upstream::OwnContext>) -> Option<(Duration, u64)> {
-    let list = TUNNELS.lock().ok()?;
-    list.iter().filter(|t| t.kind == Kind::Own && t.closed.is_none() && t.answered_at.is_some()
-        && t.own.as_ref().and_then(|bound| bound.upgrade()).is_some_and(|bound| Arc::ptr_eq(&bound, own)))
-        .map(|t| (t.activity.idle().unwrap_or_else(|| t.opened.elapsed()), t.activity.bytes().0))
         .min_by_key(|(idle, _)| *idle)
 }
 
@@ -2320,7 +1362,7 @@ pub struct Row {
 pub fn rows(usable: impl Fn(Kind) -> bool) -> Vec<Row> {
     let s = snapshot();
     let open = open_counts();
-    let order = order_with(&s, DIRECT_USES_NORMAL_TIERS, &usable);
+    let order = order_with(&s, &usable);
     let mut kinds: Vec<Kind> = order.clone();
     kinds.extend(ALL.iter().copied().filter(|k| !order.contains(k)));
     // A build without the relay has no such route at all - not an unusable one.
@@ -2362,68 +1404,6 @@ fn note(message: &str) {
 mod tests {
 
     #[test]
-    #[ignore = "isolated process: owns the current Own slot, route table and loopback sockets"]
-    fn guard_drop_silence_is_bound_to_the_actual_own_endpoint() {
-        use super::*;
-        struct Cleanup;
-        impl Drop for Cleanup { fn drop(&mut self) { crate::upstream::fixture_select_own(None); } }
-        let _cleanup = Cleanup;
-        let a = crate::upstream::parse("192.0.2.1:8080").unwrap();
-        let b = crate::upstream::parse("192.0.2.2:8080").unwrap();
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (client, _) = listener.accept().unwrap();
-        let open = |own: Arc<crate::upstream::OwnContext>| {
-            let guard = begin_gate_connection(&client, "example.invalid");
-            bind_serving_own(own);
-            note_used(Kind::Own);
-            serving_activity().unwrap().to_upstream(5);
-            guard
-        };
-        let old_a = crate::upstream::fixture_select_own(Some(a.clone())).unwrap();
-        let guard = open(old_a.clone());
-        let _current_b = crate::upstream::fixture_select_own(Some(b.clone())).unwrap();
-        drop(guard);
-        assert!(TABLE.lock().unwrap().silent[Kind::Own.index()].is_none());
-        let guard = open(old_a);
-        let _ = crate::upstream::fixture_select_own(Some(a));
-        drop(guard);
-        assert!(TABLE.lock().unwrap().silent[Kind::Own.index()].is_none());
-        let current_b = crate::upstream::fixture_select_own(Some(b)).unwrap();
-        let guard = open(current_b);
-        drop(guard);
-        assert!(TABLE.lock().unwrap().silent[Kind::Own.index()].is_some());
-    }
-
-    #[test]
-    #[ignore = "isolated process: owns the current Own slot and tunnel table"]
-    fn old_own_tunnel_cannot_publish_or_bench_new_endpoint() {
-        use super::*;
-        struct Cleanup(u64);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                if let Ok(mut list) = TUNNELS.lock() { list.retain(|t| t.id != self.0); }
-                crate::upstream::fixture_select_own(None);
-            }
-        }
-        let a = crate::upstream::fixture_select_own(Some(crate::upstream::parse("192.0.2.1:8080").unwrap())).unwrap();
-        let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
-        let _cleanup = Cleanup(id);
-        TUNNELS.lock().unwrap().push(Tunnel { id, kind: Kind::Own, own: Some(Arc::downgrade(&a)),
-            host: "example.invalid".into(), opened: Instant::now(), closed: None, answered_at: None,
-            activity: Arc::new(Activity::default()), client: None, upstream: None, dns_binding: None, dns_peer: None, dns_answered: false });
-        let b = crate::upstream::fixture_select_own(Some(crate::upstream::parse("192.0.2.2:8080").unwrap())).unwrap();
-        assert!(b.usable());
-        assert!(!credit_attributed(Kind::Own, id));
-        assert!(own_attributed_drops(id, 1, false).is_none());
-        assert!(blame_attributed(Kind::Own, id).is_none());
-        assert!(bench_dropping_attributed(Kind::Own, id).is_none());
-        assert!(!is_proven(Kind::Own));
-        assert_eq!(b.add_drops(1), 1);
-        assert!(b.usable());
-    }
-
-    #[test]
     fn a_pinned_route_name_maps_to_its_kind_and_junk_to_none() {
         assert_eq!(forced(" Relay "), Some(Kind::Relay));
         assert_eq!(forced("vpn"), Some(Kind::Vpn));
@@ -2431,526 +1411,6 @@ mod tests {
         assert_eq!(forced("proxy"), None);
     }
     use super::*;
-
-    #[test]
-    fn endpoint_feedback_requires_unambiguous_host_peer_and_generation() {
-        const HOST: &str = "fixture-peer.invalid";
-        struct Cleanup(Vec<u64>);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                TUNNELS.lock().unwrap_or_else(|error| error.into_inner()).retain(|t| !self.0.contains(&t.id));
-            }
-        }
-        let ids = vec![NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed), NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed)];
-        let _cleanup = Cleanup(ids.clone());
-        let now = Instant::now();
-        let identity = |ip| DnsPeerIdentity { host: HOST.into(), ip, generation: 7 };
-        let first = identity(std::net::Ipv4Addr::new(192, 0, 2, 1));
-        let second = identity(std::net::Ipv4Addr::new(192, 0, 2, 2));
-        {
-            let mut list = TUNNELS.lock().unwrap();
-            for (id, peer) in [(ids[0], first.clone()), (ids[1], second)] {
-                list.push(Tunnel { id, kind: Kind::Direct, own: None, host: HOST.into(), opened: now,
-                    closed: None, answered_at: None, activity: Arc::new(Activity::default()),
-                    client: None, upstream: None, dns_binding: None, dns_peer: Some(peer), dns_answered: false });
-            }
-        }
-        assert!(unique_dns_peer(now, None).is_none());
-        assert!(unique_dns_peer(now, Some(HOST)).is_none());
-        TUNNELS.lock().unwrap().iter_mut().find(|t| t.id == ids[1]).unwrap().dns_peer = Some(first.clone());
-        assert_eq!(unique_dns_peer(now, Some(HOST)), Some(first));
-        TUNNELS.lock().unwrap().iter_mut().find(|t| t.id == ids[1]).unwrap().dns_peer.as_mut().unwrap().generation = 8;
-        assert!(unique_dns_peer(now, Some(HOST)).is_none());
-    }
-
-    #[test]
-    #[ignore = "isolated process: owns tunnel records and loopback sockets"]
-    fn ambiguous_direct_log_feedback_never_credits_or_cuts_siblings() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        const HOST: &str = "cloudcode-pa.googleapis.com";
-        struct Cleanup(Vec<u64>);
-        impl Drop for Cleanup {
-            fn drop(&mut self) { TUNNELS.lock().unwrap_or_else(|error| error.into_inner()).retain(|t| !self.0.contains(&t.id)); }
-        }
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut peer_a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut server_a, _) = listener.accept().unwrap();
-        let mut peer_b = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut server_b, _) = listener.accept().unwrap();
-        server_a.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        server_b.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let ids = vec![NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed), NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed)];
-        let _cleanup = Cleanup(ids.clone());
-        let at = Instant::now();
-        {
-            let mut list = TUNNELS.lock().unwrap();
-            for (index, server) in [(0, &server_a), (1, &server_b)] {
-                let ip = std::net::Ipv4Addr::new(192, 0, 2, (index + 1) as u8);
-                list.push(Tunnel { id: ids[index], kind: Kind::Direct, own: None, host: HOST.into(), opened: at,
-                    closed: None, answered_at: None, activity: Arc::new(Activity::default()), client: Some(server.try_clone().unwrap()),
-                    upstream: None, dns_binding: None, dns_peer: Some(DnsPeerIdentity { host: HOST.into(), ip, generation: 1 }), dns_answered: false });
-            }
-        }
-        let proven_before = is_proven(Kind::Direct);
-        let answer = receive_log_feedback(at, Some(HOST), Some(HOST), Some(true));
-        let refusal = receive_log_feedback(at, Some(HOST), Some(HOST), Some(false));
-        peer_a.write_all(b"a").unwrap();
-        peer_b.write_all(b"b").unwrap();
-        let mut a = [0]; let mut b = [0];
-        server_a.read_exact(&mut a).unwrap();
-        server_b.read_exact(&mut b).unwrap();
-        assert_eq!((a, b), ([b'a'], [b'b']));
-        assert!(matches!(answer, LogFeedback::Direct { applied: false, .. }));
-        assert!(matches!(refusal, LogFeedback::Direct { applied: false, .. }));
-        assert_eq!(is_proven(Kind::Direct), proven_before);
-        assert!(TUNNELS.lock().unwrap().iter().filter(|t| ids.contains(&t.id)).all(|t| t.answered_at.is_none()));
-        TUNNELS.lock().unwrap().iter_mut().find(|t| t.id == ids[1]).unwrap().kind = Kind::Own;
-        assert!(matches!(receive_log_feedback(at, Some(HOST), Some(HOST), Some(false)), LogFeedback::Ambiguous));
-        peer_a.write_all(b"c").unwrap();
-        peer_b.write_all(b"d").unwrap();
-        server_a.read_exact(&mut a).unwrap();
-        server_b.read_exact(&mut b).unwrap();
-        assert_eq!((a, b), ([b'c'], [b'd']));
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn current_direct_refusal_closes_the_original_pooled_socket_pair() {
-        direct_log_socket_fixture(false, 0);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn scanned_refusal_through_forwarder_closes_the_original_socket_pair() {
-        direct_log_socket_fixture(true, 0);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn scanned_drop_answer_drop_keeps_socket_and_resets_streak() {
-        direct_log_socket_fixture(true, 1);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn scanned_two_drops_recover_the_original_socket_pair() {
-        direct_log_socket_fixture(true, 2);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn scanned_later_answer_protects_socket_before_batch_shutdown() {
-        direct_log_socket_fixture(true, 3);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn separate_log_polls_recover_after_two_drops() {
-        direct_log_socket_fixture(true, 4);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn scanned_drops_for_distinct_endpoints_are_not_combined() {
-        direct_log_socket_fixture(true, 5);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn ambiguous_answer_protects_original_streams_but_not_later_stream() {
-        direct_log_socket_fixture(true, 6);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn mixed_direct_and_own_log_refusal_preserves_both_streams() {
-        direct_log_socket_fixture(true, 7);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn new_plausible_tunnel_during_preparation_prevents_feedback() {
-        direct_log_socket_fixture(true, 8);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn later_timestamp_answer_before_refusal_span_protects_original_pair() {
-        direct_log_socket_fixture(true, 9);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn valid_answer_before_unplaced_record_protects_next_batch() {
-        direct_log_socket_fixture(true, 10);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn fenced_record_precedes_later_proven_record_even_when_time_is_reversed() {
-        direct_log_socket_fixture(true, 11);
-    }
-
-    #[test]
-    #[ignore = "isolated process: controlled settings and owned loopback sockets"]
-    fn complete_refusal_at_retained_log_boundary_closes_original_pair() {
-        direct_log_socket_fixture(true, 12);
-    }
-
-    fn direct_log_socket_fixture(through_forwarder: bool, scenario: u8) {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        const HOST: &str = "cloudcode-pa.googleapis.com";
-        struct Cleanup(Vec<u64>);
-        impl Drop for Cleanup {
-            fn drop(&mut self) { TUNNELS.lock().unwrap_or_else(|error| error.into_inner()).retain(|t| !self.0.contains(&t.id)); }
-        }
-        let _lease = lease_test_dns_state().unwrap();
-        let witness = crate::resolvers::current_witness(crate::resolvers::DnsMissingPolicy::LegacyDefaults).unwrap();
-        let candidate = crate::resolvers::test_source_candidate(std::net::Ipv4Addr::new(8, 8, 8, 8), &witness);
-        let generation = begin_dns_maintenance(HOST, &witness, true).unwrap();
-        assert!(publish_dns_candidate(HOST, generation, candidate.clone(), Ok(crate::proxy::CandidateProbe::Reachable(Duration::from_millis(1)))).unwrap());
-        let route_state_before = (is_proven(Kind::Direct), is_penalised(Kind::Direct), is_proven(Kind::Own), is_penalised(Kind::Own));
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut client_peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut client_control, _) = listener.accept().unwrap();
-        let mut upstream_peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut upstream_control, _) = listener.accept().unwrap();
-        client_control.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
-        upstream_control.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
-        let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
-        let mut cleanup = Cleanup(vec![id]);
-        let peer = DnsPeerIdentity { host: HOST.into(), ip: candidate.ip, generation };
-        let binding = DnsBinding { admission: DnsAdmission::new(candidate.ip, generation), candidate: candidate.clone(),
-            witness: witness.clone(), allow_missing_defaults: true };
-        let opened = Instant::now();
-        TUNNELS.lock().unwrap().push(Tunnel { id, kind: Kind::Direct, own: None, host: HOST.into(), opened,
-            closed: None, answered_at: None, activity: Arc::new(Activity::default()),
-            client: Some(client_control.try_clone().unwrap()), upstream: Some(upstream_control.try_clone().unwrap()),
-            dns_binding: Some(binding.clone()), dns_peer: Some(peer.clone()), dns_answered: false });
-        let mut additional = Vec::new();
-        if scenario == 6 || scenario == 7 || scenario == 12 {
-            let remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (control, _) = listener.accept().unwrap();
-            control.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
-            let other_id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
-            cleanup.0.push(other_id);
-            TUNNELS.lock().unwrap().push(Tunnel { id: other_id, kind: if scenario == 7 { Kind::Own } else { Kind::Direct }, own: None, host: HOST.into(), opened,
-                closed: None, answered_at: None, activity: Arc::new(Activity::default()), client: Some(control.try_clone().unwrap()), upstream: None,
-                dns_binding: (scenario != 7).then(|| binding.clone()), dns_peer: (scenario != 7).then(|| peer.clone()), dns_answered: scenario == 12 });
-            additional.push((remote, control));
-        }
-        if scenario == 5 || scenario == 11 {
-            const OTHER: &str = "aicode.googleapis.com";
-            assert!(publish_dns_candidate(OTHER, generation, candidate.clone(), Ok(crate::proxy::CandidateProbe::Reachable(Duration::from_millis(1)))).unwrap());
-            let other_id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
-            cleanup.0.push(other_id);
-            let other_peer = DnsPeerIdentity { host: OTHER.into(), ip: candidate.ip, generation };
-            let other_binding = DnsBinding { admission: DnsAdmission::new(candidate.ip, generation), candidate: candidate.clone(),
-                witness: witness.clone(), allow_missing_defaults: true };
-            TUNNELS.lock().unwrap().push(Tunnel { id: other_id, kind: Kind::Direct, own: None, host: OTHER.into(), opened,
-                closed: None, answered_at: None, activity: Arc::new(Activity::default()), client: None, upstream: None,
-                dns_binding: Some(other_binding), dns_peer: Some(other_peer), dns_answered: false });
-        }
-        // The synthetic admission key is test-only; both retained handles and
-        // their independently observed peer traffic are real local sockets.
-        struct RemoveLog(std::path::PathBuf);
-        impl Drop for RemoveLog { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
-        let path = std::env::temp_dir().join(format!("antigravity-direct-{}-{id}.log", std::process::id()));
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
-        let _log = RemoveLog(path.clone());
-        if scenario == 12 {
-            let refusal = b"I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 user location is not supported\n";
-            let budget = usize::try_from(crate::ls_log::test_max_read()).expect("log budget fits a test buffer");
-            let padding = budget.checked_sub(refusal.len() + 1).expect("log budget must hold the complete record");
-            file.write_all(b"old history\n").unwrap();
-            file.write_all(refusal).unwrap();
-            file.write_all(&vec![b'x'; padding]).unwrap();
-            file.write_all(b"\n").unwrap();
-        } else if scenario == 9 {
-            file.write_all(concat!(
-                "I0901 15:09:25.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent ResponseID: a\n",
-                "I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 user location is not supported\n"
-            ).as_bytes()).unwrap();
-        } else if scenario == 10 {
-            file.write_all(concat!(
-                "I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent ResponseID: a\n",
-                "URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n"
-            ).as_bytes()).unwrap();
-        } else if scenario == 1 {
-            file.write_all(concat!(
-                "I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n",
-                "I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent ResponseID: a\n",
-                "I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n"
-            ).as_bytes()).unwrap();
-        } else if scenario == 6 {
-            file.write_all(b"I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent ResponseID: a\n").unwrap();
-        } else if scenario == 4 || scenario == 11 {
-            file.write_all(b"I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n").unwrap();
-        } else if scenario == 5 {
-            file.write_all(concat!(
-                "I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n",
-                "I0901 15:09:24.000000 URL: https://aicode.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n"
-            ).as_bytes()).unwrap();
-        } else if scenario == 2 || scenario == 3 {
-            file.write_all(concat!(
-                "I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n",
-                "I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n"
-            ).as_bytes()).unwrap();
-            if scenario == 3 {
-                file.write_all(b"I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent ResponseID: a\n").unwrap();
-            }
-        } else {
-            file.write_all(b"I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 user location is not supported\n").unwrap();
-        }
-        drop(file);
-        if scenario == 12 {
-            use std::io::Seek;
-            let mut check = std::fs::File::open(&path).unwrap();
-            let budget = crate::ls_log::test_max_read();
-            let length = check.metadata().unwrap().len();
-            assert!(length > budget, "fixture must force the owned read budget to skip history");
-            check.seek(std::io::SeekFrom::Start(length - budget - 1)).unwrap();
-            let mut prefix = [0u8; 2];
-            check.read_exact(&mut prefix).unwrap();
-            assert_eq!(prefix, [b'\n', b'I'], "retained tail begins at the checked complete-record boundary");
-        }
-        let clock = crate::utils::LocalClock { month: 9, day: 1, second_of_day: 15 * 3600 + 9 * 60 + if scenario == 9 || scenario == 11 { 25 } else { 24 } };
-        let tally = if scenario == 12 {
-            let mut cursor = crate::ls_log::TestLogCursor::default();
-            crate::ls_log::test_poll_log(&mut cursor, &path, Some(clock), Instant::now())
-        } else if scenario == 11 {
-            let mut cursor = crate::ls_log::TestLogCursor::default();
-            let first = crate::ls_log::test_poll_log(&mut cursor, &path, Some(clock), Instant::now());
-            assert_eq!(first.direct_signals.len(), 1);
-            crate::dns_forwarder::test_answer_log(&[(path.clone(), first)]);
-            struct RestoreFile { held: std::path::PathBuf, original: std::path::PathBuf, moved: bool }
-            impl Drop for RestoreFile { fn drop(&mut self) { if self.moved { let _ = std::fs::rename(&self.held, &self.original); } } }
-            let held = path.with_extension("held");
-            assert!(!held.exists(), "owned temporary hold destination must be vacant");
-            let mut restore = RestoreFile { held: held.clone(), original: path.clone(), moved: false };
-            std::fs::rename(&path, &held).unwrap();
-            restore.moved = true;
-            let gap = crate::ls_log::test_poll_log(&mut cursor, &path, Some(clock), Instant::now());
-            assert!(gap.direct_signals.is_empty());
-            std::fs::rename(&held, &path).unwrap();
-            restore.moved = false;
-            let mut append = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            append.write_all(concat!(
-                "I0901 15:09:25.000000 URL: https://aicode.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n",
-                "I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n"
-            ).as_bytes()).unwrap();
-            drop(append);
-            let next_clock = crate::utils::LocalClock { month: 9, day: 1, second_of_day: 15 * 3600 + 9 * 60 + 25 };
-            let next = crate::ls_log::test_poll_log(&mut cursor, &path, Some(next_clock), Instant::now());
-            assert_eq!(next.direct_signals.len(), 2);
-            assert_eq!(next.direct_signals[0].continuity, crate::ls_log::SignalContinuity::Fence);
-            assert_eq!(next.direct_signals[1].continuity, crate::ls_log::SignalContinuity::Proven);
-            next
-        } else if scenario == 10 {
-            let mut cursor = crate::ls_log::TestLogCursor::default();
-            let first = crate::ls_log::test_poll_log(&mut cursor, &path, Some(clock), Instant::now());
-            assert_eq!(first.direct_signals.len(), 2);
-            assert!(first.direct_signals[0].at.is_some() && first.direct_signals[1].at.is_none());
-            crate::dns_forwarder::test_answer_log(&[(path.clone(), first)]);
-            let mut append = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            append.write_all(b"I0901 15:09:25.000000 URL: https://cloudcode-pa.googleapis.com/v1 user location is not supported\n").unwrap();
-            drop(append);
-            let next_clock = crate::utils::LocalClock { month: 9, day: 1, second_of_day: 15 * 3600 + 9 * 60 + 25 };
-            let refusal = crate::ls_log::test_poll_log(&mut cursor, &path, Some(next_clock), Instant::now());
-            assert_eq!(refusal.direct_signals.len(), 1);
-            refusal
-        } else if scenario == 6 {
-            let mut cursor = crate::ls_log::TestLogCursor::default();
-            let answer = crate::ls_log::test_poll_log(&mut cursor, &path, Some(clock), Instant::now());
-            assert_eq!(answer.direct_signals.len(), 1);
-            crate::dns_forwarder::test_answer_log(&[(path.clone(), answer)]);
-            let remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (control, _) = listener.accept().unwrap();
-            control.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
-            let new_id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
-            cleanup.0.push(new_id);
-            TUNNELS.lock().unwrap().push(Tunnel { id: new_id, kind: Kind::Direct, own: None, host: HOST.into(), opened: Instant::now(),
-                closed: None, answered_at: None, activity: Arc::new(Activity::default()), client: Some(control.try_clone().unwrap()), upstream: None,
-                dns_binding: Some(binding.clone()), dns_peer: Some(peer.clone()), dns_answered: false });
-            additional.push((remote, control));
-            let mut append = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            append.write_all(b"I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 user location is not supported\n").unwrap();
-            drop(append);
-            let refusal = crate::ls_log::test_poll_log(&mut cursor, &path, Some(clock), Instant::now());
-            assert_eq!(refusal.direct_signals.len(), 1);
-            refusal
-        } else if scenario == 4 {
-            let mut cursor = crate::ls_log::TestLogCursor::default();
-            let first = crate::ls_log::test_poll_log(&mut cursor, &path, Some(clock), Instant::now());
-            assert_eq!(first.direct_signals.len(), 1);
-            crate::dns_forwarder::test_answer_log(&[(path.clone(), first)]);
-            client_peer.write_all(b"p").unwrap();
-            let mut prior = [0]; client_control.read_exact(&mut prior).unwrap();
-            assert_eq!(prior, [b'p']);
-            let mut append = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            append.write_all(b"I0901 15:09:24.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n").unwrap();
-            drop(append);
-            let second = crate::ls_log::test_poll_log(&mut cursor, &path, Some(clock), Instant::now());
-            assert_eq!(second.direct_signals.len(), 1);
-            assert_eq!(second.direct_signals[0].continuity, crate::ls_log::SignalContinuity::Proven);
-            second
-        } else {
-            let (end, tally) = crate::ls_log::test_scan_log(&path, Some(0), Some(clock), Instant::now());
-            assert!(end > 0 && tally.direct_signals.len() == match scenario { 1 | 3 => 3, 2 | 5 | 9 => 2, _ => 1 });
-            tally
-        };
-        let signal_count = tally.direct_signals.len();
-        let result = if scenario == 8 {
-            struct ClearPause;
-            impl Drop for ClearPause { fn drop(&mut self) { DIRECT_PREPARED_TEST_PAUSE.lock().unwrap_or_else(|e| e.into_inner()).take(); } }
-            let _pause_cleanup = ClearPause;
-            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            *DIRECT_PREPARED_TEST_PAUSE.lock().unwrap() = Some((entered_tx, release_rx));
-            let worker_path = path.clone();
-            std::thread::scope(|scope| {
-                let worker = scope.spawn(move || crate::dns_forwarder::test_answer_log(&[(worker_path, tally)]));
-                assert!(entered_rx.recv_timeout(Duration::from_secs(5)).expect("actual prepared boundary not reached"),
-                    "race requires an accepted original binding before insertion");
-                let remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-                let (control, _) = listener.accept().unwrap();
-                control.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
-                let other_id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
-                cleanup.0.push(other_id);
-                let other_candidate = crate::resolvers::test_source_candidate(std::net::Ipv4Addr::new(1, 1, 1, 1), &witness);
-                let other_binding = DnsBinding { admission: DnsAdmission::new(other_candidate.ip, generation), candidate: other_candidate.clone(),
-                    witness: witness.clone(), allow_missing_defaults: true };
-                let other_peer = DnsPeerIdentity { host: HOST.into(), ip: other_candidate.ip, generation };
-                TUNNELS.lock().unwrap().push(Tunnel { id: other_id, kind: Kind::Direct, own: None, host: HOST.into(), opened: Instant::now(),
-                    closed: None, answered_at: None, activity: Arc::new(Activity::default()), client: Some(control.try_clone().unwrap()), upstream: None,
-                    dns_binding: Some(other_binding), dns_peer: Some(other_peer), dns_answered: false });
-                additional.push((remote, control));
-                release_tx.send(()).expect("prepared worker released early");
-                worker.join().expect("prepared worker failed");
-            });
-            None
-        } else if through_forwarder {
-            crate::dns_forwarder::test_answer_log(&[(path.clone(), tally)]);
-            None
-        } else {
-            let first = receive_direct_batch(&tally.direct_signals);
-            let replay = receive_direct_batch(&tally.direct_signals);
-            assert!(replay.iter().all(|effect| matches!(effect, DirectBatchEffect::NoAction(_))), "replay must not reapply or shut down again");
-            Some(first)
-        };
-        let mut byte = [0];
-        let client_live = client_peer.write_all(b"c").is_ok() && client_control.read_exact(&mut byte).is_ok();
-        let upstream_live = upstream_peer.write_all(b"u").is_ok() && upstream_control.read_exact(&mut byte).is_ok();
-        if let Some(result) = result {
-            assert!(result.iter().any(|effect| matches!(effect, DirectBatchEffect::StateChanged)), "fixture must exercise a currently admitted refusal");
-            assert!(result.iter().any(|effect| matches!(effect, DirectBatchEffect::Shutdown { client: ShutdownSide::Succeeded, upstream: ShutdownSide::Succeeded })), "both owned shutdown results must be received");
-        }
-        if matches!(scenario, 1 | 3 | 5 | 6 | 7 | 8 | 9 | 10 | 11) {
-            assert!(client_live && upstream_live, "the answered connection must remain usable on both sides");
-            let table = TABLE.lock().unwrap();
-            let entry = table.dns.entries.iter().find(|entry| entry.host == HOST && entry.generation == generation).unwrap();
-            assert_eq!(entry.drop_streak, if matches!(scenario, 3 | 6 | 7 | 8 | 9 | 10) { 0 } else { 1 });
-            if scenario == 9 || scenario == 10 { assert!(entry.model_seen.is_some(), "valid answer must remain observable"); }
-            if scenario == 7 || scenario == 8 {
-                assert!(entry.refusal_at.is_none() && !entry.refusal_blocking && entry.model_seen.is_none() && !entry.model_proven,
-                    "ambiguous feedback must not change endpoint evidence");
-            }
-            if scenario == 5 || scenario == 11 {
-                let other = table.dns.entries.iter().find(|entry| entry.host == "aicode.googleapis.com" && entry.generation == generation).unwrap();
-                assert_eq!(other.drop_streak, 1);
-            }
-            drop(table);
-            if scenario == 6 {
-                let (original_remote, original_control) = &mut additional[0];
-                original_remote.write_all(b"o").unwrap();
-                original_control.read_exact(&mut byte).unwrap();
-                let (new_remote, new_control) = &mut additional[1];
-                let new_live = new_remote.write_all(b"n").is_ok() && new_control.read_exact(&mut byte).is_ok();
-                assert!(!new_live, "later unmatched stream must remain recoverable");
-            }
-            if scenario == 7 || scenario == 8 {
-                assert_eq!((is_proven(Kind::Direct), is_penalised(Kind::Direct), is_proven(Kind::Own), is_penalised(Kind::Own)), route_state_before,
-                    "ambiguous feedback must not credit or penalise either route");
-                let (other_remote, other_control) = &mut additional[0];
-                other_remote.write_all(b"s").unwrap();
-                other_control.read_exact(&mut byte).unwrap();
-                assert_eq!(byte, [b's']);
-                assert!(TUNNELS.lock().unwrap().iter().filter(|t| cleanup.0.contains(&t.id))
-                    .all(|t| t.answered_at.is_none() && !t.dns_answered), "ambiguous feedback must not credit either route");
-            }
-        } else {
-            assert!(!client_live, "the original client-side pooled socket remained usable");
-            assert!(!upstream_live, "the original upstream-side pooled socket remained usable");
-            if scenario == 12 {
-                assert_eq!(signal_count, 1, "the complete refusal is the only retained event");
-                let (protected_remote, protected_control) = &mut additional[0];
-                protected_remote.write_all(b"s").unwrap();
-                protected_control.read_exact(&mut byte).unwrap();
-                assert_eq!(byte, [b's'], "the independently protected sibling remains usable");
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "isolated process: owns candidate route state"]
-    fn candidate_refusal_is_not_cleared_by_anonymous_reachability() {
-        struct Restore { dns: Option<DnsState>, context: u64 }
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                let mut table = TABLE.lock().unwrap_or_else(|error| error.into_inner());
-                table.dns = self.dns.take().unwrap();
-                table.context = self.context;
-            }
-        }
-        let saved = {
-            let mut table = TABLE.lock().unwrap();
-            let context = table.context;
-            table.context = 0;
-            Restore { dns: Some(std::mem::replace(&mut table.dns, DnsState::new())), context }
-        };
-        let _restore = saved;
-        let host = "cloudcode-pa.googleapis.com";
-        let witness = crate::resolvers::test_source_witness();
-        let candidate = crate::resolvers::test_source_candidate(std::net::Ipv4Addr::new(8, 8, 8, 8), &witness);
-        let other = crate::resolvers::test_source_candidate(std::net::Ipv4Addr::new(1, 1, 1, 1), &witness);
-        let generation = begin_dns_maintenance(host, &witness, true).unwrap();
-        assert!(publish_dns_candidate(host, generation, candidate.clone(), Ok(crate::proxy::CandidateProbe::Reachable(Duration::from_millis(10)))).unwrap());
-        assert!(publish_dns_candidate(host, generation, other.clone(), Ok(crate::proxy::CandidateProbe::Reachable(Duration::from_millis(12)))).unwrap());
-        assert!(matches!(dns_selection(host, &witness).unwrap(), DnsSelection::Ready(_)));
-        {
-            let peer = DnsPeerIdentity { host: host.into(), ip: candidate.ip, generation };
-            let mut table = TABLE.lock().unwrap();
-            assert_eq!(apply_dns_silence(&mut table.dns, &peer, true), None);
-            assert_eq!(apply_dns_silence(&mut table.dns, &peer, false), Some(SILENT_STEPS[0]));
-            assert_eq!(apply_dns_silence(&mut table.dns, &peer, false), None);
-            assert!(table.dns.entries.iter().find(|entry| entry.candidate.ip == other.ip).unwrap().silent_until.is_none());
-            table.dns.entries.iter_mut().find(|entry| entry.candidate.ip == candidate.ip).unwrap().silent_until = Some(Instant::now());
-            assert_eq!(apply_dns_silence(&mut table.dns, &peer, false), Some(SILENT_STEPS[1]));
-            let entry = table.dns.entries.iter_mut().find(|entry| entry.candidate.ip == candidate.ip).unwrap();
-            entry.silent_until = None;
-            entry.silent_streak = 0;
-            apply_dns_feedback(&mut table.dns, &peer, true);
-            let entry = table.dns.entries.iter().find(|entry| entry.host == host).unwrap();
-            assert!(entry.model_seen.is_some() && !entry.model_proven);
-        }
-        assert!(publish_dns_candidate(host, generation, candidate.clone(), Ok(crate::proxy::CandidateProbe::Refused)).unwrap());
-        assert!(publish_dns_candidate(host, generation, candidate.clone(), Ok(crate::proxy::CandidateProbe::Reachable(Duration::from_millis(5)))).unwrap());
-        finish_dns_maintenance(host, generation);
-        assert!(matches!(dns_selection(host, &witness).unwrap(), DnsSelection::Ready(items)
-            if !items.iter().any(|(admission, _)| admission.ip == candidate.ip)
-                && items.iter().any(|(admission, _)| admission.ip == other.ip)));
-        {
-            let mut table = TABLE.lock().unwrap();
-            let entry = table.dns.entries.iter_mut().find(|entry| entry.host == host).unwrap();
-            entry.refusal_at = Instant::now().checked_sub(FIRST_PENALTY + Duration::from_secs(1));
-        }
-        assert!(matches!(dns_selection(host, &witness).unwrap(), DnsSelection::Ready(_)));
-        TABLE.lock().unwrap().context = 1;
-        assert!(matches!(dns_selection(host, &witness).unwrap(), DnsSelection::Pending));
-        assert!(!publish_dns_candidate(host, generation, candidate, Ok(crate::proxy::CandidateProbe::Reachable(Duration::ZERO))).unwrap());
-    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -2977,10 +1437,10 @@ mod tests {
         let (g, v) = (Kind::Group.index(), Kind::Vpn.index());
         s.refused_at[g] = Some(Instant::now());
         s.ok_at[v] = Some(Instant::now());
-        assert_eq!(order_with(&s, true, |k| k != Kind::Own)[0], Kind::Vpn);
+        assert_eq!(order_with(&s, |k| k != Kind::Own)[0], Kind::Vpn);
         // Nothing else has answered: the pin keeps its place.
         s.ok_at[v] = None;
-        assert_eq!(order_with(&s, true, |k| k != Kind::Own)[0], Kind::Group);
+        assert_eq!(order_with(&s, |k| k != Kind::Own)[0], Kind::Group);
     }
 
     fn blank() -> Snapshot {
@@ -3003,49 +1463,30 @@ mod tests {
     fn the_later_added_of_group_and_own_leads() {
         let mut s = blank();
         let all = |_: Kind| true;
-        assert_eq!(order_with(&s, true, all)[..2], [Kind::Group, Kind::Own]);
+        assert_eq!(order_with(&s, all)[..2], [Kind::Group, Kind::Own]);
         s.pinned = [Kind::Own, Kind::Group];
-        let order = order_with(&s, true, all);
+        let order = order_with(&s, all);
         assert_eq!(order[..2], [Kind::Own, Kind::Group]);
         // Everything else keeps its own order behind the pair.
-        assert_eq!(order[2..], [Kind::Relay, Kind::Exits, Kind::Direct, Kind::Vpn]);
+        assert_eq!(
+            order[2..],
+            [Kind::Relay, Kind::Exits, Kind::Direct, Kind::Vpn]
+        );
     }
 
     #[test]
     fn unmeasured_routes_take_the_default_order() {
-        let order = order_with(&blank(), true, |_| true);
+        let order = order_with(&blank(), |_| true);
         assert_eq!(
             order,
-            vec![Kind::Group, Kind::Own, Kind::Relay, Kind::Exits, Kind::Direct, Kind::Vpn]
-        );
-    }
-
-    #[test]
-    fn fallback_only_direct_goes_last_whatever_it_measured() {
-        let mut s = blank();
-        s.samples[Kind::Direct.index()] = sample(50);
-        s.samples[Kind::Exits.index()] = sample(400);
-        let order = order_with(&s, false, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
-        assert_eq!(order, vec![Kind::Exits, Kind::Relay, Kind::Direct]);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_direct_ranks_by_proof_and_still_respects_the_bench() {
-        let mut s = blank();
-        s.samples[Kind::Direct.index()] = sample(500);
-        s.samples[Kind::Exits.index()] = sample(50);
-        s.ok_at[Kind::Direct.index()] = Some(Instant::now());
-        let usable = |k| matches!(k, Kind::Direct | Kind::Exits);
-        assert_eq!(
-            order_with(&s, DIRECT_USES_NORMAL_TIERS, usable),
-            vec![Kind::Direct, Kind::Exits],
-        );
-
-        s.penalised[Kind::Direct.index()] = Some(Instant::now() + ms(60_000));
-        assert_eq!(
-            order_with(&s, DIRECT_USES_NORMAL_TIERS, usable),
-            vec![Kind::Exits, Kind::Direct],
+            vec![
+                Kind::Group,
+                Kind::Own,
+                Kind::Relay,
+                Kind::Exits,
+                Kind::Direct,
+                Kind::Vpn
+            ]
         );
     }
 
@@ -3054,7 +1495,7 @@ mod tests {
         let mut s = blank();
         s.samples[Kind::Relay.index()] = sample(1300);
         s.samples[Kind::Exits.index()] = sample(450);
-        let order = order_with(&s, true, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
+        let order = order_with(&s, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
         assert_eq!(order, vec![Kind::Exits, Kind::Relay, Kind::Direct]);
     }
 
@@ -3065,9 +1506,9 @@ mod tests {
         s.samples[Kind::Exits.index()] = sample(270);
         s.leader = Some(Kind::Direct);
         let usable = |k: Kind| k != Kind::Own && k != Kind::Vpn && k != Kind::Group;
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Direct);
+        assert_eq!(order_with(&s, usable)[0], Kind::Direct);
         s.samples[Kind::Exits.index()] = sample(180);
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Exits);
+        assert_eq!(order_with(&s, usable)[0], Kind::Exits);
     }
 
     #[test]
@@ -3079,12 +1520,12 @@ mod tests {
         s.leader = Some(Kind::Direct);
         let usable = |k: Kind| k != Kind::Own && k != Kind::Vpn && k != Kind::Group;
         assert_eq!(
-            order_with(&s, true, usable),
+            order_with(&s, usable),
             vec![Kind::Relay, Kind::Exits, Kind::Direct]
         );
         s.penalised[Kind::Direct.index()] = Some(Instant::now() - ms(1));
         s.leader = None;
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Direct);
+        assert_eq!(order_with(&s, usable)[0], Kind::Direct);
     }
 
     /// The whole point of proof: the fastest route is not the one that works.
@@ -3098,10 +1539,10 @@ mod tests {
         s.ok_at[Kind::Exits.index()] = Some(Instant::now());
         s.leader = Some(Kind::Direct);
         let usable = |k: Kind| k != Kind::Own && k != Kind::Vpn && k != Kind::Group;
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Exits);
+        assert_eq!(order_with(&s, usable)[0], Kind::Exits);
         // A refusal after the answer takes the proof away again.
         s.bad_at[Kind::Exits.index()] = Some(Instant::now() + ms(1));
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Direct);
+        assert_eq!(order_with(&s, usable)[0], Kind::Direct);
     }
 
     /// A route that could not even open for a live connection steps aside for a
@@ -3112,11 +1553,11 @@ mod tests {
         s.samples[Kind::Direct.index()] = sample(100);
         s.samples[Kind::Exits.index()] = sample(500);
         s.stumbled[Kind::Direct.index()] = Some(Instant::now() + ms(60_000));
-        let order = order_with(&s, true, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
+        let order = order_with(&s, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
         assert_eq!(order, vec![Kind::Exits, Kind::Relay, Kind::Direct]);
         s.stumbled[Kind::Direct.index()] = Some(Instant::now() - ms(1));
         assert_eq!(
-            order_with(&s, true, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group)[0],
+            order_with(&s, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group)[0],
             Kind::Direct
         );
     }
@@ -3132,12 +1573,9 @@ mod tests {
         s.ok_at[Kind::Exits.index()] = Some(Instant::now() - ms(600_000));
         s.leader = Some(Kind::Exits);
         let usable = |k: Kind| k == Kind::Exits || k == Kind::Direct;
-        assert_eq!(order_with(&s, true, usable)[0], Kind::Exits);
+        assert_eq!(order_with(&s, usable)[0], Kind::Exits);
         s.silent[Kind::Exits.index()] = Some(Instant::now() + ms(120_000));
-        assert_eq!(
-            order_with(&s, true, usable),
-            vec![Kind::Direct, Kind::Exits]
-        );
+        assert_eq!(order_with(&s, usable), vec![Kind::Direct, Kind::Exits]);
     }
 
     #[test]
@@ -3183,7 +1621,7 @@ mod tests {
         s.penalised[Kind::Direct.index()] = Some(now + ms(600_000));
         s.penalised[Kind::Exits.index()] = Some(now + ms(60_000));
         s.penalised[Kind::Relay.index()] = Some(now + ms(3_600_000));
-        let order = order_with(&s, true, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
+        let order = order_with(&s, |k| k != Kind::Own && k != Kind::Vpn && k != Kind::Group);
         assert_eq!(order, vec![Kind::Exits, Kind::Direct, Kind::Relay]);
     }
 
@@ -3194,9 +1632,9 @@ mod tests {
         s.samples[Kind::Direct.index()] = sample(100);
         s.ok_at[Kind::Direct.index()] = Some(Instant::now());
         s.leader = Some(Kind::Direct);
-        assert_eq!(order_with(&s, true, |k| k != Kind::Group)[0], Kind::Own);
+        assert_eq!(order_with(&s, |k| k != Kind::Group)[0], Kind::Own);
         assert_eq!(
-            order_with(&s, true, |k| k != Kind::Own && k != Kind::Group)[0],
+            order_with(&s, |k| k != Kind::Own && k != Kind::Group)[0],
             Kind::Direct
         );
     }
@@ -3209,10 +1647,10 @@ mod tests {
         s.samples[Kind::Direct.index()] = sample(100);
         s.ok_at[Kind::Direct.index()] = Some(Instant::now());
         s.leader = Some(Kind::Direct);
-        let order = order_with(&s, true, |_| true);
+        let order = order_with(&s, |_| true);
         assert_eq!(order[..3], [Kind::Group, Kind::Own, Kind::Direct]);
         // Group not usable (switch off, no key, probe failed): Own leads.
-        assert_eq!(order_with(&s, true, |k| k != Kind::Group)[0], Kind::Own);
+        assert_eq!(order_with(&s, |k| k != Kind::Group)[0], Kind::Own);
     }
 
     #[test]
@@ -3227,15 +1665,15 @@ mod tests {
             let mut s = blank();
             bench(&mut s, now + ms(600_000));
             assert_eq!(
-                order_with(&s, true, usable),
+                order_with(&s, usable),
                 vec![Kind::Relay, Kind::Exits, Kind::Direct, Kind::Group]
             );
             // With the user's own proxy present it takes the lead meanwhile.
-            assert_eq!(order_with(&s, true, |k| k != Kind::Vpn)[0], Kind::Own);
+            assert_eq!(order_with(&s, |k| k != Kind::Vpn)[0], Kind::Own);
 
             let mut s = blank();
             bench(&mut s, now - ms(1));
-            assert_eq!(order_with(&s, true, usable)[0], Kind::Group);
+            assert_eq!(order_with(&s, usable)[0], Kind::Group);
         }
     }
 
@@ -3250,7 +1688,7 @@ mod tests {
         ] {
             let mut s = blank();
             bench(&mut s, now + ms(600_000));
-            let order = order_with(&s, true, usable);
+            let order = order_with(&s, usable);
             assert_eq!(
                 order,
                 vec![Kind::Relay, Kind::Exits, Kind::Direct, Kind::Own]
@@ -3259,7 +1697,7 @@ mod tests {
             // The bench over, first again.
             let mut s = blank();
             bench(&mut s, now - ms(1));
-            assert_eq!(order_with(&s, true, usable)[0], Kind::Own);
+            assert_eq!(order_with(&s, usable)[0], Kind::Own);
         }
     }
 
@@ -3269,21 +1707,21 @@ mod tests {
         let mut s = blank();
         s.penalised[Kind::Own.index()] = Some(now + ms(600_000));
         s.penalised[Kind::Relay.index()] = Some(now + ms(60_000));
-        let order = order_with(&s, true, |k| k != Kind::Vpn && k != Kind::Group);
+        let order = order_with(&s, |k| k != Kind::Vpn && k != Kind::Group);
         assert_eq!(
             order,
             vec![Kind::Exits, Kind::Direct, Kind::Relay, Kind::Own]
         );
         // An unusable Own is not offered at all, benched or not.
-        let order = order_with(&s, true, |k| k != Kind::Vpn && k != Kind::Own && k != Kind::Group);
+        let order = order_with(&s, |k| k != Kind::Vpn && k != Kind::Own && k != Kind::Group);
         assert!(!order.contains(&Kind::Own));
     }
 
     #[test]
     fn unusable_routes_are_not_offered_at_all() {
-        let order = order_with(&blank(), true, |k| k == Kind::Relay);
+        let order = order_with(&blank(), |k| k == Kind::Relay);
         assert_eq!(order, vec![Kind::Relay]);
-        assert!(order_with(&blank(), true, |_| false).is_empty());
+        assert!(order_with(&blank(), |_| false).is_empty());
     }
 
     /// `usable` may ask the table questions of its own. This deadlocked once:
@@ -3348,7 +1786,10 @@ mod tests {
                 "but the refusal is still on the record the window shows"
             );
         } else {
-            assert!(relay_row.is_none(), "a build without the relay shows no relay row");
+            assert!(
+                relay_row.is_none(),
+                "a build without the relay shows no relay row"
+            );
         }
         // Once the proof has aged out, the same refusal benches - at the first
         // step, because the answer reset the streak.
@@ -3418,11 +1859,9 @@ mod tests {
         record(Kind::Direct, ms(300));
         record_failure(Kind::Direct);
         assert_eq!(latency(Kind::Direct), None);
-        // Use the normal tiers so the test can distinguish a benched Direct
-        // route from an unmeasured one.
-        let after_loss = order_with(&snapshot(), true, |_| true);
+        let after_loss = order_with(&snapshot(), |_| true);
         probe_failed(Kind::Direct);
-        let after_probe = order_with(&snapshot(), true, |_| true);
+        let after_probe = order_with(&snapshot(), |_| true);
         assert!(
             after_probe.last() == Some(&Kind::Direct) && after_loss.last() != Some(&Kind::Direct),
             "{after_loss:?} then {after_probe:?}"
@@ -3518,6 +1957,16 @@ mod tests {
         credit_tunnel(id);
         // The answer hands the client bytes, the way a stream does.
         activity.to_client(8 * 1024);
+
+        record(Kind::Exits, ms(300));
+        refresh_leader(|k| k == Kind::Exits);
+        let measured = latency(Kind::Exits);
+        probe_failed(Kind::Exits);
+        record(Kind::Relay, ms(1));
+        refresh_leader(|k| matches!(k, Kind::Exits | Kind::Relay));
+        assert_eq!(latency(Kind::Exits), measured, "a failed background probe cannot erase live proof");
+        assert_eq!(leader(), Some(Kind::Exits), "a faster probe cannot move a streaming leader");
+        assert_eq!(order(|k| matches!(k, Kind::Exits | Kind::Relay))[0], Kind::Exits);
 
         match blame(Kind::Exits) {
             Blamed::Streaming { to_client, .. } => assert_eq!(to_client, 8 * 1024),

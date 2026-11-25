@@ -113,7 +113,9 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
                 app.key_next_attempt = Some(std::time::Instant::now() + app.key_cooldown);
 
                 if valid {
-                    app.worker.send(crate::ops::Cmd::RememberLicense(app.key_input.trim().to_string()));
+                    app.worker.send(crate::ops::Cmd::RememberLicense(
+                        app.key_input.trim().to_string(),
+                    ));
                     app.screen = Screen::Main;
                     // The key field is about to stop existing. Leaving egui's focus
                     // pointed at it makes the next key press land on whatever claims
@@ -134,7 +136,7 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new("Ключ не подходит к этой версии анлокера.")
-                    .color(theme::BAD)
+                    .color(theme::palette(ui).bad)
                     .size(13.0),
             );
         }
@@ -154,14 +156,14 @@ pub fn view(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Подождите…")
-                .color(theme::MUTED)
+                .color(theme::palette(ui).muted)
                 .size(12.5),
         );
     } else if !app.key_input.trim().is_empty() && normalized_len != 24 {
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Введите ключ подходящей длины")
-                .color(theme::MUTED)
+                .color(theme::palette(ui).muted)
                 .size(12.5),
         );
     }

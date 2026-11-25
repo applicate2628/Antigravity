@@ -20,7 +20,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
@@ -181,20 +181,16 @@ impl Route {
 
     pub(crate) fn probe_with(&self, probe_fn: impl FnOnce() -> Result<(), String>) {
         let started = Instant::now();
-        let result = probe_fn();
-        self.record_probe(result, started.elapsed());
-    }
-
-    pub(crate) fn record_probe(&self, result: Result<(), String>, elapsed: Duration) {
-        match result {
+        match probe_fn() {
             Ok(()) => {
-                crate::routes::record(self.kind, elapsed);
+                crate::routes::record(self.kind, started.elapsed());
                 self.health.revive("проверка прошла");
             }
             Err(why) => {
                 crate::dns_forwarder::log_proxy(&format!("{} не отвечает: {}", self.label, why));
+                if self.kind != crate::routes::Kind::Exits && crate::routes::is_streaming(self.kind) { return; }
                 if self.kind != crate::routes::Kind::Exits {
-                    crate::routes::record_failure(self.kind);
+                    crate::routes::probe_failed(self.kind);
                 }
                 self.health.probe_failed();
             }
@@ -202,89 +198,8 @@ impl Route {
     }
 }
 
-/// One received endpoint and its own health; old work keeps its original Arc.
-pub(crate) struct OwnContext {
-    endpoint: Upstream,
-    route: Route,
-    drops: std::sync::atomic::AtomicUsize,
-}
-
-static CURRENT_OWN: Mutex<Option<Arc<OwnContext>>> = Mutex::new(None);
-
-pub(crate) fn while_own_absent<T>(f: impl FnOnce() -> T) -> Result<Option<T>, String> {
-    let slot = CURRENT_OWN.lock().map_err(|_| "own proxy state unavailable".to_string())?;
-    Ok(if slot.is_none() { Some(f()) } else { None })
-}
-
-pub(crate) fn capture_own() -> Result<Option<Arc<OwnContext>>, String> {
-    let mut current = CURRENT_OWN.lock().map_err(|_| "own proxy state unavailable".to_string())?;
-    let received = configured_checked()?;
-    select_own(&mut current, received)
-}
-
-fn select_own(current: &mut Option<Arc<OwnContext>>, received: Option<Upstream>) -> Result<Option<Arc<OwnContext>>, String> {
-    if current.as_ref().is_some_and(|old| Some(&old.endpoint) == received.as_ref()) {
-        return Ok(current.clone());
-    }
-    if current.is_some() || received.is_some() { crate::routes::reset_own_projection()?; }
-    *current = received.map(|endpoint| Arc::new(OwnContext {
-        endpoint, route: Route::new("свой прокси", crate::routes::Kind::Own), drops: std::sync::atomic::AtomicUsize::new(0),
-    }));
-    Ok(current.clone())
-}
-
-#[cfg(test)]
-pub(crate) fn fixture_select_own(endpoint: Option<Upstream>) -> Option<Arc<OwnContext>> {
-    select_own(&mut CURRENT_OWN.lock().unwrap(), endpoint).unwrap()
-}
-
-impl OwnContext {
-    #[cfg(test)]
-    pub(crate) fn fixture(endpoint: Upstream) -> Arc<Self> {
-        Arc::new(Self { endpoint, route: Route::new("fixture", crate::routes::Kind::Own), drops: std::sync::atomic::AtomicUsize::new(0) })
-    }
-    pub(crate) fn endpoint(&self) -> &Upstream { &self.endpoint }
-    pub(crate) fn usable(&self) -> bool { self.route.usable() }
-    pub(crate) fn is_benched(&self) -> bool { self.route.health.is_benched() }
-    pub(crate) fn note_open_failure(&self) { self.route.health.note(false); }
-    pub(crate) fn add_drops(&self, count: usize) -> usize {
-        self.drops.fetch_add(count, std::sync::atomic::Ordering::Relaxed).saturating_add(count)
-    }
-    pub(crate) fn clear_drops(&self) { self.drops.store(0, std::sync::atomic::Ordering::Relaxed); }
-    pub(crate) fn if_current<T>(self: &Arc<Self>, f: impl FnOnce() -> T) -> Option<T> {
-        let current = CURRENT_OWN.lock().ok()?;
-        if current.as_ref().is_some_and(|item| Arc::ptr_eq(item, self)) { Some(f()) } else { None }
-    }
-    pub(crate) fn probe(self: &Arc<Self>, check_region: bool) -> Result<(), String> {
-        if check_region {
-            match exit_info(&self.endpoint) {
-                Some((ip, loc)) if region_is_blocked(&loc) => {
-                    self.route.note_blocked_exit(&ip, &loc);
-                    return Err("own proxy exit is blocked".into());
-                }
-                Some((ip, loc)) => self.route.note_usable_exit(&ip, &loc),
-                None => (),
-            }
-        }
-        let started = Instant::now();
-        let result = probe(&self.endpoint);
-        self.receive_probe(&result, started.elapsed());
-        result
-    }
-    fn receive_probe(self: &Arc<Self>, result: &Result<(), String>, elapsed: Duration) {
-        match &result {
-            Ok(()) => self.route.health.revive("проверка прошла"),
-            Err(why) => {
-                crate::dns_forwarder::log_proxy(&format!("{} не отвечает: {}", self.route.label, why));
-                self.route.health.probe_failed();
-            }
-        }
-        self.if_current(|| match &result {
-            Ok(()) => crate::routes::record(crate::routes::Kind::Own, elapsed),
-            Err(_) => crate::routes::record_failure(crate::routes::Kind::Own),
-        });
-    }
-}
+/// The user's own proxy, as a route. Built-in exits carry one of these each.
+pub static OWN: Route = Route::new("свой прокси", crate::routes::Kind::Own);
 
 /// A user-supplied HTTP CONNECT proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,9 +268,7 @@ pub fn parse(input: &str) -> Result<Upstream, String> {
     if host.is_empty() {
         return Err("не указан адрес".to_string());
     }
-    let port: u16 = port
-        .parse()
-        .map_err(|_| format!("порт «{}» не число", port))?;
+    let port: u16 = port.parse().map_err(|_| "порт должен быть числом от 1 до 65535".to_string())?;
     if port == 0 {
         return Err("порт не может быть 0".to_string());
     }
@@ -373,27 +286,22 @@ pub fn parse(input: &str) -> Result<Upstream, String> {
 /// connections - runs under an S4U principal for that same user and reads it.
 /// A registry value or an environment variable would need a relay restart to
 /// take effect; a file is picked up on the next connection.
-fn config_path() -> Result<PathBuf, String> {
-    crate::dns_forwarder::checked_log_dir().map(|dir| dir.join("upstream.txt"))
+pub fn config_path() -> PathBuf {
+    crate::dns_forwarder::log_dir().join("upstream.txt")
 }
 
 pub fn save(up: &Upstream) -> Result<(), String> {
-    let path = config_path()?;
+    let path = config_path();
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     fs::write(&path, up.as_line()).map_err(|e| e.to_string())
 }
 
-pub fn clear() -> Result<(), String> {
-    clear_path(&config_path()?)
-}
-
-fn clear_path(path: &std::path::Path) -> Result<(), String> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+pub fn try_clear() -> std::io::Result<()> {
+    match fs::remove_file(config_path()) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("Не удалось удалить сохранённый адрес своего прокси: {}", error)),
+        result => result,
     }
 }
 
@@ -405,18 +313,8 @@ fn clear_path(path: &std::path::Path) -> Result<(), String> {
 /// nothing beside the handshake that follows it - the same reasoning the old CA
 /// lookup used.
 pub fn configured() -> Option<Upstream> {
-    let raw = fs::read_to_string(config_path().ok()?).ok()?;
+    let raw = fs::read_to_string(config_path()).ok()?;
     parse(&raw).ok()
-}
-
-/// Checked observation for the existing configuration writer. A failed read or
-/// malformed file is not proof that an attempted clear left no runtime proxy.
-pub(crate) fn configured_checked() -> Result<Option<Upstream>, String> {
-    match fs::read_to_string(config_path()?) {
-        Ok(raw) => parse(&raw).map(Some).map_err(|_| "saved proxy configuration is malformed".into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("saved proxy read failed: {:?}/{:?}", error.kind(), error.raw_os_error())),
-    }
 }
 
 /// Whether the route should be tried for this connection.
@@ -425,7 +323,7 @@ pub(crate) fn configured_checked() -> Result<Option<Upstream>, String> {
 /// comes out somewhere Google will accept. The last is checked against a pinned
 /// address rather than a clock - see `Route`.
 pub fn available() -> bool {
-    capture_own().ok().flatten().is_some_and(|own| own.usable())
+    configured().is_some() && OWN.usable()
 }
 
 fn basic(auth: &str) -> String {
@@ -455,7 +353,7 @@ fn basic(auth: &str) -> String {
 /// then hangs on the OS default - about 21 s on Windows - with a live client
 /// waiting behind it. The budget is spent across every candidate address rather
 /// than granted to each, so the whole step is bounded however many a name has.
-fn connect_within_budget(host: &str, port: u16, deadline: Instant, cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<TcpStream, String> {
+fn connect_within_budget(host: &str, port: u16, deadline: Instant) -> Result<TcpStream, String> {
     let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("адрес не разрешается: {}", e))?
@@ -465,9 +363,6 @@ fn connect_within_budget(host: &str, port: u16, deadline: Instant, cancelled: Op
     }
     let mut last = String::from("время вышло");
     for addr in addrs {
-        if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
-            return Err("отменено".to_string());
-        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
@@ -494,16 +389,12 @@ fn connect_within_budget(host: &str, port: u16, deadline: Instant, cancelled: Op
 /// because that is the thing a waiting client experiences. Bounding each part
 /// separately is how three seconds of patience turns into fifteen (I43).
 pub fn open(up: &Upstream, host: &str, port: u16, budget: Duration) -> Result<TcpStream, String> {
-    open_with_cancellation(up, host, port, budget, None)
-}
-
-pub(crate) fn open_with_cancellation(up: &Upstream, host: &str, port: u16, budget: Duration, cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<TcpStream, String> {
     let deadline = Instant::now() + budget;
-    let mut sock = connect_within_budget(&up.host, up.port, deadline, cancelled)?;
+    let mut sock = connect_within_budget(&up.host, up.port, deadline)?;
     let left = || deadline.saturating_duration_since(Instant::now());
     // A zero timeout means "block forever" to the OS, so a spent budget has to be
     // an error here rather than a socket option.
-    if left().is_zero() || cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+    if left().is_zero() {
         return Err("прокси не ответил вовремя".to_string());
     }
     sock.set_read_timeout(Some(left())).ok();
@@ -517,12 +408,12 @@ pub(crate) fn open_with_cancellation(up: &Upstream, host: &str, port: u16, budge
     // proxy is handed Google's address instead of the name; the client's own
     // TLS still names the host, so nothing else changes.
     let target = crate::proxy::connect_target(up.host.as_str(), host);
-    if left().is_zero() || cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
-        return Err("отменено или время вышло".to_string());
-    }
     let host = target.as_str();
-    let encoded_basic = up.auth.as_ref().map(|a| basic(a));
-    let req = crate::connect_wire::format_request(host, port, encoded_basic.as_deref());
+    let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+    if let Some(a) = &up.auth {
+        req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", basic(a)));
+    }
+    req.push_str("\r\n");
     sock.write_all(req.as_bytes())
         .map_err(|e| format!("не отправить CONNECT: {}", e))?;
 
@@ -534,7 +425,7 @@ pub(crate) fn open_with_cancellation(up: &Upstream, host: &str, port: u16, budge
         }
         // The socket timeout bounds one `read`; this bounds the loop, so a proxy
         // dribbling a byte at a time cannot outlast the budget by repeating.
-        if left().is_zero() || cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+        if left().is_zero() {
             return Err("прокси не ответил вовремя".to_string());
         }
         match sock.read(&mut byte) {
@@ -555,7 +446,11 @@ pub(crate) fn open_with_cancellation(up: &Upstream, host: &str, port: u16, budge
             Err(e) => return Err(format!("нет ответа: {}", e)),
         }
     }
-    let status = crate::connect_wire::response_view(&head).first_line;
+    let status = String::from_utf8_lossy(&head)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
     // Not `starts_with("HTTP/1.1 200")`: a CONNECT proxy is free to answer on
     // HTTP/1.0, and tinyproxy - which is what the built-in exits run - does.
     if !status.contains(" 200") {
@@ -570,9 +465,6 @@ pub(crate) fn open_with_cancellation(up: &Upstream, host: &str, port: u16, budge
             return Err(format!("прокси не пропускает этот хост: {}", host));
         }
         return Err(format!("прокси отказал: {}", status));
-    }
-    if left().is_zero() || cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
-        return Err("отменено или время вышло".to_string());
     }
     // The budgets above bounded reaching the proxy and reading its answer. They
     // are mine, not the caller's, so the socket goes back clean - a caller that
@@ -630,11 +522,10 @@ pub fn probe(up: &Upstream) -> Result<(), String> {
 /// Own gives way like any route (G81). Owner's decision: no trace traffic to
 /// third-party hosts through their proxy every two minutes.
 pub fn probe_health() {
-    match capture_own() {
-        Ok(Some(own)) => { let _ = own.probe(false); }
-        Ok(None) => (),
-        Err(error) => crate::dns_forwarder::log_proxy(&format!("own proxy observation failed: {error}")),
-    }
+    let Some(up) = configured() else {
+        return;
+    };
+    OWN.probe(&up, false);
 }
 
 /// The address the proxy comes out on, and the country Cloudflare puts it in.
@@ -773,70 +664,6 @@ pub fn region_is_blocked(loc: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[ignore = "isolated process: owns the current Own slot and route projection"]
-    fn own_endpoint_switch_retains_work_identity_and_revives_current() {
-        struct Restore(Option<Arc<OwnContext>>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                if let Ok(mut slot) = CURRENT_OWN.lock() { *slot = self.0.take(); }
-                let _ = crate::routes::reset_own_projection();
-            }
-        }
-        let previous = CURRENT_OWN.lock().unwrap().take();
-        let _restore = Restore(previous);
-        let a = parse("192.0.2.1:8080").unwrap();
-        let b = parse("192.0.2.2:8080").unwrap();
-        let select = |endpoint| select_own(&mut CURRENT_OWN.lock().unwrap(), endpoint).unwrap();
-        let old_a = select(Some(a.clone())).unwrap();
-        old_a.note_open_failure();
-        old_a.note_open_failure();
-        assert!(!old_a.usable());
-        let current_b = select(Some(b.clone())).unwrap();
-        assert!(current_b.usable());
-        assert!(Arc::ptr_eq(&current_b, &select(Some(b)).unwrap()));
-        old_a.receive_probe(&Ok(()), Duration::from_millis(17));
-        assert!(crate::routes::latency(crate::routes::Kind::Own).is_none());
-        current_b.note_open_failure();
-        current_b.note_open_failure();
-        assert!(!current_b.usable());
-        current_b.receive_probe(&Ok(()), Duration::from_millis(23));
-        assert!(current_b.usable());
-        assert_eq!(crate::routes::latency(crate::routes::Kind::Own), Some(Duration::from_millis(23)));
-        select(None);
-        let new_a = select(Some(a)).unwrap();
-        assert!(!Arc::ptr_eq(&old_a, &new_a));
-        old_a.receive_probe(&Ok(()), Duration::from_millis(31));
-        assert!(crate::routes::latency(crate::routes::Kind::Own).is_none());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn own_endpoint_unlink_failure_is_reported_and_retains_endpoint() {
-        use std::os::windows::fs::OpenOptionsExt;
-        // The compiler's manifest directory is this guard's frozen source
-        // fixture, never the actual application configuration directory.
-        let fixture = crate::wsl_discovery_contract_cases::fixture_dir("own-endpoint-unlink");
-        let path = fixture.join("upstream.txt");
-        let mut retained = fs::OpenOptions::new().write(true).create_new(true)
-            .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
-            .open(&path).unwrap();
-        let line = "synthetic:credential@192.0.2.1:8080";
-        retained.write_all(line.as_bytes()).unwrap();
-        retained.flush().unwrap();
-        let failed = clear_path(&path);
-        let preserved = fs::read_to_string(&path);
-        drop(retained);
-        let cleared = clear_path(&path);
-        let absent = clear_path(&path);
-        assert!(failed.is_err(), "failed unlink must not report success");
-        assert!(!failed.unwrap_err().contains(line), "error must not disclose endpoint credentials");
-        assert_eq!(parse(&preserved.unwrap()).unwrap(), parse(line).unwrap());
-        cleared.unwrap();
-        absent.unwrap();
-        assert!(!path.exists());
-    }
 
     /// Live: the P16 primitive reaches Cloudflare directly and reads the exit
     /// country. Ignored (needs the network); the point is that the direct

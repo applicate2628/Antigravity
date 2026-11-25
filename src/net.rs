@@ -9,9 +9,9 @@
 //! refused it from the tunnel's foreign exit. The DoH provider had the same gap
 //! (P13): its queries rode the tunnel and came back unsubstituted.
 //!
-//! The interface option has to be set *before* `connect`. `TcpStream` creates
-//! and connects in one call, so the socket is built with `socket2` and handed
-//! back as an ordinary `TcpStream`.
+//! IP_UNICAST_IF has to be set *before* `connect`, which `TcpStream` cannot do —
+//! it creates and connects in one call — so the socket is built with `socket2`
+//! and handed back as an ordinary `TcpStream`.
 //!
 //! Pinning is only switched on while a tunnel holds the default route. With no
 //! tunnel the ISP link *is* the default route, and naming it buys nothing while
@@ -59,8 +59,8 @@ pub fn tunnel_up() -> bool {
     pin_interface() != 0
 }
 
-/// Connects to `addr` inside `timeout`. On Windows and macOS, a nonzero
-/// `if_index` selects the outgoing interface.
+/// Connects to `addr` inside `timeout`, leaving through `if_index` when it is
+/// not 0.
 ///
 /// A pinned connect that the interface cannot carry fails like any other
 /// connect — a kill-switch VPN drops it, a dead link refuses it — so the caller's
@@ -101,30 +101,61 @@ fn connect_pinned(addr: SocketAddr, timeout: Duration, if_index: u32) -> io::Res
     Ok(sock.into())
 }
 
-#[cfg(target_os = "macos")]
+/// Linux: `SO_BINDTOIFINDEX` (kernel 5.7+ lets an unprivileged process bind a
+/// socket not yet bound to a device). macOS: `IP_BOUND_IF`, no privilege needed.
+///
+/// A socket the kernel refuses to bind *for lack of privilege* is connected
+/// unpinned rather than not at all: through a tunnel a RU-only provider refuses the connection and the
+/// caller falls through to the next address or route, which is exactly what a
+/// failed pinned connect would have led to - minus the routes that would have
+/// worked unpinned.
+#[cfg(not(target_os = "windows"))]
 fn connect_pinned(addr: SocketAddr, timeout: Duration, if_index: u32) -> io::Result<TcpStream> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-
     let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-    bind_to_interface(&sock, addr.is_ipv6(), if_index)?;
+    if let Err(e) = bind_to_interface(&sock, addr.is_ipv6(), if_index) {
+        // Only a refusal of the privilege falls back. Any other error (ENODEV:
+        // the interface went away) is a connect this interface cannot carry.
+        if !refused_privilege(&e) {
+            return Err(e);
+        }
+        note_unpinned(&e);
+    }
     sock.connect_timeout(&SockAddr::from(addr), timeout)?;
     Ok(sock.into())
 }
 
-/// Sets the macOS bound-interface option for the socket's address family.
-#[cfg(target_os = "macos")]
-pub(crate) fn bind_to_interface(sock: &socket2::Socket, v6: bool, if_index: u32) -> io::Result<()> {
-    let index = std::num::NonZeroU32::new(if_index);
+/// Binds `sock` to `if_index` (IPv4 or IPv6 option). Shared with `dns_client`.
+#[cfg(not(target_os = "windows"))]
+pub fn bind_to_interface(sock: &socket2::Socket, v6: bool, if_index: u32) -> io::Result<()> {
+    let idx = std::num::NonZeroU32::new(if_index);
     if v6 {
-        sock.bind_device_by_index_v6(index)
+        sock.bind_device_by_index_v6(idx)
     } else {
-        sock.bind_device_by_index_v4(index)
+        sock.bind_device_by_index_v4(idx)
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn connect_pinned(addr: SocketAddr, timeout: Duration, _if_index: u32) -> io::Result<TcpStream> {
-    TcpStream::connect_timeout(&addr, timeout)
+/// EPERM/EACCES: a kernel older than 5.7, or a socket already bound to a device.
+#[cfg(not(target_os = "windows"))]
+pub fn refused_privilege(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::PermissionDenied)
+}
+
+/// Said once per process: a kernel that refuses the binding refuses it every
+/// time, and the log has a budget.
+#[cfg(not(target_os = "windows"))]
+pub fn note_unpinned(e: &io::Error) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        #[cfg(not(test))]
+        crate::dns_forwarder::log_proxy(&format!(
+            "соединения не привязать к интерфейсу провайдера ({}) — идут по таблице маршрутов",
+            e
+        ));
+        #[cfg(test)]
+        let _ = e;
+    }
 }
 
 /// The interface the routing table would send a packet to `dest` through.
@@ -132,7 +163,7 @@ fn connect_pinned(addr: SocketAddr, timeout: Duration, _if_index: u32) -> io::Re
 /// One syscall, no PowerShell: cheap enough for every warm pass, which is what
 /// lets the relay notice a VPN coming up within seconds instead of on the
 /// four-minute clock the full adapter scan runs on. `None` where it cannot be
-/// asked (no route at all, or not Windows).
+/// asked (no route at all).
 #[cfg(target_os = "windows")]
 pub fn best_interface(dest: Ipv4Addr) -> Option<u32> {
     let mut idx: u32 = 0;
@@ -142,8 +173,8 @@ pub fn best_interface(dest: Ipv4Addr) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn best_interface(_dest: Ipv4Addr) -> Option<u32> {
-    None
+pub fn best_interface(dest: Ipv4Addr) -> Option<u32> {
+    crate::netif::best_interface(dest)
 }
 
 #[cfg(target_os = "windows")]

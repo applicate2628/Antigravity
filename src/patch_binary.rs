@@ -1,51 +1,56 @@
-pub(crate) use crate::binary_profile::{count_occurrences, field_signatures, proxy_var_original, replace_all};
-#[allow(unused_imports)]
-pub(crate) use crate::binary_profile::{prepare_profile, PatchProfile, ProfileError, ProfilePreparation};
-
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativePermissionDenied {
-    pub operation: &'static str,
-    pub kind: std::io::ErrorKind,
-    pub raw_os_error: Option<i32>,
-    pub detail: String,
-}
+/// All writers (window, relay and standalone watchdog) share one transaction.
+/// A second watchdog must re-read the winner's patched file, not kill the LS
+/// to commit an obsolete copy it read before the first writer finished.
+#[cfg(windows)]
+struct PatchLock(windows_sys::Win32::Foundation::HANDLE);
 
-impl std::fmt::Display for NativePermissionDenied {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: kind={:?}, raw={:?}: {}", self.operation, self.kind, self.raw_os_error, self.detail)
+#[cfg(windows)]
+impl PatchLock {
+    fn acquire(path: &Path) -> Result<Self, String> {
+        use sha2::{Digest, Sha256};
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        let absolute = fs::canonicalize(path).map_err(|e| e.to_string())?;
+        let id = hex::encode(Sha256::digest(
+            absolute.to_string_lossy().to_lowercase().as_bytes(),
+        ));
+        let name: Vec<_> = format!("Global\\AGUnlocker.Patch.{id}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let waited = unsafe { WaitForSingleObject(handle, 15_000) };
+        if waited == 0 || waited == 0x80 {
+            return Ok(Self(handle));
+        }
+        let error = if waited == 258 {
+            "another patch writer is still busy".into()
+        } else {
+            std::io::Error::last_os_error().to_string()
+        };
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        Err(error)
     }
 }
 
-#[cfg(target_os = "macos")]
-#[derive(Debug)]
-enum MacWriteError { PermissionDenied(NativePermissionDenied), Other(String) }
-
-#[cfg(target_os = "macos")]
-impl From<String> for MacWriteError { fn from(value: String) -> Self { Self::Other(value) } }
-#[cfg(target_os = "macos")]
-impl From<&str> for MacWriteError { fn from(value: &str) -> Self { Self::Other(value.to_owned()) } }
-#[cfg(target_os = "macos")]
-impl std::fmt::Display for MacWriteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::PermissionDenied(error) => std::fmt::Display::fmt(error, f), Self::Other(error) => f.write_str(error) }
+#[cfg(windows)]
+impl Drop for PatchLock {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
     }
-}
-
-#[cfg(target_os = "macos")]
-fn mac_stage_creation_error(error: std::io::Error) -> MacWriteError {
-    let kind = error.kind(); let raw_os_error = error.raw_os_error();
-    if kind == std::io::ErrorKind::PermissionDenied || matches!(raw_os_error, Some(libc::EPERM | libc::EACCES)) {
-        MacWriteError::PermissionDenied(NativePermissionDenied {
-            operation: "создание staging", kind, raw_os_error, detail: error.to_string(),
-        })
-    } else { MacWriteError::Other(format!("Файл не заменён: создание staging: {error}")) }
 }
 
 // Two edits are made to the native binaries, both same-length renames of a
@@ -66,365 +71,83 @@ fn mac_stage_creation_error(error: std::io::Error) -> MacWriteError {
 // The literals live inside obfstr! blocks so they don't show up as plain
 // strings in this binary.
 
+fn replace_all(data: &mut [u8], from: &[u8], to: &[u8]) -> usize {
+    debug_assert_eq!(from.len(), to.len());
+    if data.len() < from.len() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    while i + from.len() <= data.len() {
+        if &data[i..i + from.len()] == from {
+            data[i..i + to.len()].copy_from_slice(to);
+            count += 1;
+            i += from.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+fn count_occurrences(data: &[u8], needle: &[u8]) -> usize {
+    if data.len() < needle.len() {
+        return 0;
+    }
+    (0..=data.len() - needle.len())
+        .filter(|&i| &data[i..i + needle.len()] == needle)
+        .count()
+}
+
 /// Writes the binary back atomically: a sibling temp on the same directory, then
 /// a rename over the target. A crash or power loss mid-write leaves either the
 /// old binary or the new one, never a truncated 135 MB executable that would fail
-/// to launch. A locked Windows image requires a normal close; this module owns
-/// no creator process handle and cannot terminate a process by image name.
-#[cfg(not(target_os = "macos"))]
+/// to launch. A running executable is locked on Windows, so the owning process is
+/// killed and the write retried only if the first attempt actually fails.
 fn write_binary(bin_path: &Path, data: &[u8]) -> Result<(), String> {
-    #[cfg(windows)]
-    let canonical_guard = crate::windows_coordinator::windows_installation::admit_native_binary(bin_path,
-        binary_targets, crate::windows_coordinator::receive_saved_context)?;
-    match write_atomic(bin_path, data) {
+    let res = match write_atomic(bin_path, data) {
+        Ok(()) => Ok(()),
+        Err(e) if matches!(e.raw_os_error(), Some(32 | 33)) => {
+            kill_holder(bin_path);
+            thread::sleep(Duration::from_millis(500));
+            write_atomic(bin_path, data).map_err(|e| e.to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    // macOS: a bundle changed under a quarantine flag is "damaged" to
+    // Gatekeeper on its first launch, so the flag goes with the patch; a
+    // refused write into a bundle says which switch macOS wants.
+    #[cfg(target_os = "macos")]
+    let res = match res {
         Ok(()) => {
-            #[cfg(windows)]
-            canonical_guard.recheck().map_err(|error| format!("Файл заменён, но каноническая проверка не завершилась: {error}"))?;
-            return Ok(());
-        },
-        Err(error) => {
-            #[cfg(windows)]
-            return Err(windows_write_failure(&error));
-            #[cfg(all(not(windows), not(target_os = "macos")))]
-            let _ = error;
-        }
-    }
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    {
-    kill_holder(bin_path);
-    thread::sleep(Duration::from_millis(500));
-    write_atomic(bin_path, data).map_err(|e| e.to_string())
-    }
-}
-
-#[cfg(windows)]
-fn windows_write_failure(error: &std::io::Error) -> String {
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
-    if matches!(error.raw_os_error().map(|code| code as u32), Some(ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION)) {
-        format!("Файл не заменён; закройте использующее его приложение обычным способом: {error}")
-    } else {
-        format!("Файл не заменён: {error}")
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn read_mac_preimage(path: &Path) -> Result<(fs::File, Vec<u8>), String> {
-    use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    mac_check_no_stage(path)?;
-    let mut file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
-        .open(path).map_err(|e| format!("исходный файл: {e}"))?;
-    #[cfg(test)]
-    mac_writer_test_barrier("OPENED")?;
-    file.try_lock().map_err(|error| match error {
-        std::fs::TryLockError::WouldBlock => "исходный файл занят".to_owned(),
-        std::fs::TryLockError::Error(error) => format!("блокировка исходного файла: {error}"),
-    })?;
-    let held = file.metadata().map_err(|e| e.to_string())?;
-    let named = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if !held.is_file() || !named.is_file() || held.nlink() != 1 || held.dev() != named.dev() || held.ino() != named.ino() {
-        return Err("неоднозначная идентичность исходного файла".into());
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    let after = file.metadata().map_err(|e| e.to_string())?;
-    let named_after = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if held.dev() != after.dev() || held.ino() != after.ino() || held.size() != after.size()
-        || held.mtime() != after.mtime() || held.mtime_nsec() != after.mtime_nsec()
-        || after.dev() != named_after.dev() || after.ino() != named_after.ino() {
-        return Err("исходный файл изменился во время чтения".into());
-    }
-    #[cfg(test)]
-    mac_writer_test_barrier("ADMITTED")?;
-    Ok((file, bytes))
-}
-
-#[cfg(target_os = "macos")]
-fn mac_check_no_stage(path: &Path) -> Result<(), String> {
-    use std::os::unix::ffi::OsStrExt;
-    let parent = path.parent().ok_or("нет родительского каталога")?;
-    let name = path.file_name().ok_or("нет имени файла")?.as_bytes();
-    for item in fs::read_dir(parent).map_err(|e| format!("проверка staging: {e}"))? {
-        let item = item.map_err(|e| format!("проверка staging: {e}"))?;
-        let file_name = item.file_name();
-        let bytes = file_name.as_bytes();
-        if bytes.starts_with(name) && bytes.get(name.len()) == Some(&b'.') && bytes.ends_with(TEMP_SUFFIX.as_bytes()) {
-            return Err(format!("существует незавершённый staging: {}", item.path().display()));
-        }
-    }
-    Ok(())
-}
-
-#[cfg(all(test, target_os = "macos"))]
-fn mac_writer_test_barrier(phase: &str) -> Result<(), String> {
-    use std::io::{BufRead, Write};
-    if std::env::var_os("AG_MAC_WRITER_TEST_CHILD").is_none() { return Ok(()); }
-    let phases = std::env::var("AG_MAC_WRITER_TEST_PHASES").unwrap_or_default();
-    if !phases.split(',').any(|value| value == phase) { return Ok(()); }
-    let mut output = std::io::stdout().lock();
-    writeln!(output, "\nAG_WRITER_PHASE {phase}").and_then(|_| output.flush()).map_err(|error| format!("test phase output: {error}"))?;
-    let mut reply = String::new();
-    std::io::stdin().lock().read_line(&mut reply).map_err(|error| format!("test phase input: {error}"))?;
-    if reply.trim_end() != "CONTINUE" { return Err("test phase input closed or invalid".into()); }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, PartialEq, Eq)]
-enum MacTargetScope { AppBundle(PathBuf), StandaloneExecutable(PathBuf) }
-
-#[cfg(target_os = "macos")]
-fn mac_scope_contains_image(scope: &MacTargetScope, image: &Path) -> bool {
-    match scope {
-        MacTargetScope::AppBundle(bundle) => image.starts_with(bundle),
-        MacTargetScope::StandaloneExecutable(target) => image == target,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn mac_target_scope(install: &Path, path: &Path) -> Result<MacTargetScope, String> {
-    use std::os::unix::fs::MetadataExt;
-    if crate::resolve_install_root(install).as_deref() != Some(install)
-        || !binary_targets(install).iter().any(|candidate| candidate == path) {
-        return Err("цель не принадлежит выбранной установке".into());
-    }
-    let info = fs::symlink_metadata(path).map_err(|error| format!("проверка цели: {error}"))?;
-    if !info.is_file() || info.nlink() != 1 { return Err("цель не является обычным файлом".into()); }
-    let path = fs::canonicalize(path).map_err(|error| format!("путь цели: {error}"))?;
-    if let Some(bundle) = path.ancestors().find(|part| part.extension().is_some_and(|ext| ext == "app")) {
-        return Ok(MacTargetScope::AppBundle(bundle.to_path_buf()));
-    }
-    let candidates = cli_target_candidates(install).into_iter().chain(extension_cli_targets(install));
-    for candidate in candidates {
-        if fs::canonicalize(candidate).ok().as_deref() == Some(path.as_path()) {
-            return Ok(MacTargetScope::StandaloneExecutable(path));
-        }
-    }
-    Err("вне пакета найден неподтверждённый исполняемый файл".into())
-}
-
-#[cfg(target_os = "macos")]
-fn mac_target_inactive(scope: &MacTargetScope) -> Result<(), String> {
-    use std::os::unix::ffi::OsStrExt;
-    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    if count <= 0 { return Err(format!("список процессов недоступен: {}", std::io::Error::last_os_error())); }
-    let mut pids = vec![0 as libc::pid_t; count as usize + 1];
-    loop {
-        let bytes = pids.len().checked_mul(std::mem::size_of::<libc::pid_t>()).and_then(|size| i32::try_from(size).ok())
-            .ok_or("список процессов слишком велик")?;
-        let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-        if count <= 0 { return Err(format!("список процессов недоступен: {}", std::io::Error::last_os_error())); }
-        if count as usize >= pids.len() {
-            let next = pids.len().checked_mul(2).ok_or("список процессов слишком велик")?;
-            pids.resize(next, 0);
-            continue;
-        }
-        pids.truncate(count as usize);
-        break;
-    }
-    for pid in pids.into_iter().filter(|pid| *pid > 0) {
-        let mut image = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-        unsafe { *libc::__error() = 0; }
-        let n = unsafe { libc::proc_pidpath(pid, image.as_mut_ptr().cast(), image.len() as u32) };
-        if n <= 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) { continue; }
-            return Err(format!("образ процесса {pid} недоступен: {error}"));
-        }
-        let image = std::ffi::CStr::from_bytes_until_nul(&image).map_err(|_| "неверный путь процесса")?;
-        let image = Path::new(std::ffi::OsStr::from_bytes(image.to_bytes()));
-        let image = fs::canonicalize(image).map_err(|error| format!("путь процесса {pid} недоступен: {error}"))?;
-        if mac_scope_contains_image(scope, &image) { return Err(format!("выбранная цель используется процессом: {}", image.display())); }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn write_binary(bin_path: &Path, data: &[u8], preimage: &[u8], original: &mut fs::File, install: &Path, scope: &MacTargetScope) -> Result<(), MacWriteError> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-
-    fn open_checked(path: &Path, write: bool) -> Result<fs::File, String> {
-        let file = fs::OpenOptions::new().read(true).write(write)
-            .custom_flags(libc::O_NOFOLLOW).open(path).map_err(|e| e.to_string())?;
-        let held = file.metadata().map_err(|e| e.to_string())?;
-        let named = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-        if !held.is_file() || !named.is_file() || held.nlink() != 1
-            || held.dev() != named.dev() || held.ino() != named.ino() {
-            return Err("неоднозначная идентичность файла".into());
-        }
-        Ok(file)
-    }
-    fn same(file: &fs::File, path: &Path) -> Result<(), String> {
-        let held = file.metadata().map_err(|e| e.to_string())?;
-        let named = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-        if held.dev() != named.dev() || held.ino() != named.ino() || named.file_type().is_symlink()
-            || held.is_dir() != named.is_dir() || held.is_file() != named.is_file()
-            || (held.is_file() && held.nlink() != 1) {
-            return Err("идентичность пути изменилась".into());
-        }
-        Ok(())
-    }
-    fn read_all(file: &mut fs::File) -> Result<Vec<u8>, String> {
-        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        Ok(bytes)
-    }
-    fn native(command: &mut Command, label: &str) -> Result<(), String> {
-        let output = command.output().map_err(|e| format!("{label}: запуск: {e}"))?;
-        #[cfg(test)]
-        let capture = (|| -> std::io::Result<()> {
-            let mut stderr = std::io::stderr().lock();
-            writeln!(stderr, "AG_MAC_NATIVE {label} status={:?}", output.status)?;
-            stderr.write_all(b"AG_MAC_NATIVE_STDOUT_BEGIN\n")?;
-            stderr.write_all(&output.stdout)?;
-            stderr.write_all(b"\nAG_MAC_NATIVE_STDERR_BEGIN\n")?;
-            stderr.write_all(&output.stderr)?;
-            stderr.write_all(b"\nAG_MAC_NATIVE_END\n")
-        })();
-        if !output.status.success() {
-            #[cfg(test)]
-            let capture_detail = format!("; capture={capture:?}");
-            #[cfg(not(test))]
-            let capture_detail = "";
-            return Err(format!("{label}: {:?}; stdout={:?}; stderr={:?}", output.status,
-                String::from_utf8_lossy(&output.stdout), format!("{}{}", String::from_utf8_lossy(&output.stderr), capture_detail)));
-        }
-        #[cfg(test)]
-        capture.map_err(|e| format!("{label}: status={:?}; capture: {e}", output.status))?;
-        Ok(())
-    }
-
-    if std::env::args_os().any(|arg| arg == "--watchdog")
-        && !crate::settings::watchdog_snapshot()?.auto_patch_wanted() {
-        return Err("сохранённые настройки запрещают автопатч".into());
-    }
-    if mac_target_scope(install, bin_path)? != *scope { return Err("область цели изменилась".into()); }
-    mac_target_inactive(scope)?;
-    if data.len() != preimage.len() { return Err("Файл не заменён: длина подготовленных данных изменилась".into()); }
-    let parent = bin_path.parent().ok_or("Файл не заменён: отсутствует родитель")?;
-    let name = bin_path.file_name().ok_or("Файл не заменён: отсутствует имя")?;
-    let mut ancestor = PathBuf::new();
-    for part in parent.components() {
-        ancestor.push(part.as_os_str());
-        let m = fs::symlink_metadata(&ancestor).map_err(|e| format!("Файл не заменён: родитель: {e}"))?;
-        if m.file_type().is_symlink() || !m.is_dir() { return Err("Файл не заменён: неоднозначный родитель".into()); }
-    }
-    let parent_handle = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
-        .open(parent).map_err(|e| format!("Файл не заменён: родитель: {e}"))?;
-    same(&parent_handle, parent).map_err(|e| format!("Файл не заменён: {e}"))?;
-    same(original, bin_path).map_err(|e| format!("Файл не заменён: {e}"))?;
-    let original_metadata = original.metadata().map_err(|e| format!("исходный файл: {e}"))?;
-    if read_all(original)? != preimage { return Err("Файл не заменён: исходные данные изменились".into()); }
-    let stage_dir = temp_path(bin_path);
-    fs::DirBuilder::new().mode(0o700).create(&stage_dir)
-        .map_err(mac_stage_creation_error)?;
-    let staged = stage_dir.join(name);
-    let operation = (|| -> Result<(), String> {
-        let stage_parent = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
-            .open(&stage_dir).map_err(|e| format!("staging parent: {e}"))?;
-        same(&parent_handle, parent)?;
-        same(&stage_parent, &stage_dir)?;
-        let mut copy = Command::new("/usr/bin/ditto");
-        copy.args(["--rsrc", "--extattr", "--qtn", "--acl"]).arg(bin_path).arg(&staged);
-        for key in ["DITTOABORT", "DITTONORSRC", "DITTOKEEPBINARIESPATTERN", "DITTOKEEPBINARIESDIR", "DITTO_TEST_OPTIONS"] { copy.env_remove(key); }
-        native(&mut copy, "ditto")?;
-        same(&parent_handle, parent)?; same(&stage_parent, &stage_dir)?; same(original, bin_path)?;
-        if read_all(original)? != preimage { return Err("исходные данные изменились после копирования".into()); }
-        let mut stage = open_checked(&staged, true)?;
-        if read_all(&mut stage)? != preimage { return Err("копия не соответствует исходным данным".into()); }
-        stage.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        stage.write_all(data).map_err(|e| format!("запись staging: {e}"))?;
-        stage.sync_all().map_err(|e| format!("синхронизация staging: {e}"))?;
-        if read_all(&mut stage)? != data { return Err("проверка записи staging не прошла".into()); }
-        same(&stage, &staged)?; same(&stage_parent, &stage_dir)?;
-        native(Command::new("/usr/bin/codesign").args(["--force", "--sign", "-", "--preserve-metadata=identifier,entitlements,flags,runtime,launch-constraints,library-constraints"]).arg(&staged), "codesign")?;
-        same(&stage_parent, &stage_dir)?;
-        let mut signed = open_checked(&staged, false)?;
-        signed.try_lock().map_err(|error| match error {
-            std::fs::TryLockError::WouldBlock => "подписанный staging занят".to_owned(),
-            std::fs::TryLockError::Error(error) => format!("блокировка подписанного staging: {error}"),
-        })?;
-        let signed_bytes = read_all(&mut signed)?;
-        native(Command::new("/usr/bin/codesign").args(["--verify", "--strict"]).arg(&staged), "stage verify")?;
-        same(&signed, &staged)?; same(&stage_parent, &stage_dir)?; same(&parent_handle, parent)?; same(original, bin_path)?;
-        if read_all(&mut signed)? != signed_bytes || read_all(original)? != preimage {
-            return Err("данные изменились перед заменой".into());
-        }
-        // Save the admitted bytes before exchange: a noncooperating updater can
-        // unlink the original between the last check and the exchange.
-        let backup_path = stage_dir.join(".ag-original");
-        let mut backup = fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW).open(&backup_path).map_err(|e| format!("сохранение исходных данных: {e}"))?;
-        backup.write_all(preimage).map_err(|e| format!("сохранение исходных данных: {e}"))?;
-        backup.sync_all().map_err(|e| format!("сохранение исходных данных: {e}"))?;
-        if read_all(&mut backup)? != preimage { return Err("копия исходных данных не подтверждена".into()); }
-        same(&backup, &backup_path)?; same(&stage_parent, &stage_dir)?;
-        if mac_target_scope(install, bin_path)? != *scope { return Err("область цели изменилась".into()); }
-        mac_target_inactive(scope)?;
-        same(original, bin_path)?;
-        if std::env::args_os().any(|arg| arg == "--watchdog")
-            && !crate::settings::watchdog_snapshot()?.auto_patch_wanted() {
-            return Err("сохранённые настройки запрещают автопатч".into());
-        }
-        let stage_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| "неверное имя staging")?;
-        let live_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| "неверное имя файла")?;
-        #[cfg(test)]
-        mac_writer_test_barrier("PRE_SWAP")?;
-        if unsafe { libc::renameatx_np(stage_parent.as_raw_fd(), stage_name.as_ptr(),
-            parent_handle.as_raw_fd(), live_name.as_ptr(), libc::RENAME_SWAP) } != 0 {
-            return Err(format!("атомарный обмен: {}", std::io::Error::last_os_error()));
-        }
-        #[cfg(test)]
-        mac_writer_test_barrier("POST_SWAP").map_err(|error| format!("TARGET_CHANGED: test phase: {error}"))?;
-        let received = (|| -> Result<(), String> {
-            same(&parent_handle, parent)?; same(&stage_parent, &stage_dir)?;
-            let mut displaced = open_checked(&staged, false)?;
-            let displaced_metadata = displaced.metadata().map_err(|e| e.to_string())?;
-            if displaced_metadata.dev() != original_metadata.dev() || displaced_metadata.ino() != original_metadata.ino()
-                || displaced_metadata.mode() != original_metadata.mode() || displaced_metadata.uid() != original_metadata.uid()
-                || displaced_metadata.gid() != original_metadata.gid() || displaced_metadata.size() != original_metadata.size()
-                || displaced_metadata.mtime() != original_metadata.mtime() || displaced_metadata.mtime_nsec() != original_metadata.mtime_nsec()
-                || read_all(&mut displaced)? != preimage {
-                return Err(format!("конфликт обновления; вытесненный файл сохранён: {}", staged.display()));
+            if let Some(app) = crate::macos::bundle_of(bin_path) {
+                crate::macos::strip_quarantine(&app);
             }
-            let mut published = open_checked(bin_path, false)?;
-            let signed_metadata = signed.metadata().map_err(|e| e.to_string())?;
-            let published_metadata = published.metadata().map_err(|e| e.to_string())?;
-            if signed_metadata.dev() != published_metadata.dev() || signed_metadata.ino() != published_metadata.ino() {
-                return Err("опубликованное поколение изменилось".into());
-            }
-            if read_all(&mut published)? != signed_bytes { return Err("опубликованные данные отличаются".into()); }
-            native(Command::new("/usr/bin/codesign").args(["--verify", "--strict"]).arg(bin_path), "published verify")?;
-            same(&published, bin_path)?; same(&parent_handle, parent)?;
-            if read_all(&mut published)? != signed_bytes { return Err("опубликованные данные изменились после проверки".into()); }
-            same(&displaced, &staged)?;
-            if read_all(&mut displaced)? != preimage { return Err("вытесненный исходный файл изменился".into()); }
-            same(&backup, &backup_path)?;
-            fs::remove_file(&staged).map_err(|e| format!("сохранён исходный файл: {e}"))?;
-            fs::remove_file(&backup_path).map_err(|e| format!("сохранена копия исходных данных: {e}"))?;
             Ok(())
-        })();
-        if let Err(error) = received {
-            let identity = |path: &Path| match fs::symlink_metadata(path) {
-                Ok(meta) => format!("dev={} inode={} size={}", meta.dev(), meta.ino(), meta.size()),
-                Err(error) => format!("недоступно: {error}"),
-            };
-            return Err(format!("TARGET_CHANGED: проверка после обмена не завершена: {error}; исходный dev={} inode={}; текущий {} [{}]; вытесненный {} [{}]; копия исходных данных {} [{}]",
-                original_metadata.dev(), original_metadata.ino(), bin_path.display(), identity(bin_path),
-                staged.display(), identity(&staged), backup_path.display(), identity(&backup_path)));
         }
-        same(&stage_parent, &stage_dir).map_err(|e| format!("TARGET_CHANGED: staging cleanup: {e}"))?;
-        fs::remove_dir(&stage_dir).map_err(|e| format!("TARGET_CHANGED: staging cleanup: {e}"))?;
-        Ok(())
-    })();
-    operation.map_err(|e| MacWriteError::Other(if e.starts_with("TARGET_CHANGED:") { e } else { format!("Файл не заменён; staging сохранён {}: {e}", stage_dir.display()) }))
+        Err(e) => Err(crate::macos::app_management_hint(bin_path, &e)),
+    };
+    res
 }
 
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+/// Kills whatever process holds `bin_path` open so the write can be retried.
+/// Windows locks a running image; Linux does not (a rename-over succeeds while
+/// the old inode keeps running), so this is a belt-and-braces retry helper there.
+#[cfg(target_os = "windows")]
+pub fn kill_holder(bin_path: &Path) {
+    let file_name = bin_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/F", "/IM", &file_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    crate::utils::no_window(&mut cmd).output().ok();
+}
+
+#[cfg(not(target_os = "windows"))]
 pub fn kill_holder(bin_path: &Path) {
     let name = bin_path
         .file_name()
@@ -439,6 +162,132 @@ pub fn kill_holder(bin_path: &Path) {
             .status()
             .ok();
     }
+}
+
+/// The Antigravity app that owns a language server: the first directory above
+/// `target` (at most six levels) holding the Desktop or IDE executable. `None`
+/// for a CLI `agy` and anything else with no app around it.
+///
+/// Killing the server alone does not release the file for long: the app starts
+/// it again within two seconds, the new process takes the lock, and after three
+/// such restarts it stops trying and is left open with no server at all (seen
+/// 2026-11-11 on the 2.31.1 update, G92). Closing the app is what makes the
+/// release stick.
+pub fn owner_app(target: &Path) -> Option<PathBuf> {
+    const APPS: [&str; 2] = ["Antigravity.exe", "Antigravity IDE.exe"];
+    target
+        .ancestors()
+        .skip(1)
+        .take(6)
+        .find_map(|dir| APPS.iter().map(|n| dir.join(n)).find(|p| p.is_file()))
+}
+
+/// Closes the app and everything it started. Windows only; elsewhere the
+/// server kill is all there is.
+#[cfg(target_os = "windows")]
+pub fn quit_app(app: &Path) {
+    let name = app
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/F", "/T", "/IM", &name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    crate::utils::no_window(&mut cmd).output().ok();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn quit_app(_app: &Path) {}
+
+/// True when this process runs in Windows session 0 - the non-interactive one
+/// the S4U tasks (watchdog, relay) live in. Anything started from there has no
+/// desktop to draw on.
+#[cfg(target_os = "windows")]
+fn in_service_session() -> bool {
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    let mut sid: u32 = u32::MAX;
+    // SAFETY: plain out-parameter call with a valid pointer.
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut sid) };
+    ok != 0 && sid == 0
+}
+
+/// Starts the app in the user's own session through a one-shot Interactive
+/// scheduled task (no password, no SeTcb privilege needed; the user must be
+/// signed in, which they are when there is something to reopen). Succeeds only
+/// when the app's process is seen in a session other than 0.
+#[cfg(target_os = "windows")]
+fn launch_in_user_session(app: &Path) -> std::io::Result<()> {
+    let q = |p: &Path| p.to_string_lossy().replace('\'', "''");
+    let stem = app
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .replace('\'', "''");
+    let script = format!(
+        "$ErrorActionPreference='Stop'; $n='AG Unlocker Reopen'; \
+         $a=New-ScheduledTaskAction -Execute '{exe}' -WorkingDirectory '{dir}'; \
+         $p=New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
+              -LogonType Interactive -RunLevel Limited; \
+         $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries \
+              -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew \
+              -ExecutionTimeLimit ([TimeSpan]::Zero); \
+         Register-ScheduledTask -TaskName $n -Action $a -Principal $p -Settings $s \
+              -Description 'Antigravity Unlocker: reopen the app in the user session' \
+              -Force | Out-Null; \
+         Start-ScheduledTask -TaskName $n; \
+         for ($i=0; $i -lt 20; $i++) {{ \
+           if (Get-Process -Name '{stem}' -ErrorAction SilentlyContinue \
+                 | Where-Object {{ $_.SessionId -ne 0 }}) {{ exit 0 }}; \
+           Start-Sleep -Milliseconds 500 }}; \
+         [Console]::Error.WriteLine('process not seen in a user session'); exit 1",
+        exe = q(app),
+        dir = q(app.parent().unwrap_or(Path::new("."))),
+        stem = stem,
+    );
+    let out = crate::utils::powershell_within(&script, std::time::Duration::from_secs(45))
+        .ok_or_else(|| std::io::Error::other("powershell did not answer"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
+    }
+}
+
+/// Starts the app again, detached from whoever asks (the watchdog's task).
+///
+/// From session 0 (the watchdog is an S4U task) a plain spawn starts the app on
+/// no desktop: no window, yet it holds Electron's single-instance lock, so every
+/// later launch by the user is silently forwarded to it and nothing appears
+/// (G96, seen after the 2.32.1 update). There the app is started through the
+/// user's own session instead, and never by a plain spawn.
+#[cfg(target_os = "windows")]
+pub fn launch_app(app: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    // Keep the client at user integrity even when the patch window is elevated.
+    // Otherwise its orphaned sidecars cannot be reaped by the Limited agent.
+    if in_service_session() || crate::utils::is_admin() {
+        return launch_in_user_session(app);
+    }
+    Command::new(app)
+        .current_dir(app.parent().unwrap_or(Path::new(".")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn launch_app(_app: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Where a patched copy of `target` is written before it is renamed over it.
@@ -516,6 +365,19 @@ fn write_atomic(bin_path: &Path, data: &[u8]) -> std::io::Result<()> {
             .unwrap_or(0o755);
         let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode));
     }
+    // macOS: the edited Mach-O no longer matches its signature and Apple
+    // Silicon would kill it at exec. The temp is re-signed before the rename,
+    // so the name never points at a binary the kernel refuses (S80). The
+    // rename also gives it a fresh vnode - an in-place write would keep the
+    // kernel's cached signature of the old one.
+    #[cfg(target_os = "macos")]
+    if crate::macos::is_macho(data) {
+        if let Err(e) = crate::macos::resign(&tmp) {
+            let _ = fs::remove_file(&tmp);
+            return Err(std::io::Error::other(e));
+        }
+        crate::macos::strip_quarantine(&tmp);
+    }
     match fs::rename(&tmp, bin_path) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -525,51 +387,93 @@ fn write_atomic(bin_path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
 }
 
-enum RewriteFailure { MissingSignature, Io(String) }
-impl std::fmt::Display for RewriteFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::MissingSignature => f.write_str("Сигнатура не найдена"), Self::Io(error) => f.write_str(error) }
+/// The field name rewrites stored in obfuscated literals.
+pub(crate) fn field_signatures() -> ([u8; 10], [u8; 10]) {
+    obfstr::obfstr! {
+        let from = "ineligible";
+        let to = "inexigible";
     }
+    let mut f = [0u8; 10];
+    let mut t = [0u8; 10];
+    f.copy_from_slice(from.as_bytes());
+    t.copy_from_slice(to.as_bytes());
+    (f, t)
 }
 
-fn rewrite(bin_path: &Path, from: &[u8], to: &[u8], #[cfg(target_os = "macos")] install: Option<&Path>) -> Result<usize, String> {
-    rewrite_result(bin_path, from, to, #[cfg(target_os = "macos")] install).map_err(|error| error.to_string())
+/// The original proxy variable name stored in an obfuscated literal.
+pub(crate) fn proxy_var_original() -> [u8; 11] {
+    obfstr::obfstr! {
+        let proxy_from = "https_proxy";
+    }
+    let mut p = [0u8; 11];
+    p.copy_from_slice(proxy_from.as_bytes());
+    p
 }
 
-fn rewrite_result(bin_path: &Path, from: &[u8], to: &[u8], #[cfg(target_os = "macos")] install: Option<&Path>) -> Result<usize, RewriteFailure> {
-    #[cfg(not(target_os = "macos"))]
-    let mut data = fs::read(bin_path).map_err(|e| RewriteFailure::Io(e.to_string()))?;
-    #[cfg(target_os = "macos")]
-    let install = install.ok_or_else(|| RewriteFailure::Io("не выбрана установка цели".into()))?;
-    #[cfg(target_os = "macos")]
-    let scope = mac_target_scope(install, bin_path).map_err(RewriteFailure::Io)?;
-    #[cfg(target_os = "macos")]
-    let (mut original, mut data) = read_mac_preimage(bin_path).map_err(RewriteFailure::Io)?;
-    #[cfg(target_os = "macos")]
-    let preimage = data.clone();
+fn rewrite(bin_path: &Path, from: &[u8], to: &[u8]) -> Result<usize, String> {
+    #[cfg(windows)]
+    let _transaction = PatchLock::acquire(bin_path)?;
+    let mut data = fs::read(bin_path).map_err(|e| e.to_string())?;
     let replaced = replace_all(&mut data, from, to);
     if replaced == 0 {
         // Nothing to do - report whether the target state is already in place.
         return if count_occurrences(&data, to) > 0 {
             Ok(0)
         } else {
-            Err(RewriteFailure::MissingSignature)
+            Err("Сигнатура не найдена".to_string())
         };
     }
-    write_binary(bin_path, &data, #[cfg(target_os = "macos")] &preimage,
-        #[cfg(target_os = "macos")] &mut original, #[cfg(target_os = "macos")] install,
-        #[cfg(target_os = "macos")] &scope).map_err(|error| RewriteFailure::Io(error.to_string()))?;
+    write_binary(bin_path, &data)?;
     Ok(replaced)
+}
+
+/// What each patch target of an install is, for the line that says a build is
+/// not known: its kind (ELF / script / PE / other), size, and where a symlink
+/// really points. A report of "не знакома" without this cannot tell a changed
+/// binary from a launcher stub or a symlink to the real file elsewhere.
+pub fn describe_targets(inst: &Path) -> String {
+    let mut parts = Vec::new();
+    for bin in binary_targets(inst) {
+        let Ok(meta) = fs::symlink_metadata(&bin) else {
+            continue;
+        };
+        let mut head = [0u8; 4];
+        let n = fs::File::open(&bin)
+            .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+            .unwrap_or(0);
+        let kind = match &head[..n] {
+            [0x7f, b'E', b'L', b'F'] => "ELF",
+            [b'#', b'!', ..] => "скрипт",
+            [b'M', b'Z', ..] => "PE",
+            [0xcf | 0xca, 0xfa | 0xfe, ..] => "Mach-O",
+            _ => "другое",
+        };
+        let name = bin.file_name().unwrap_or_default().to_string_lossy();
+        let link = if meta.file_type().is_symlink() {
+            match fs::canonicalize(&bin) {
+                Ok(t) => format!(
+                    ", ссылка → {}",
+                    crate::utils::mask_path(&t.display().to_string())
+                ),
+                Err(_) => ", битая ссылка".to_string(),
+            }
+        } else {
+            String::new()
+        };
+        let size = fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+        parts.push(format!("{name}: {kind}, {} КБ{link}", size / 1024));
+    }
+    parts.join("; ")
 }
 
 pub fn patch_binary(_inst: &Path, bin_path: &Path) -> Result<usize, String> {
     let (old_bytes, new_bytes) = field_signatures();
-    rewrite(bin_path, &old_bytes, &new_bytes, #[cfg(target_os = "macos")] Some(_inst))
+    rewrite(bin_path, &old_bytes, &new_bytes)
 }
 
 pub fn unpatch_binary(bin_path: &Path) -> Result<usize, String> {
     let (old_bytes, new_bytes) = field_signatures();
-    rewrite(bin_path, &new_bytes, &old_bytes, #[cfg(target_os = "macos")] None)
+    rewrite(bin_path, &new_bytes, &old_bytes)
 }
 
 /// The name the patched language server reads its proxy URL from, in place of
@@ -620,7 +524,7 @@ pub fn unpatch_binary(bin_path: &Path) -> Result<usize, String> {
 ///
 /// Same length as the name it replaces, so this is the same class of edit as the
 /// eligibility rename: no relocation moves, no size change, byte-exact revert.
-pub use crate::binary_profile::PROXY_VAR_NEW;
+pub const PROXY_VAR_NEW: &str = "AG_LS_PROXY";
 
 /// Points the language server's proxy lookup at [`PROXY_VAR_NEW`].
 ///
@@ -628,21 +532,18 @@ pub use crate::binary_profile::PROXY_VAR_NEW;
 /// binary is already renamed, `Err` only when neither name is present, which
 /// callers report rather than treat as a failed patch.
 pub fn patch_proxy_var(bin_path: &Path) -> Result<usize, String> {
-    patch_proxy_var_result(bin_path, #[cfg(target_os = "macos")] None).map_err(|error| error.to_string())
-}
-fn patch_proxy_var_result(bin_path: &Path, #[cfg(target_os = "macos")] install: Option<&Path>) -> Result<usize, RewriteFailure> {
     let old_bytes = proxy_var_original();
-    rewrite_result(bin_path, &old_bytes, PROXY_VAR_NEW.as_bytes(), #[cfg(target_os = "macos")] install)
+    rewrite(bin_path, &old_bytes, PROXY_VAR_NEW.as_bytes())
 }
 
 /// Puts the standard name back.
 pub fn unpatch_proxy_var(bin_path: &Path) -> Result<usize, String> {
     let old_bytes = proxy_var_original();
-    rewrite(bin_path, PROXY_VAR_NEW.as_bytes(), &old_bytes, #[cfg(target_os = "macos")] None)
+    rewrite(bin_path, PROXY_VAR_NEW.as_bytes(), &old_bytes)
 }
 
 /// What re-patching one binary found. The background watchdog needs to tell
-/// these four apart where menu 1 only needs success/failure:
+/// these outcomes apart where menu 1 only needs success/failure:
 ///
 /// - `SignatureMissing` is deliberately distinct from `Failed`. A signature
 ///   that is simply gone means a new or broken build this patcher does not
@@ -658,54 +559,45 @@ pub enum RepatchOutcome {
     Repatched(usize),
     /// The signature is absent - do not touch it, let the app show its error.
     SignatureMissing,
-    /// A direct native write permission denial, held for this worker lifetime.
-    PermissionDenied(NativePermissionDenied),
     /// A transient failure, usually a file locked mid-update. Retry later.
     Failed(String),
-}
-
-#[cfg(target_os = "macos")]
-fn mac_repatch_error(error: MacWriteError) -> RepatchOutcome {
-    match error {
-        MacWriteError::PermissionDenied(error) => RepatchOutcome::PermissionDenied(error),
-        MacWriteError::Other(error) => RepatchOutcome::Failed(error),
-    }
+    /// An additive edit is locked; retry without ever killing a working LS.
+    Deferred(String),
 }
 
 /// Re-applies the rename to a binary that may have been reverted by an update.
 ///
 /// Unlike `patch_binary`, this never conflates "nothing to patch because the
 /// signature is gone" with "already patched": that distinction is the whole
-/// point of the watchdog. Platform-specific write and process policies remain
-/// with the selected writer.
+/// point of the watchdog. `write_binary` still kills a process holding the file
+/// open and retries, so a running-but-unpatched Language Server is replaced in
+/// the same step - which is what enforces "no unpatched server keeps running"
+/// without ever touching the editor shell.
 pub fn repatch_if_needed(bin_path: &Path) -> RepatchOutcome {
-    repatch_with_install(bin_path, #[cfg(target_os = "macos")] None)
+    repatch_with(bin_path, true)
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn repatch_for_install(install: &Path, bin_path: &Path) -> RepatchOutcome {
-    repatch_with_install(bin_path, Some(install))
+#[cfg(windows)]
+pub(crate) fn repatch_before_launch(bin_path: &Path) -> RepatchOutcome {
+    repatch_with(bin_path, false)
 }
 
-fn repatch_with_install(bin_path: &Path, #[cfg(target_os = "macos")] install: Option<&Path>) -> RepatchOutcome {
+fn repatch_with(bin_path: &Path, kill_locked: bool) -> RepatchOutcome {
+    #[cfg(windows)]
+    if crate::watchdog::updater_busy(&crate::watchdog::updater_dirs()) {
+        return RepatchOutcome::Deferred("Antigravity update is still running".into());
+    }
+    #[cfg(windows)]
+    let _transaction = match PatchLock::acquire(bin_path) {
+        Ok(lock) => lock,
+        Err(e) => return RepatchOutcome::Failed(e),
+    };
     let (from, to) = field_signatures();
     let proxy_from = proxy_var_original();
-    #[cfg(not(target_os = "macos"))]
     let mut data = match fs::read(bin_path) {
         Ok(d) => d,
         Err(e) => return RepatchOutcome::Failed(e.to_string()),
     };
-    #[cfg(target_os = "macos")]
-    let install = match install { Some(install) => install, None => return RepatchOutcome::Failed("не выбрана установка цели".into()) };
-    #[cfg(target_os = "macos")]
-    let scope = match mac_target_scope(install, bin_path) { Ok(scope) => scope, Err(error) => return RepatchOutcome::Failed(error) };
-    #[cfg(target_os = "macos")]
-    let (mut original, mut data) = match read_mac_preimage(bin_path) {
-        Ok(received) => received,
-        Err(error) => return RepatchOutcome::Failed(error),
-    };
-    #[cfg(target_os = "macos")]
-    let preimage = data.clone();
     let replaced = replace_all(&mut data, &from, &to);
     // Both renames ride in one read and one write. An update restores both at
     // once, and a machine upgrading from a build that only knew the first one
@@ -719,37 +611,25 @@ fn repatch_with_install(bin_path: &Path, #[cfg(target_os = "macos")] install: Op
         // that alone, but report what the watchdog cares about: nothing about
         // the unlock itself changed.
         //
-        // This additive change must not trigger the non-Mac retry that may
-        // terminate a holder. Mac uses its preserving writer for both edits.
+        // `write_atomic`, deliberately not `write_binary`: the latter answers a
+        // locked file by killing whatever holds it, and this edit is additive -
+        // the server is unlocked and working, it just has no local-proxy route
+        // yet. Killing a running language server mid-session for that is a worse
+        // outcome than waiting; the file settles and the next poll retries.
         if proxy > 0 {
-            #[cfg(not(target_os = "macos"))]
-            {
-            #[cfg(windows)]
-            let canonical_guard = match crate::windows_coordinator::windows_installation::admit_native_binary(bin_path,
-                binary_targets, crate::windows_coordinator::receive_saved_context) {
-                Ok(guard) => guard,
-                Err(error) => return RepatchOutcome::Failed(error),
-            };
-            if let Err(error) = write_atomic(bin_path, &data) {
-                return RepatchOutcome::Failed(format!("Добавочное изменение не записано: {error}"));
-            }
-            #[cfg(windows)]
-            if let Err(error) = canonical_guard.recheck() { return RepatchOutcome::Failed(error); }
-            }
-            #[cfg(target_os = "macos")]
-            if let Err(error) = write_binary(bin_path, &data, &preimage, &mut original, install, &scope) {
-                return mac_repatch_error(error);
+            if let Err(e) = write_atomic(bin_path, &data) {
+                return RepatchOutcome::Deferred(e.to_string());
             }
         }
         return RepatchOutcome::AlreadyPatched;
     }
-    match write_binary(bin_path, &data, #[cfg(target_os = "macos")] &preimage,
-        #[cfg(target_os = "macos")] &mut original, #[cfg(target_os = "macos")] install,
-        #[cfg(target_os = "macos")] &scope) {
+    let written = if kill_locked {
+        write_binary(bin_path, &data)
+    } else {
+        write_atomic(bin_path, &data).map_err(|e| e.to_string())
+    };
+    match written {
         Ok(()) => RepatchOutcome::Repatched(replaced),
-        #[cfg(target_os = "macos")]
-        Err(e) => mac_repatch_error(e),
-        #[cfg(not(target_os = "macos"))]
         Err(e) => RepatchOutcome::Failed(e),
     }
 }
@@ -763,82 +643,44 @@ fn repatch_with_install(bin_path: &Path, #[cfg(target_os = "macos")] install: Op
 /// of hardcoding it the two `bin` directories are globbed for any
 /// `language_server*` file - whatever the exact suffix, the signature scan then
 /// decides whether it is really a target.
-fn cli_target_candidates(inst: &Path) -> Vec<PathBuf> {
-    vec![inst.join("agy.exe"), inst.join("agy"), inst.join("bin").join("agy")]
-}
-
-fn extension_cli_targets(inst: &Path) -> Vec<PathBuf> {
-    if !inst.join("resources").join("app").join("extensions").join("agy").is_dir() { return Vec::new(); }
-    extension_cli_candidates()
-}
-
-fn extension_cli_candidates() -> Vec<PathBuf> {
-    std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from).map(|home| {
-            let bin = home.join(".gemini").join("bin");
-            ["agy.exe", "agy"].into_iter().map(|name| bin.join(name)).collect()
-        }).unwrap_or_default()
-}
-
-fn binary_target_candidates(inst: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let resources_bin = inst.join("resources").join("bin");
-    let ext_bin = inst
-        .join("resources")
+pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
+    // A macOS bundle spells it `Contents/Resources`.
+    #[cfg(target_os = "macos")]
+    let resources = crate::macos::resources_dir(inst);
+    #[cfg(not(target_os = "macos"))]
+    let resources = inst.join("resources");
+    let resources_bin = resources.join("bin");
+    let ext_bin = resources
         .join("app")
         .join("extensions")
         .join("antigravity")
         .join("bin");
 
-    // macOS .app bundle locations
-    let mac_resources_bin = inst.join("Contents").join("Resources").join("bin");
-    let mac_ext_bin = inst
-        .join("Contents")
-        .join("Resources")
-        .join("app")
-        .join("extensions")
-        .join("antigravity")
-        .join("bin");
-    let mac_macos_bin = inst.join("Contents").join("MacOS");
-
-    let mut targets = cli_target_candidates(inst);
-    targets.extend([
+    let mut targets: Vec<PathBuf> = vec![
+        // CLI: `agy.exe` on Windows, bare `agy` on Linux/macOS.
+        inst.join("agy.exe"),
+        inst.join("agy"),
         // Desktop's own language server.
         resources_bin.join("language_server.exe"),
         resources_bin.join("language_server"),
-        mac_resources_bin.join("language_server"),
-        mac_resources_bin.join("language_server_macos_arm"),
-        mac_resources_bin.join("language_server_macos_x64"),
-        // IDE's bundled language server, Windows & macOS named.
+        // IDE's bundled language server, Windows-named.
         ext_bin.join("language_server_windows_x64.exe"),
         ext_bin.join("language_server.exe"),
-        ext_bin.join("language_server_macos_arm"),
-        ext_bin.join("language_server_macos_x64"),
-        mac_ext_bin.join("language_server_macos_arm"),
-        mac_ext_bin.join("language_server_macos_x64"),
-        mac_ext_bin.join("language_server"),
-        mac_macos_bin.join("language_server"),
-        mac_macos_bin.join("language_server_macos_arm"),
-    ]);
+    ];
 
-    (targets, vec![ext_bin, resources_bin, mac_ext_bin, mac_resources_bin, mac_macos_bin])
-}
-
-fn is_language_server_candidate(name: &std::ffi::OsStr) -> bool {
-    name.to_str().is_some_and(|value| value.starts_with("language_server") && !value.ends_with(TEMP_SUFFIX))
-}
-
-pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
-    let (mut targets, dirs) = binary_target_candidates(inst);
-    // Any other `language_server*` in candidate bin dirs - catches the Linux/macOS
-    // platform-suffixed names (`language_server_linux_x64`, `language_server_macos_arm`, …)
+    // Any other `language_server*` in the two bin dirs - catches the Linux/macOS
+    // platform-suffixed names (`language_server_linux_x64`, `..._darwin_arm64`, …)
     // without pinning the exact spelling.
-    for dir in &dirs {
+    for dir in [&ext_bin, &resources_bin] {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 // Never a patch temp: `language_server_linux_x64.<pid>.agtmp`
                 // matches the prefix for the second or so it exists.
-                let is_ls = path.file_name().is_some_and(is_language_server_candidate);
+                let is_ls = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("language_server") && !n.ends_with(TEMP_SUFFIX));
                 if is_ls && path.is_file() && !targets.contains(&path) {
                     targets.push(path);
                 }
@@ -849,8 +691,23 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
     // IDE 2.6.0 carries no language server of its own: its `agy` extension
     // downloads the backend into the user's `~/.gemini/bin`. That file is the
     // IDE's, so the IDE's row reads and patches it (G85).
-    for p in extension_cli_targets(inst) {
-        if !targets.contains(&p) { targets.push(p); }
+    if resources
+        .join("app")
+        .join("extensions")
+        .join("agy")
+        .is_dir()
+    {
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from);
+        if let Some(bin) = home.map(|h| h.join(".gemini").join("bin")) {
+            for name in ["agy.exe", "agy"] {
+                let p = bin.join(name);
+                if !targets.contains(&p) {
+                    targets.push(p);
+                }
+            }
+        }
     }
 
     targets.retain(|p| p.exists());
@@ -872,116 +729,36 @@ pub fn binary_targets(inst: &Path) -> Vec<PathBuf> {
     targets
 }
 
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MacFileStamp {
-    pub size: u64,
-    pub modified: std::time::SystemTime,
-    pub identity: (u64, u64),
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub links: u64,
-    pub changed: (i64, i64),
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn mac_file_stamp(path: &Path) -> Result<MacFileStamp, String> {
-    use std::os::unix::fs::MetadataExt;
-    let info = fs::symlink_metadata(path).map_err(|error| format!("метаданные {}: {error}", path.display()))?;
-    Ok(MacFileStamp { size: info.size(), modified: info.modified().map_err(|error| error.to_string())?,
-        identity: (info.dev(), info.ino()), mode: info.mode(), uid: info.uid(), gid: info.gid(),
-        links: info.nlink(), changed: (info.ctime(), info.ctime_nsec()) })
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MacTargetSnapshot {
-    root: ((u64, u64), u32, u32, u32),
-    pub targets: Vec<(PathBuf, MacFileStamp)>,
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn mac_confirm_absent(path: &Path, error: std::io::Error) -> Result<(), String> {
-    if !matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) {
-        return Err(format!("проверка {}: {error}", path.display()));
-    }
-    let mut current = Some(path);
-    while let Some(candidate) = current {
-        match fs::symlink_metadata(candidate) {
-            Ok(info) if info.file_type().is_symlink() => return Err(format!("неразрешимая ссылка {}", candidate.display())),
-            Ok(_) if candidate == path => return Err(format!("неразрешимый путь {}: {error}", path.display())),
-            Ok(_) => return Ok(()),
-            Err(absent) if matches!(absent.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => current = candidate.parent(),
-            Err(other) => return Err(format!("проверка {}: {other}", candidate.display())),
-        }
-    }
-    Err(format!("не подтверждено отсутствие {}", path.display()))
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn mac_target_snapshot(inst: &Path) -> Result<MacTargetSnapshot, String> {
-    let root = mac_file_stamp(inst)?;
-    if root.mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFDIR) { return Err("корень установки не является каталогом".into()); }
-    let (mut candidates, dirs) = binary_target_candidates(inst);
-    for dir in dirs {
-        match fs::read_dir(&dir) {
-            Ok(entries) => for entry in entries {
-                let entry = entry.map_err(|error| format!("чтение {}: {error}", dir.display()))?;
-                let path = entry.path();
-                if is_language_server_candidate(&entry.file_name()) {
-                    let metadata = fs::metadata(&path).map_err(|error| format!("метаданные {}: {error}", path.display()))?;
-                    if metadata.is_file() && !candidates.contains(&path) { candidates.push(path); }
-                }
-            },
-            Err(error) => mac_confirm_absent(&dir, error)?,
-        }
-    }
-    let extension = inst.join("resources").join("app").join("extensions").join("agy");
-    match fs::metadata(&extension) {
-        Ok(info) if info.is_dir() => for path in extension_cli_candidates() {
-            if !candidates.contains(&path) { candidates.push(path); }
-        },
-        Ok(_) => {},
-        Err(error) => mac_confirm_absent(&extension, error)?,
-    }
-    let mut targets = Vec::new();
-    for path in candidates {
-        match fs::metadata(&path) {
-            Ok(_) => {
-                let path = fs::canonicalize(&path).map_err(|error| format!("путь {}: {error}", path.display()))?;
-                let stamp = mac_file_stamp(&path)?;
-                if stamp.mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFREG) || stamp.links != 1 {
-                    return Err(format!("неоднозначный файл {}", path.display()));
-                }
-                mac_check_no_stage(&path)?;
-                targets.push((path, stamp));
-            },
-            Err(error) => mac_confirm_absent(&path, error)?,
-        }
-    }
-    targets.sort_by(|a, b| a.0.cmp(&b.0));
-    if targets.windows(2).any(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1) {
-        return Err("файл изменился при перечислении целей".into());
-    }
-    targets.dedup_by(|a, b| a.0 == b.0);
-    let after = mac_file_stamp(inst)?;
-    if (root.identity, root.mode, root.uid, root.gid) != (after.identity, after.mode, after.uid, after.gid) {
-        return Err("корень установки изменился".into());
-    }
-    Ok(MacTargetSnapshot { root: (root.identity, root.mode, root.uid, root.gid), targets })
-}
-
 /// Closes Antigravity before a patch run.
 ///
 /// Silent: the only caller left is the window's worker thread, which has no
 /// console to print to and reports the step in the log pane itself. The one
 /// second afterwards is functional, not cosmetic — `taskkill` returns before the
 /// image handle is actually released.
-#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn kill_affected_processes() {
     kill_platform_processes();
     thread::sleep(Duration::from_millis(1000));
+}
+
+/// Stops the language server / CLI so their files can be replaced. Never the
+/// editor shell itself - that would lose the user's unsaved work (D9).
+#[cfg(target_os = "windows")]
+fn kill_platform_processes() {
+    let processes = [
+        "Antigravity.exe",
+        "Antigravity CLI.exe",
+        "Antigravity IDE.exe",
+        "agy.exe",
+        "language_server.exe",
+        "language_server_windows_x64.exe",
+    ];
+    for p in processes.iter() {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/F", "/IM", p])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::utils::no_window(&mut cmd).output().ok();
+    }
 }
 
 /// The Linux/macOS side. The language server is the process holding the file
@@ -989,7 +766,7 @@ pub fn kill_affected_processes() {
 /// platform suffix is (`language_server_linux_x64`), it is caught. The `agy` CLI
 /// and the two language-server basenames are killed; the editor shell is left
 /// running, same rule as Windows.
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 fn kill_platform_processes() {
     // -f matches against the whole command line, so a full install path still
     // matches; the patterns are the binary basenames the patcher targets.
@@ -1038,19 +815,6 @@ impl BinarySummary {
 }
 
 pub fn patch_all_binaries(inst: &Path) -> BinarySummary {
-    patch_binary_batch(inst, false)
-}
-
-pub(crate) fn patch_all_binaries_checked(inst: &Path) -> Result<BinarySummary, String> {
-    let summary = patch_binary_batch(inst, true);
-    if summary.failed > 0 || summary.proxy_var_retryable {
-        return Err(format!("Нативный пакет остановлен: успешно/без изменений {}, ошибки {}, канал прокси {}; {}",
-            summary.ok, summary.failed, summary.proxy_var, summary.last_error.as_deref().unwrap_or("причина не получена")));
-    }
-    Ok(summary)
-}
-
-fn patch_binary_batch(inst: &Path, stop_on_failure: bool) -> BinarySummary {
     let mut summary = BinarySummary {
         ok: 0,
         failed: 0,
@@ -1073,23 +837,18 @@ fn patch_binary_batch(inst: &Path, stop_on_failure: bool) -> BinarySummary {
             Err(e) => {
                 summary.failed += 1;
                 summary.last_error = Some(format!("{}: {}", label, e));
-                if stop_on_failure { return summary; }
             }
         }
         // Additive and separately judged: a binary whose proxy literal is not
         // where this build expects it is still unlocked, so it never touches
         // `failed`. `Ok(0)` is "already renamed", which counts as carrying it.
-        match patch_proxy_var_result(&bin, #[cfg(target_os = "macos")] Some(inst)) {
+        match patch_proxy_var(&bin) {
             Ok(_) => summary.proxy_var += 1,
             // `rewrite` says "Сигнатура не найдена" for a literal that is not
             // there and anything else for an I/O problem. Only the second is
             // worth telling the user to retry.
-            Err(RewriteFailure::Io(error)) => {
-                summary.proxy_var_retryable = true;
-                summary.last_error = Some(format!("{label}: {error}"));
-                if stop_on_failure { return summary; }
-            },
-            Err(RewriteFailure::MissingSignature) => {}
+            Err(e) if !e.contains("Сигнатура") => summary.proxy_var_retryable = true,
+            Err(_) => {}
         }
     }
     summary
@@ -1188,11 +947,7 @@ fn inspect_file_stream(bin_path: &Path, chunk_size: usize) -> FileState {
     let overlap_len = max_needle.saturating_sub(1);
 
     let mut file = match fs::File::open(bin_path) {
-        Ok(f) => {
-            #[cfg(all(windows, ag_private_startup_scan_timing))]
-            crate::ops::startup_scan_timing::observe_inspect_handle(&f);
-            f
-        }
+        Ok(f) => f,
         Err(e) => return FileState::Unreadable(e.to_string()),
     };
 
@@ -1260,454 +1015,53 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_patch_write_advises_close_only_for_native_sharing_or_lock() {
-        use std::io::{Error, ErrorKind};
-        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION};
-
-        for (code, advise_close) in [(ERROR_SHARING_VIOLATION, true), (ERROR_LOCK_VIOLATION, true),
-            (ERROR_ACCESS_DENIED, false), (ERROR_PATH_NOT_FOUND, false)] {
-            let error = Error::from_raw_os_error(code as i32);
-            let message = windows_write_failure(&error);
-            assert_eq!(message.contains("обычным способом"), advise_close);
-            assert!(message.ends_with(error.to_string().as_str()));
-        }
-        let error = Error::new(ErrorKind::Other, "sharing violation from an untyped source");
-        assert_eq!(windows_write_failure(&error), format!("Файл не заменён: {error}"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn mac_snapshot_tracks_replacement_target_set_root_and_unresolved_stage() {
-        let parent = std::env::temp_dir().canonicalize().unwrap();
-        let base = parent.join(format!("ag-mac-snapshot-{}", std::process::id()));
-        fs::create_dir(&base).unwrap();
-        let root = base.join("cli"); fs::create_dir(&root).unwrap();
-        let target = root.join("agy"); fs::write(&target, b"ineligible").unwrap();
-        let initial = mac_target_snapshot(&root).unwrap();
-        assert_eq!(initial.targets.len(), 1);
-        let replacement = base.join("replacement"); fs::write(&replacement, b"inexigible").unwrap();
-        fs::rename(&replacement, &target).unwrap();
-        let changed = mac_target_snapshot(&root).unwrap();
-        assert_ne!(initial, changed);
-        let stage = temp_path(&target); fs::create_dir(&stage).unwrap();
-        assert!(mac_target_snapshot(&root).is_err());
-        fs::remove_dir(&stage).unwrap();
-        fs::remove_file(&target).unwrap();
-        assert!(mac_target_snapshot(&root).unwrap().targets.is_empty());
-        std::os::unix::fs::symlink(base.join("missing"), &target).unwrap();
-        assert!(mac_target_snapshot(&root).is_err());
-        fs::remove_file(&target).unwrap();
-        let old = base.join("old-root"); fs::rename(&root, &old).unwrap(); fs::create_dir(&root).unwrap();
-        assert_ne!(mac_target_snapshot(&root).unwrap().root, changed.root);
-        fs::remove_dir(&root).unwrap(); fs::remove_dir(&old).unwrap(); fs::remove_dir(&base).unwrap();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn mac_stage_permission_is_native_typed_and_not_inferred_from_text() {
-        for code in [libc::EPERM, libc::EACCES] {
-            let error = std::io::Error::from_raw_os_error(code);
-            let kind = error.kind();
-            match mac_stage_creation_error(error) {
-                MacWriteError::PermissionDenied(received) => {
-                    assert_eq!(received.operation, "создание staging");
-                    assert_eq!(received.kind, kind);
-                    assert_eq!(received.raw_os_error, Some(code));
-                },
-                other => panic!("expected native permission denial: {other:?}"),
-            }
-        }
-        assert!(matches!(mac_stage_creation_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
-            MacWriteError::PermissionDenied(NativePermissionDenied { raw_os_error: None, .. })));
-        assert!(matches!(mac_stage_creation_error(std::io::Error::other("Permission denied")), MacWriteError::Other(_)));
-    }
-
-    #[cfg(target_os = "macos")]
-    mod mac_writer_race {
-        use super::*;
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::fs::MetadataExt;
-        use std::process::{Child, Stdio};
-        use std::sync::mpsc::{self, Receiver};
-        use std::thread::JoinHandle;
-
-        fn err(error: impl std::fmt::Display) -> String { error.to_string() }
-        fn require(value: bool, message: &str) -> Result<(), String> {
-            if value { Ok(()) } else { Err(message.into()) }
-        }
-
-        struct OwnedChild {
-            child: Option<Child>,
-            reader: Option<JoinHandle<Result<(), String>>>,
-            lines: Receiver<Vec<u8>>,
-            stdout_path: PathBuf,
-            stderr: fs::File,
-            status_file: fs::File,
-        }
-
-        impl OwnedChild {
-            fn spawn(case: &Path, evidence: &Path, label: &str, phases: &str) -> Result<Self, String> {
-                let stdout_path = evidence.join(format!("{label}.stdout"));
-                let stdout_file = fs::OpenOptions::new().write(true).create_new(true).open(&stdout_path).map_err(err)?;
-                let stderr = fs::OpenOptions::new().write(true).create_new(true).open(evidence.join(format!("{label}.stderr"))).map_err(err)?;
-                let mut status_file = fs::OpenOptions::new().write(true).create_new(true).open(evidence.join(format!("{label}.status"))).map_err(err)?;
-                let stderr_child = stderr.try_clone().map_err(err)?;
-                let mut child = Command::new(std::env::current_exe().map_err(err)?)
-                    .args(["--exact", "patch_binary::tests::mac_writer_race::child", "--ignored", "--nocapture"])
-                    .env("AG_MAC_WRITER_TEST_CHILD", "1").env("AG_MAC_WRITER_TEST_ROOT", case)
-                    .env("AG_MAC_WRITER_TEST_PHASES", phases)
-                    .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::from(stderr_child))
-                    .spawn().map_err(err)?;
-                let stdout = match child.stdout.take() {
-                    Some(stdout) => stdout,
-                    None => {
-                        drop(child.stdin.take());
-                        let status = child.wait();
-                        let capture = stderr.sync_all();
-                        let record = writeln!(status_file, "{status:?}").and_then(|_| status_file.sync_all());
-                        return Err(format!("child stdout missing; exit={status:?}; stderr={capture:?}; status record={record:?}"));
-                    },
-                };
-                let (tx, lines) = mpsc::channel();
-                let reader = std::thread::Builder::new().spawn(move || -> Result<(), String> {
-                    let mut file = stdout_file;
-                    let mut input = BufReader::new(stdout);
-                    loop {
-                        let mut line = Vec::new();
-                        if input.read_until(b'\n', &mut line).map_err(err)? == 0 { break; }
-                        file.write_all(&line).and_then(|_| file.flush()).and_then(|_| file.sync_data()).map_err(err)?;
-                        let _ = tx.send(line);
-                    }
-                    file.sync_all().map_err(err)
-                });
-                let reader = match reader {
-                    Ok(reader) => reader,
-                    Err(error) => {
-                        drop(child.stdin.take());
-                        let status = child.wait();
-                        let capture = stderr.sync_all();
-                        let record = writeln!(status_file, "{status:?}").and_then(|_| status_file.sync_all());
-                        return Err(format!("stdout capture start: {error}; exit={status:?}; stderr={capture:?}; status record={record:?}"));
-                    },
-                };
-                Ok(Self { child: Some(child), reader: Some(reader), lines, stdout_path, stderr, status_file })
-            }
-
-            fn phase(&self, expected: &str) -> Result<(), String> {
-                let expected = format!("AG_WRITER_PHASE {expected}\n");
-                while let Ok(line) = self.lines.recv() {
-                    if line == expected.as_bytes() { return Ok(()); }
-                    if line.starts_with(b"AG_WRITER_PHASE ") { return Err("unexpected writer phase".into()); }
-                }
-                Err("child exited before requested writer phase".into())
-            }
-
-            fn release(&mut self) -> Result<(), String> {
-                let stdin = self.child.as_mut().and_then(|child| child.stdin.as_mut()).ok_or("child stdin missing")?;
-                stdin.write_all(b"CONTINUE\n").and_then(|_| stdin.flush()).map_err(err)
-            }
-
-            fn settle(&mut self) -> Result<(std::process::ExitStatus, String), String> {
-                let mut child = self.child.take().ok_or("child already received")?;
-                drop(child.stdin.take());
-                let status = match child.wait() {
-                    Ok(status) => status,
-                    Err(error) => {
-                        let record = writeln!(self.status_file, "wait error: {error}").and_then(|_| self.status_file.sync_all());
-                        let stderr = self.stderr.sync_all();
-                        self.child = Some(child);
-                        return Err(format!("owned child wait: {error}; status record={record:?}; stderr={stderr:?}; stdout capture pending"));
-                    },
-                };
-                let capture = match self.reader.take() {
-                    Some(reader) => match reader.join() { Ok(result) => result, Err(_) => Err("stdout capture panicked".into()) },
-                    None => Err("stdout capture missing".into()),
-                };
-                let stderr = self.stderr.sync_all().map_err(err);
-                let status_record = writeln!(self.status_file, "{status:?}")
-                    .and_then(|_| self.status_file.sync_all()).map_err(err);
-                let output = fs::read_to_string(&self.stdout_path).map_err(err);
-                match (capture, stderr, status_record, output) {
-                    (Ok(()), Ok(()), Ok(()), Ok(output)) => Ok((status, output)),
-                    (capture, stderr, record, output) => Err(format!("child receiving: status={status:?}; stdout={capture:?}; stderr={stderr:?}; status record={record:?}; readback={output:?}")),
-                }
-            }
-
-            fn finish(mut self) -> Result<String, String> {
-                let (status, output) = self.settle()?;
-                require(status.success(), &format!("child exit {status}"))?;
-                Ok(output)
-            }
-        }
-
-        impl Drop for OwnedChild {
-            fn drop(&mut self) {
-                if self.child.is_some() {
-                    if let Err(error) = self.settle() { eprintln!("owned writer child settlement: {error}"); }
-                }
-            }
-        }
-
-        fn native(evidence: &Path, label: &str, command: &mut Command) -> Result<(), String> {
-            let output = command.output().map_err(err)?;
-            let persist = |suffix: &str, data: &[u8]| -> std::io::Result<()> {
-                let mut file = fs::OpenOptions::new().write(true).create_new(true)
-                    .open(evidence.join(format!("{label}.{suffix}")))?;
-                file.write_all(data)?; file.sync_all()
-            };
-            let stdout = persist("stdout", &output.stdout);
-            let stderr = persist("stderr", &output.stderr);
-            let status = persist("status", format!("{}\n", output.status).as_bytes());
-            if stdout.is_err() || stderr.is_err() || status.is_err() {
-                return Err(format!("{label} capture: stdout={stdout:?}; stderr={stderr:?}; status={status:?}; exit={}", output.status));
-            }
-            require(output.status.success(), &format!("{label}: {}", output.status))
-        }
-
-        fn sign(evidence: &Path, label: &str, path: &Path) -> Result<(), String> {
-            native(evidence, label, Command::new("/usr/bin/codesign")
-                .args(["--force", "--sign", "-", "--identifier", label]).arg(path))
-        }
-
-        fn setup(base: &Path, fixture: &Path, name: &str) -> Result<PathBuf, String> {
-            let case = base.join(name);
-            fs::create_dir(&case).map_err(err)?;
-            fs::copy(fixture, case.join("agy")).map_err(err)?;
-            sign(base, &format!("{name}-original"), &case.join("agy"))?;
-            Ok(case)
-        }
-
-        #[test]
-        #[ignore = "private child entry for mac_native_writer_races"]
-        fn child() {
-            if std::env::var_os("AG_MAC_WRITER_TEST_CHILD").is_none() { return; }
-            let root = PathBuf::from(std::env::var_os("AG_MAC_WRITER_TEST_ROOT").expect("child fixture root"));
-            let outcome = repatch_for_install(&root, &root.join("agy"));
-            println!("AG_WRITER_RESULT {outcome:?}");
-        }
-
-        fn run() -> Result<(), String> {
-            let root = fs::canonicalize(PathBuf::from(std::env::var_os("AG_R3_FIXTURE_ROOT").ok_or("AG_R3_FIXTURE_ROOT missing")?)).map_err(err)?;
-            let fixture = root.join("agy");
-            let evidence = root.join("r3-writer-race-owned");
-            fs::create_dir(&evidence).map_err(err)?;
-
-            // Writer B must not pass the original inode lock while A holds it.
-            let first = setup(&evidence, &fixture, "lock")?;
-            let before = fs::read(first.join("agy")).map_err(err)?;
-            let mut a = OwnedChild::spawn(&first, &evidence, "lock-a", "ADMITTED")?;
-            a.phase("ADMITTED")?;
-            let b = OwnedChild::spawn(&first, &evidence, "lock-b", "")?.finish()?;
-            require(b.contains("AG_WRITER_RESULT Failed") && b.contains("занят"), "lock contender did not defer")?;
-            require(fs::read(first.join("agy")).map_err(err)? == before, "contender changed locked bytes")?;
-            a.release()?;
-            require(a.finish()?.contains("AG_WRITER_RESULT Repatched"), "first writer did not patch")?;
-            native(&evidence, "lock-verify", Command::new("/usr/bin/codesign").args(["--verify", "--strict"]).arg(first.join("agy")))?;
-
-            // A stale pre-opened handle may acquire its inode lock after A's swap,
-            // but must fail the existing path/nlink check before reading or writing.
-            let stale = setup(&evidence, &fixture, "stale")?;
-            let mut b = OwnedChild::spawn(&stale, &evidence, "stale-b", "OPENED")?;
-            b.phase("OPENED")?;
-            require(OwnedChild::spawn(&stale, &evidence, "stale-a", "")?.finish()?.contains("AG_WRITER_RESULT Repatched"), "stale-case writer did not patch")?;
-            let patched = fs::read(stale.join("agy")).map_err(err)?;
-            b.release()?;
-            let result = b.finish()?;
-            require(result.contains("AG_WRITER_RESULT Failed") && result.contains("идентичность"), "stale handle was not rejected")?;
-            require(fs::read(stale.join("agy")).map_err(err)? == patched, "stale contender changed target")?;
-
-            // Prepare C through the real writer, then bind distinct signed B/C.
-            let seed = setup(&evidence, &fixture, "c-seed")?;
-            require(OwnedChild::spawn(&seed, &evidence, "c-seed-writer", "")?.finish()?.contains("AG_WRITER_RESULT Repatched"), "C seed did not patch")?;
-            let conflict = setup(&evidence, &fixture, "conflict")?;
-            let target = conflict.join("agy");
-            let original = fs::read(&target).map_err(err)?;
-            let b_path = conflict.join("updater-b");
-            let c_path = conflict.join("updater-c");
-            fs::copy(&fixture, &b_path).map_err(err)?; sign(&evidence, "updater-b", &b_path)?;
-            fs::copy(seed.join("agy"), &c_path).map_err(err)?; sign(&evidence, "updater-c", &c_path)?;
-            native(&evidence, "updater-b-verify", Command::new("/usr/bin/codesign").args(["--verify", "--strict"]).arg(&b_path))?;
-            native(&evidence, "updater-c-verify", Command::new("/usr/bin/codesign").args(["--verify", "--strict"]).arg(&c_path))?;
-            let b_bytes = fs::read(&b_path).map_err(err)?; let c_bytes = fs::read(&c_path).map_err(err)?;
-            let b_info = fs::metadata(&b_path).map_err(err)?; let c_info = fs::metadata(&c_path).map_err(err)?;
-            require((b_info.dev(), b_info.ino()) != (c_info.dev(), c_info.ino()), "B and C are not distinct inodes")?;
-            let (stock, patched_marker) = field_signatures();
-            require(count_occurrences(&c_bytes, &stock) == 0 && count_occurrences(&c_bytes, &patched_marker) > 0,
-                "C is not patched-looking")?;
-            let mut a = OwnedChild::spawn(&conflict, &evidence, "conflict-a", "PRE_SWAP,POST_SWAP")?;
-            a.phase("PRE_SWAP")?;
-            fs::rename(&b_path, &target).map_err(err)?;
-            a.release()?; a.phase("POST_SWAP")?;
-            fs::rename(&c_path, &target).map_err(err)?;
-            a.release()?;
-            let result = a.finish()?;
-            require(result.contains("AG_WRITER_RESULT Failed") && result.contains("TARGET_CHANGED"), "conflict was not reported as partially changed")?;
-            require(fs::read(&target).map_err(err)? == c_bytes, "recovery changed updater C")?;
-            let received_c = fs::metadata(&target).map_err(err)?;
-            require((received_c.dev(), received_c.ino()) == (c_info.dev(), c_info.ino()), "recovery displaced updater C")?;
-            let mut stages = Vec::new();
-            for entry in fs::read_dir(&conflict).map_err(err)? {
-                let entry = entry.map_err(err)?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with("agy.") && name.ends_with(TEMP_SUFFIX) { stages.push(entry.path()); }
-            }
-            require(stages.len() == 1, "expected one retained conflict stage")?;
-            require(fs::read(stages[0].join("agy")).map_err(err)? == b_bytes, "displaced updater B not retained")?;
-            let retained_b = fs::metadata(stages[0].join("agy")).map_err(err)?;
-            require((retained_b.dev(), retained_b.ino()) == (b_info.dev(), b_info.ino()), "retained B identity changed")?;
-            require(fs::read(stages[0].join(".ag-original")).map_err(err)? == original, "original preimage not retained")?;
-            let retry = OwnedChild::spawn(&conflict, &evidence, "conflict-reentry", "")?.finish()?;
-            require(retry.contains("AG_WRITER_RESULT Failed") && retry.contains("staging"), "retained conflict did not hold re-entry")?;
-            require(fs::read(&target).map_err(err)? == c_bytes, "re-entry changed updater C")?;
-            Ok(())
-        }
-
-        #[test]
-        #[ignore = "requires private AG_R3_FIXTURE_ROOT with the owned compiled agy_fixture as agy"]
-        fn mac_native_writer_races() {
-            let result = run();
-            if let Err(error) = result { panic!("writer race fixture: {error}"); }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn mac_scope_is_bound_to_discovered_target_and_exact_process_image() {
-        let parent = std::env::temp_dir().canonicalize().unwrap();
-        let root = parent.join(format!("ag-mac-scopes-{}", std::process::id()));
-        fs::create_dir(&root).unwrap();
-        let cli = root.join("cli"); let other = root.join("other");
-        let app = root.join("Fixture.app"); let macos = app.join("Contents").join("MacOS");
-        fs::create_dir(&cli).unwrap(); fs::create_dir(&other).unwrap(); fs::create_dir_all(&macos).unwrap();
-        let selected = cli.join("agy"); let unrelated = other.join("agy");
-        let unknown = cli.join("unknown");
-        let server = macos.join("language_server");
-        for path in [&selected, &unrelated, &unknown, &server] { fs::write(path, b"ineligible https_proxy").unwrap(); }
-        assert_eq!(crate::resolve_install_root(&selected), Some(cli.clone()));
-        let standalone = mac_target_scope(&cli, &selected).unwrap();
-        assert_eq!(standalone, MacTargetScope::StandaloneExecutable(selected.clone()));
-        assert!(mac_scope_contains_image(&standalone, &selected));
-        assert!(!mac_scope_contains_image(&standalone, &unrelated));
-        assert!(mac_target_scope(&cli, &unrelated).is_err());
-        assert!(mac_target_scope(&cli, &unknown).is_err());
-        let bundle = mac_target_scope(&app, &server).unwrap();
-        assert_eq!(bundle, MacTargetScope::AppBundle(app.clone()));
-        assert!(mac_scope_contains_image(&bundle, &macos.join("other-process")));
-        assert!(!mac_scope_contains_image(&bundle, &selected));
-        for path in [&selected, &unrelated, &unknown, &server] { fs::remove_file(path).unwrap(); }
-        fs::remove_dir(&macos).unwrap(); fs::remove_dir(app.join("Contents")).unwrap(); fs::remove_dir(&app).unwrap();
-        fs::remove_dir(&cli).unwrap(); fs::remove_dir(&other).unwrap(); fs::remove_dir(&root).unwrap();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "requires AG_R3_FIXTURE_ROOT with the owned compiled agy_fixture as agy"]
-    fn mac_standalone_scope_distinguishes_live_exact_image() {
-        use std::io::{BufRead, BufReader};
-        use std::process::{Child, Stdio};
-        struct OwnedChild(Option<Child>);
-        impl OwnedChild {
-            fn finish(mut self) {
-                let mut child = self.0.take().unwrap();
-                drop(child.stdin.take());
-                assert!(child.wait().expect("reap owned fixture").success());
-            }
-        }
-        impl Drop for OwnedChild {
-            fn drop(&mut self) {
-                if let Some(mut child) = self.0.take() {
-                    drop(child.stdin.take());
-                    if let Err(error) = child.wait() { eprintln!("owned fixture reap failed: {error}"); }
-                }
-            }
-        }
-        fn start(path: &Path) -> OwnedChild {
-            let child = Command::new(path).arg("--hold").stdin(Stdio::piped()).stdout(Stdio::piped())
-                .spawn().expect("start owned fixture");
-            let mut owned = OwnedChild(Some(child));
-            let mut line = String::new();
-            BufReader::new(owned.0.as_mut().unwrap().stdout.take().unwrap()).read_line(&mut line).unwrap();
-            assert_eq!(line.trim(), "READY");
-            owned
-        }
-        let root = PathBuf::from(std::env::var_os("AG_R3_FIXTURE_ROOT").expect("fixture root"));
-        let root = fs::canonicalize(root).unwrap();
-        let target = root.join("agy");
-        let scope = mac_target_scope(&root, &target).unwrap();
-        assert_eq!(scope, MacTargetScope::StandaloneExecutable(target.clone()));
-        mac_target_inactive(&scope).expect("inactive selected fixture");
-        let other_dir = root.join("r3-other-owned");
-        fs::create_dir(&other_dir).expect("vacant other fixture directory");
-        let other = other_dir.join("agy");
-        fs::copy(&target, &other).unwrap();
-        let other_child = start(&other);
-        mac_target_inactive(&scope).expect("different same-name fixture must not block");
-        let selected_child = start(&target);
-        assert!(mac_target_inactive(&scope).unwrap_err().contains("используется процессом"));
-        selected_child.finish(); other_child.finish();
-        mac_target_inactive(&scope).expect("fixtures exited normally");
-        fs::remove_file(&other).unwrap(); fs::remove_dir(&other_dir).unwrap();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn mac_writer_rejects_changed_preimage_and_occupied_stage() {
-        let parent = std::env::temp_dir().canonicalize().expect("ordinary temp parent");
-        let dir = parent.join(format!("ag-mac-writer-{}", std::process::id()));
-        fs::create_dir(&dir).expect("vacant owned test directory");
-        let target = dir.join("agy");
-        fs::write(&target, b"original").unwrap();
-        let scope = mac_target_scope(&dir, &target).unwrap();
-        let (mut original, before) = read_mac_preimage(&target).unwrap();
-        fs::write(&target, b"changed!").unwrap();
-        assert!(write_binary(&target, b"modified", &before, &mut original, &dir, &scope).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"changed!");
-        assert!(!temp_path(&target).exists());
-        drop(original);
-        let (mut original, current) = read_mac_preimage(&target).unwrap();
-        let occupied = temp_path(&target);
-        fs::create_dir(&occupied).unwrap();
-        assert!(write_binary(&target, b"modified", &current, &mut original, &dir, &scope).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"changed!");
-        assert!(occupied.is_dir());
-        drop(original);
-        fs::remove_dir(&occupied).unwrap();
-        fs::remove_file(&target).unwrap();
-        fs::remove_dir(&dir).unwrap();
+    fn competing_writers_wait_then_read_the_committed_patch() {
+        let path =
+            std::env::temp_dir().join(format!("ag_patch_transaction_{}.bin", std::process::id()));
+        fs::write(&path, b"..ineligible..https_proxy..").unwrap();
+        let lock = PatchLock::acquire(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = path.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(repatch_before_launch(&other)).unwrap();
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"..ineligible..https_proxy..");
+        drop(lock);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            RepatchOutcome::Repatched(1)
+        );
+        worker.join().unwrap();
+        assert_eq!(repatch_before_launch(&path), RepatchOutcome::AlreadyPatched);
+        assert_eq!(fs::read(&path).unwrap(), b"..inexigible..AG_LS_PROXY..");
+        fs::remove_file(path).unwrap();
     }
 
     #[cfg(windows)]
     #[test]
-    fn checked_native_io_failure_stops_before_the_next_binary() {
+    fn a_locked_proxy_only_edit_is_deferred_and_retried() {
         use std::os::windows::fs::OpenOptionsExt;
-        let root = crate::wsl_discovery_contract_cases::fixture_dir("native-first-failure");
-        let state = root.join("state");
-        let install = root.join("install");
-        fs::create_dir(&state).unwrap();
-        fs::create_dir(&install).unwrap();
-        let previous = std::env::var_os("AG_LEGACY_NATIVE_GUARD_TEST_BASE");
-        struct RestoreEnv(Option<std::ffi::OsString>);
-        impl Drop for RestoreEnv {
-            fn drop(&mut self) { unsafe { match &self.0 {
-                Some(value) => std::env::set_var("AG_LEGACY_NATIVE_GUARD_TEST_BASE", value),
-                None => std::env::remove_var("AG_LEGACY_NATIVE_GUARD_TEST_BASE"),
-            } } }
-        }
-        unsafe { std::env::set_var("AG_LEGACY_NATIVE_GUARD_TEST_BASE", &state); }
-        let _restore = RestoreEnv(previous);
-        let first = install.join("agy.exe");
-        let second = install.join("agy");
-        let (original, _) = field_signatures();
-        let mut bytes = original.to_vec();
-        bytes.extend_from_slice(&proxy_var_original());
-        fs::write(&first, &bytes).unwrap();
-        fs::write(&second, &bytes).unwrap();
-        let held = fs::OpenOptions::new().read(true).share_mode(1 | 2).open(&first).unwrap();
-        let failure = patch_all_binaries_checked(&install).err().expect("actual sharing failure required");
-        assert!(failure.contains("Файл не заменён"), "must reach the native write, not fail admission: {failure}");
-        assert_eq!(fs::read(&first).unwrap(), bytes);
-        assert_eq!(fs::read(&second).unwrap(), bytes, "later native binary must remain unchanged");
-        drop(held);
+        let path =
+            std::env::temp_dir().join(format!("ag_proxy_deferred_{}.bin", std::process::id()));
+        fs::write(&path, b"..inexigible..https_proxy..").unwrap();
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(
+            repatch_if_needed(&path),
+            RepatchOutcome::Deferred(_)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"..inexigible..https_proxy..");
+        drop(reader);
+        assert_eq!(repatch_if_needed(&path), RepatchOutcome::AlreadyPatched);
+        assert_eq!(fs::read(&path).unwrap(), b"..inexigible..AG_LS_PROXY..");
+        fs::remove_file(path).unwrap();
     }
 
     /// What this machine's installs look like right now, read-only.
@@ -1758,27 +1112,6 @@ mod tests {
         let mut data = b"xxineligibleyyineligible".to_vec();
         assert_eq!(replace_all(&mut data, b"ineligible", b"inexigible"), 2);
         assert_eq!(&data, b"xxinexigibleyyinexigible");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn retained_stage_blocks_even_a_read_of_the_new_generation() {
-        use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("ag-mac-stage-hold-{}", std::process::id()));
-        fs::create_dir(&dir).expect("isolated fixture directory");
-        let target = dir.join("target");
-        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&target).unwrap();
-        file.write_all(b"replacement").unwrap();
-        drop(file);
-        let stage = temp_path(&target);
-        fs::create_dir(&stage).unwrap();
-        assert!(read_mac_preimage(&target).unwrap_err().contains("staging"));
-        fs::remove_dir(&stage).unwrap();
-        let (file, bytes) = read_mac_preimage(&target).unwrap();
-        assert_eq!(bytes, b"replacement");
-        drop(file);
-        fs::remove_file(&target).unwrap();
-        fs::remove_dir(&dir).unwrap();
     }
 
     #[test]
@@ -2157,25 +1490,6 @@ mod tests {
 /// clean revert. The window has no console for the difference to appear on
 /// either.
 pub fn unpatch_all_binaries(inst: &Path) -> Vec<(String, Result<usize, String>)> {
-    unpatch_binary_batch(inst, false)
-}
-
-#[derive(Debug, serde::Serialize)]
-pub(crate) struct NativeUndoFailure { pub(crate) completed: usize, pub(crate) cause: String }
-
-pub(crate) fn unpatch_all_binaries_checked(inst: &Path) -> Result<usize, NativeUndoFailure> {
-    let mut completed = 0;
-    for (label, result) in unpatch_binary_batch(inst, true) {
-        match result {
-            Ok(0) => {},
-            Ok(_) => completed += 1,
-            Err(error) => return Err(NativeUndoFailure { completed, cause: format!("{label}: {error}") }),
-        }
-    }
-    Ok(completed)
-}
-
-fn unpatch_binary_batch(inst: &Path, stop_on_failure: bool) -> Vec<(String, Result<usize, String>)> {
     let mut results = Vec::new();
     for bin in binary_targets(inst) {
         let label = bin
@@ -2187,28 +1501,34 @@ fn unpatch_binary_batch(inst: &Path, stop_on_failure: bool) -> Vec<(String, Resu
         // our variable, and a revert that failed halfway should at least leave
         // the language server on the stock proxy channel. Silent - a build that
         // never carried it is not an error to report.
-        let original = proxy_var_original();
-        let (proxy, proxy_error) = match rewrite_result(&bin, PROXY_VAR_NEW.as_bytes(), &original, #[cfg(target_os = "macos")] Some(inst)) {
-            Ok(count) => (count, None),
-            Err(RewriteFailure::MissingSignature) => (0, None),
-            Err(RewriteFailure::Io(error)) => (0, Some(error)),
-        };
-        if stop_on_failure {
-            if let Some(error) = proxy_error {
-                results.push((label, Err(format!("Канал прокси не восстановлен: {error}"))));
-                break;
-            }
-        }
-        let (from, to) = field_signatures();
-        let result = match (proxy_error, rewrite(&bin, &to, &from, #[cfg(target_os = "macos")] Some(inst))) {
-            (None, Ok(count)) => Ok(if count == 0 && proxy > 0 { 1 } else { count }),
-            (None, Err(error)) => Err(format!("Канал прокси: {proxy} замен; основной откат не завершён: {error}")),
-            (Some(proxy_error), Ok(count)) => Err(format!("Основной откат: {count} замен; канал прокси не восстановлен: {proxy_error}")),
-            (Some(proxy_error), Err(error)) => Err(format!("Канал прокси: {proxy_error}; основной откат: {error}")),
-        };
-        let failed = result.is_err();
-        results.push((label, result));
-        if stop_on_failure && failed { break; }
+        unpatch_proxy_var(&bin).ok();
+        results.push((label, unpatch_binary(&bin)));
     }
     results
+}
+
+#[cfg(test)]
+mod owner_app_tests {
+    use super::*;
+
+    #[test]
+    fn a_server_inside_an_install_has_the_install_s_app_and_a_lone_agy_has_none() {
+        let root = std::env::temp_dir().join(format!("ag_owner_{}", std::process::id()));
+        let bin = root.join("resources").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let ls = bin.join("language_server.exe");
+        fs::write(&ls, b"x").unwrap();
+        assert_eq!(owner_app(&ls), None, "no app beside it yet");
+        let app = root.join("Antigravity.exe");
+        fs::write(&app, b"x").unwrap();
+        assert_eq!(owner_app(&ls), Some(app));
+
+        let lone = std::env::temp_dir().join(format!("ag_lone_{}", std::process::id()));
+        fs::create_dir_all(&lone).unwrap();
+        let agy = lone.join("agy.exe");
+        fs::write(&agy, b"x").unwrap();
+        assert_eq!(owner_app(&agy), None);
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&lone).ok();
+    }
 }

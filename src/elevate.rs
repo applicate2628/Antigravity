@@ -25,7 +25,7 @@ pub const PATCH_ROOT_FLAG: &str = "--patch-root";
 pub const UNPATCH_ROOT_FLAG: &str = "--unpatch-root";
 
 /// What taking the patch off one install did, file by file.
-#[derive(Debug, Default, PartialEq, serde::Serialize)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Reverted {
     pub files: usize,
     pub errors: Vec<String>,
@@ -39,32 +39,7 @@ pub struct Reverted {
 /// the proxy variable) are not here: they belong to the user, not to the
 /// install, and the root helper must not touch them.
 pub fn revert_files(inst: &Path) -> Reverted {
-    revert_files_run(inst, false)
-}
-
-pub(crate) fn revert_files_checked(inst: &Path) -> Result<Reverted, Reverted> {
-    let out = revert_files_run(inst, true);
-    if !out.errors.is_empty() {
-        return Err(out);
-    }
-    Ok(out)
-}
-
-fn revert_files_run(inst: &Path, stop_on_failure: bool) -> Reverted {
     let mut out = Reverted::default();
-    #[cfg(windows)]
-    let canonical = match crate::windows_coordinator::windows_installation::canonical_installed(inst) {
-        Ok(value) => value,
-        Err(error) => { out.errors.push(error); return out; },
-    };
-    #[cfg(not(windows))]
-    let canonical = false;
-    if stop_on_failure {
-        match crate::patch_binary::unpatch_all_binaries_checked(inst) {
-            Ok(files) => out.files += files,
-            Err(error) => { out.files += error.completed; out.errors.push(error.cause); return out; },
-        }
-    } else {
     for (label, res) in crate::patch_binary::unpatch_all_binaries(inst) {
         match res {
             Ok(0) => {}
@@ -72,50 +47,15 @@ fn revert_files_run(inst: &Path, stop_on_failure: bool) -> Reverted {
             Err(e) => out.errors.push(format!("{label}: {e}")),
         }
     }
-    }
-    // A canonical Desktop operation is NativeBinaryOnly here. Archive/hook
-    // revert belongs to its versioned installation owner, never this leaf.
-    if canonical { return out; }
-    if stop_on_failure {
-        match crate::patch_ide::unpatch_ide_js_checked(inst) {
-            Ok(results) => for (label, result) in results {
-                match result {
-                    crate::patch_ide::JsRestore::Unchanged => {},
-                    crate::patch_ide::JsRestore::BackupRestored => out.files += 1,
-                    crate::patch_ide::JsRestore::MarkerOnly => {
-                        out.files += 1;
-                        out.warnings.push(format!("{label}: бэкапа нет, снят только маркер"));
-                    },
-                }
-            },
-            Err(error) => {
-                for (label, result) in error.completed {
-                    match result {
-                        crate::patch_ide::JsRestore::Unchanged => {},
-                        crate::patch_ide::JsRestore::BackupRestored => out.files += 1,
-                        crate::patch_ide::JsRestore::MarkerOnly => {
-                            out.files += 1;
-                            out.warnings.push(format!("{label}: бэкапа нет, снят только маркер"));
-                        },
-                    }
-                }
-                out.errors.push(error.cause); return out;
-            },
-        }
-    } else {
     for (label, res) in crate::patch_ide::unpatch_ide_js(inst) {
         match res {
             Ok(true) => out.files += 1,
-            Ok(false) => out
-                .warnings
-                .push(format!("{label}: бэкапа нет, снят только маркер")),
+            Ok(false) => {},
             Err(e) => out.errors.push(format!("{label}: {e}")),
         }
     }
-    }
     if let Err(e) = crate::restore_pristine_asar(&inst.join("resources")) {
-        if stop_on_failure { out.errors.push(format!("app.asar не восстановлен: {e}")); }
-        else { out.warnings.push(format!("app.asar не восстановлен: {e}")); }
+        out.warnings.push(format!("app.asar не восстановлен: {e}"));
     }
     out
 }
@@ -209,6 +149,47 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Runs `exe flag inst` as root behind the desktop's own password prompt, and
+/// hands back its output with pkexec's exit codes (126 = refused, 127 = no
+/// prompt possible) whatever did the asking.
+///
+/// Linux: `pkexec --disable-internal-agent` - with no desktop agent (a TUI over
+/// SSH) it fails instead of asking on the terminal the TUI is drawing on.
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn elevated_output(exe: &Path, flag: &str, inst: &Path) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("pkexec")
+        .arg("--disable-internal-agent")
+        .arg(exe)
+        .arg(flag)
+        .arg(inst)
+        .output()
+}
+
+/// macOS: AppleScript's `with administrator privileges`, the system's own
+/// password sheet (S80). Its stdout is the command's; a dismissed sheet is
+/// error -128, mapped to pkexec's 126.
+#[cfg(target_os = "macos")]
+fn elevated_output(exe: &Path, flag: &str, inst: &Path) -> std::io::Result<std::process::Output> {
+    use std::os::unix::process::ExitStatusExt;
+    let cmd = format!(
+        "{} {} {}",
+        shell_quote(&exe.display().to_string()),
+        flag,
+        shell_quote(&inst.display().to_string())
+    );
+    let as_literal = cmd.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "do shell script \"{as_literal}\" with administrator privileges without altering line endings"
+    );
+    let mut out = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .output()?;
+    if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("-128") {
+        out.status = std::process::ExitStatus::from_raw(126 << 8);
+    }
+    Ok(out)
+}
+
 /// Patches `inst` through `pkexec`, which shows the desktop's own password
 /// prompt. `--disable-internal-agent`: with no desktop agent (a TUI over SSH)
 /// pkexec would otherwise ask on the terminal the TUI is drawing on, so it
@@ -217,22 +198,16 @@ fn shell_quote(s: &str) -> String {
 pub fn patch_as_root(inst: &Path) -> Result<Elevated, String> {
     use std::process::Command;
     let exe = std::env::current_exe().map_err(|e| format!("не найден путь к exe: {e}"))?;
-    let out = Command::new("pkexec")
-        .arg("--disable-internal-agent")
-        .arg(&exe)
-        .arg(PATCH_ROOT_FLAG)
-        .arg(inst)
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "установка принадлежит root, а pkexec в системе нет. Выполните в терминале: {}",
-                    manual_command(inst)
-                )
-            } else {
-                format!("pkexec не запустился: {e}")
-            }
-        })?;
+    let out = elevated_output(&exe, PATCH_ROOT_FLAG, inst).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "установка принадлежит root, а pkexec в системе нет. Выполните в терминале: {}",
+                manual_command(inst)
+            )
+        } else {
+            format!("pkexec не запустился: {e}")
+        }
+    })?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed = parse_report(&stdout);
     match (out.status.code(), parsed) {
@@ -261,76 +236,30 @@ pub fn patch_as_root(_inst: &Path) -> Result<Elevated, String> {
 /// The helper's side, run as root: patch one install, report in lines of
 /// `KEY<TAB>value`, exit 0 on success.
 pub fn run_helper(arg: Option<String>) -> ! {
-    let (wire, code) = run_helper_root(arg, crate::process_install, &mut crate::command_lifetime::receive_failure, #[cfg(test)] None);
-    print!("{wire}");
-    std::process::exit(code);
-}
-
-fn run_helper_root(arg: Option<String>,
-    action: impl FnOnce(&mut crate::utils::CommandOutcome, &std::path::Path) -> Result<crate::InstallOutcome, String>,
-    receive: &mut impl FnMut(&crate::utils::CommandOutcome, &mut Option<String>) -> Result<(), String>,
-    #[cfg(test)] on_hold: Option<&mut dyn FnMut()>) -> (String, i32) {
-    run_helper_root_with_writer(arg, action, receive, &mut std::io::stderr(), #[cfg(test)] on_hold)
-}
-
-fn run_helper_root_with_writer(arg: Option<String>,
-    action: impl FnOnce(&mut crate::utils::CommandOutcome, &std::path::Path) -> Result<crate::InstallOutcome, String>,
-    receive: &mut impl FnMut(&crate::utils::CommandOutcome, &mut Option<String>) -> Result<(), String>,
-    diagnostic: &mut impl std::io::Write,
-    #[cfg(test)] mut on_hold: Option<&mut dyn FnMut()>) -> (String, i32) {
-    let Some(inst) = arg.map(std::path::PathBuf::from).filter(|p| p.is_absolute() && p.is_dir())
-    else { return ("ERR\tне указана папка установки\n".into(), 2); };
-    let mut saved = crate::command_lifetime::SavedCommand::new();
-    saved.run(|outcome| action(outcome, &inst));
-    let mut held_reported = false;
-    loop {
-        match saved.receive_with(receive) {
-            Ok(true) => break,
-            Ok(false) => {
-                if !held_reported {
-                    if let Err(error) = writeln!(diagnostic, "helper command outcome remains pending") {
-                        saved.diagnostic_errors.push(error);
-                    }
-                    #[cfg(test)]
-                    if let Some(callback) = on_hold.as_mut() { callback(); }
-                    held_reported = true;
-                }
+    let Some(inst) = arg
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute() && p.is_dir())
+    else {
+        println!("ERR\tне указана папка установки");
+        std::process::exit(2);
+    };
+    match crate::process_install(&inst) {
+        Ok(o) => {
+            println!("OK\t{}", one_line(o.label));
+            for w in o.warnings {
+                println!("WARN\t{}", one_line(&w));
             }
-            Err(error) => {
-                if let Err(diagnostic_error) = writeln!(diagnostic, "helper result receiving held: {error}") {
-                    saved.diagnostic_errors.push(diagnostic_error);
-                }
-                // Re-enter only the saved receiving step. The action is never
-                // run again, and a failed projection has not been committed.
-                match saved.receive_with(receive) {
-                    Ok(true) => break,
-                    Ok(false) => {},
-                    Err(recovery) => {
-                        // The production receiver has no external prerequisite.
-                        // If receiving-only recovery itself violates that
-                        // invariant, retain both failures without a panic loop.
-                        if let Err(error) = writeln!(diagnostic, "helper receiving recovery remains held: {recovery}") {
-                            saved.diagnostic_errors.push(error);
-                        }
-                        loop { std::thread::park_timeout(std::time::Duration::from_millis(10)); }
-                    }
-                }
-            }
+            println!(
+                "PROXYVAR\t{}\t{}",
+                u8::from(o.summary.proxy_var > 0),
+                u8::from(o.summary.proxy_var_retryable)
+            );
+            std::process::exit(0);
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    helper_wire(&saved.finish())
-}
-
-fn helper_wire(result: &Result<crate::InstallOutcome, String>) -> (String, i32) {
-    match result {
-        Ok(outcome) => {
-            let mut wire = format!("OK\t{}\n", one_line(outcome.label));
-            for warning in &outcome.warnings { wire.push_str(&format!("WARN\t{}\n", one_line(warning))); }
-            wire.push_str(&format!("PROXYVAR\t{}\t{}\n", u8::from(outcome.summary.proxy_var > 0), u8::from(outcome.summary.proxy_var_retryable)));
-            (wire, 0)
+        Err(e) => {
+            println!("ERR\t{}", one_line(&e));
+            std::process::exit(1);
         }
-        Err(error) => (format!("ERR\t{}\n", one_line(error)), 1),
     }
 }
 
@@ -376,22 +305,16 @@ fn parse_report(stdout: &str) -> Result<Elevated, String> {
 pub fn unpatch_as_root(inst: &Path) -> Result<Reverted, String> {
     use std::process::Command;
     let exe = std::env::current_exe().map_err(|e| format!("не найден путь к exe: {e}"))?;
-    let out = Command::new("pkexec")
-        .arg("--disable-internal-agent")
-        .arg(&exe)
-        .arg(UNPATCH_ROOT_FLAG)
-        .arg(inst)
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "установка принадлежит root, а pkexec в системе нет. Выполните в терминале: {}",
-                    manual_command_for(UNPATCH_ROOT_FLAG, inst)
-                )
-            } else {
-                format!("pkexec не запустился: {e}")
-            }
-        })?;
+    let out = elevated_output(&exe, UNPATCH_ROOT_FLAG, inst).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "установка принадлежит root, а pkexec в системе нет. Выполните в терминале: {}",
+                manual_command_for(UNPATCH_ROOT_FLAG, inst)
+            )
+        } else {
+            format!("pkexec не запустился: {e}")
+        }
+    })?;
     match (
         out.status.code(),
         parse_reverted(&String::from_utf8_lossy(&out.stdout)),
@@ -455,104 +378,12 @@ fn parse_reverted(stdout: &str) -> Option<Reverted> {
 
 #[cfg(test)]
 mod tests {
-    struct BrokenDiagnostic(usize);
-    impl std::io::Write for BrokenDiagnostic {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            self.0 += 1;
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-    }
-    #[test]
-    fn helper_fail_once_receiving_recovers_without_replaying_action() {
-        let mut actions = 0;
-        let mut receipts = 0;
-        let mut diagnostic = BrokenDiagnostic(0);
-        let (wire, code) = super::run_helper_root_with_writer(Some(std::env::temp_dir().to_string_lossy().into_owned()),
-            |_, _| { actions += 1; Err("original helper error".into()) },
-            &mut |command, failure| {
-                receipts += 1;
-                if receipts == 1 {
-                    *failure = Some("unreceived candidate".into());
-                    return Err("repairable receiving failure".into());
-                }
-                crate::command_lifetime::receive_failure(command, failure)
-            }, &mut diagnostic, None);
-        assert_eq!((actions, receipts), (1, 2));
-        assert_eq!(diagnostic.0, 1);
-        assert_eq!((wire.as_str(), code), ("ERR\toriginal helper error\n", 1));
-    }
-    #[test]
-    fn helper_fail_once_receiver_unwind_resumes_the_same_original_box() {
-        let original: Box<dyn std::any::Any + Send> = Box::new(43u64);
-        let address = original.as_ref() as *const _ as *const () as usize;
-        let mut receipts = 0;
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::run_helper_root(Some(std::env::temp_dir().to_string_lossy().into_owned()),
-                |_, _| std::panic::resume_unwind(original),
-                &mut |command, failure| {
-                    receipts += 1;
-                    if receipts == 1 {
-                        *failure = Some("unreceived receiver panic projection".into());
-                        panic!("secondary helper receiver panic");
-                    }
-                    crate::command_lifetime::receive_failure(command, failure)
-                }, None)
-        })).unwrap_err();
-        assert_eq!(receipts, 2);
-        assert_eq!(panic.as_ref() as *const _ as *const () as usize, address);
-        assert_eq!(panic.downcast_ref::<u64>(), Some(&43));
-    }
-    #[test]
-    fn helper_receiving_preserves_original_and_secondary_panics() {
-        let mut saved = crate::command_lifetime::SavedCommand::<()>::new();
-        saved.run(|_| panic!("original helper panic"));
-        assert!(saved.receive_with(&mut |_, _| panic!("receiver panic")).is_err());
-        assert_eq!(saved.receiving_panics.len(), 1);
-        assert!(saved.receive().unwrap());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| saved.finish()));
-        assert_eq!(result.unwrap_err().downcast_ref::<&str>(), Some(&"original helper panic"));
-    }
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "requires creator-owned Windows Job and private U04_FIXTURE_EXE/U04_FIXTURE_DIR"]
-    fn helper_receives_inherited_writer_before_final_wire() {
-        let executable = std::path::PathBuf::from(std::env::var_os("U04_FIXTURE_EXE").expect("absolute actor"));
-        let parent = std::path::PathBuf::from(std::env::var_os("U04_FIXTURE_DIR").expect("qualified fixture directory"));
-        let directory = parent.join("helper-crate-inherited-writer");
-        std::fs::create_dir(&directory).unwrap();
-        let release = directory.join("release");
-        let (send, receive) = std::sync::mpsc::channel();
-        let releaser = std::thread::spawn(move || {
-            use std::io::Write;
-            receive.recv().unwrap();
-            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(release).unwrap();
-            file.write_all(b"release").unwrap();
-            file.sync_all().unwrap();
-        });
-        let mut held = || send.send(()).unwrap();
-        let mut diagnostic = BrokenDiagnostic(0);
-        let mut actions = 0;
-        let (wire, code) = super::run_helper_root_with_writer(Some(directory.to_string_lossy().into_owned()), |outcome, path| {
-            actions += 1;
-            let prepared = crate::utils::PreparedExec::fixture_absolute(&executable).unwrap()
-                .args(["--fixture", "parent"]).arg(path.as_os_str());
-            assert_eq!(crate::utils::bounded_output(outcome, prepared, std::time::Duration::from_millis(400)),
-                crate::utils::CommandObservation::Deadline);
-            assert!(!outcome.releasable());
-            Err("original helper failure".into())
-        }, &mut crate::command_lifetime::receive_failure, &mut diagnostic, Some(&mut held));
-        releaser.join().unwrap();
-        assert_eq!(actions, 1);
-        assert_eq!(diagnostic.0, 1);
-        assert_eq!(code, 1);
-        assert!(wire.starts_with("ERR\toriginal helper failure; "));
-        assert!(wire.contains("capture_eof=true"));
-    }
     #[test]
     fn the_unpatch_report_reads_back_and_needs_its_last_line() {
-        let done = super::parse_reverted("FILES\t2\nBAD\tlanguage_server: отказано\nWARN\tapp.asar\nDONE\n")
-            .expect("done");
+        let done = super::parse_reverted(
+            "FILES\t2\nBAD\tlanguage_server: отказано\nWARN\tapp.asar\nDONE\n",
+        )
+        .expect("done");
         assert_eq!(done.files, 2);
         assert_eq!(done.errors, vec!["language_server: отказано".to_string()]);
         assert_eq!(done.warnings, vec!["app.asar".to_string()]);

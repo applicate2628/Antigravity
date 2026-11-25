@@ -2,29 +2,19 @@
 name = "ag_unlocker"
 version = "2.35.0"
 edition = "2021"
-default-run = "ag_unlocker"
 description = "Antigravity Configuration Tool"
-repository = "https://github.com/applicate2628/Antigravity"
-authors = ["Brent t.me/nova_txt", "Fuheshka github.com/Fuheshka"]
+authors = ["Brent t.me/nova_txt"]
 
 [features]
 personal-build = []
 
 [dependencies]
-subprocess = "=1.2.3"
 obfstr = "0.4"
 sha2 = "0.10"
 hex = "0.4"
 regex = "1.10"
-ress = { version = "=0.11.7", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Existing transitive package: bounded binary registration-interface search.
-memchr = "=2.8.0"
-url = "=2.5.8"
-httparse = "=1.10.1"
-ring = "=0.17.14"
-ipnet = { version = "=2.12.2", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "1"
 # Decrypts the relay credential baked in by build.rs (owner build only; the
@@ -36,8 +26,10 @@ aes-gcm = "0.10"
 # expose. `default-features = false` because the image half is eframe's business,
 # not ours; features unify, so the build is unchanged either way.
 arboard = { version = "3.6", default-features = false }
-# Interface options have to be set before `connect`, and std creates and connects
-# in one call. `all` exposes the macOS binding used for TCP and DNS (`net.rs`).
+# The one socket `TcpStream` cannot build: IP_UNICAST_IF has to be set before
+# `connect`, and std creates and connects in one call. Pins the relay's own
+# connections to the ISP link while a VPN holds the default route (`net.rs`),
+# the same way every UDP resolver query already is (I4). Small, no runtime.
 socket2 = { version = "0.6", features = ["all"] }
 # The terminal UI (`--tui`; on Linux also any start with no graphical session,
 # e.g. a server over SSH; on Windows also the fallback when no renderer opens a
@@ -56,32 +48,28 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # window ever opened, whichever adapter would have been chosen. D3D12 and its
 # software rasteriser WARP ship with every Windows 10, so nothing else is needed.
 [target.'cfg(windows)'.dependencies]
-winreg = { version = "=0.56.0", default-features = false }
-windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_TaskScheduler", "Win32_UI_Shell"] }
-# Already present in the lock/cache: typed native process/token/RunAs handles.
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Environment", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_StationsAndDesktops", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_RemoteDesktop", "Win32_System_Diagnostics_Debug"] }
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "links", "wgpu_no_default_features", "glow"] }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12"] }
 
 [target.'cfg(not(windows))'.dependencies]
+# getifaddrs/if_nametoindex and the sockaddr layouts for `netif.rs` (interfaces
+# and the default route on Linux/macOS). Already in the tree through socket2.
+libc = "0.2"
 # Linux has no DirectX: wgpu's default Vulkan + GL, then glow.
 eframe = { version = "0.36", features = ["glow"] }
 
-[target.'cfg(windows)'.dev-dependencies]
-winit = { version = "=0.30.13", default-features = false }
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 
 [build-dependencies]
+winres = "0.1"
 # build.rs derives the per-release canary with the same formula as canary.rs.
 sha2 = "0.10"
 hex = "0.4"
-serde = "1.0"
-serde_json = "1.0"
 # Encrypt the relay credential into the binary with a random per-build key.
 aes-gcm = "0.10"
 getrandom = "0.2"
-
-[target.'cfg(windows)'.build-dependencies]
-winres = "0.1"
 
 [profile.release]
 opt-level = "z"
@@ -96,16 +84,3 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-[profile.release.package.sha2]
-opt-level = 3
-
-
-# Private Linux launcher: directory-anchored I/O, liveness polling and fd execution.
-[target.'cfg(unix)'.dependencies]
-rustix = { version = "=1.1.4", features = ["fs"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "=1.1.4", features = ["fs", "process", "event", "stdio", "runtime"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "=0.2.186"

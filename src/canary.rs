@@ -112,7 +112,7 @@ pub fn about_banner() -> String {
     format!(
         "{}\n\nversion: {}\nbuild:   {}\nmark:    {}\nauthor:  {}\norigin:  {}",
         NOTICE,
-        crate::update::current_version(),
+        env!("CARGO_PKG_VERSION"),
         RELEASE_TOKEN,
         STATIC_CANARY,
         AUTHOR,

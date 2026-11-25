@@ -6,10 +6,10 @@
 //! on because the user asked for it", which is what lets the app put a switch
 //! back where the user left it and re-apply after a reboot wiped something.
 //!
-//! General consumers use the existing best-effort settings behavior. The
-//! persistent macOS watchdog separately requires readable, parsed intent.
+//! Deliberately best-effort: a missing or corrupt file is a fresh `Settings`,
+//! never an error the user has to deal with.
 //!
-//! Lives in the relay's state directory, next to `upstream.txt`, and for the same
+//! Lives in `dns_forwarder::log_dir()`, next to `upstream.txt`, and for the same
 //! reason: the relay task runs **as this user** under an S4U principal, not as
 //! SYSTEM, so per-user state is exactly what both processes can reach. It is
 //! also why the provider deny-list needs no second copy anywhere — one file,
@@ -17,7 +17,6 @@
 //! set (src/upstream.rs:286).
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(not(test))]
@@ -26,164 +25,18 @@ use std::time::Instant;
 
 const FILE_NAME: &str = "settings.json";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum TransportProfile {
-    SystemTcp,
-    ExistingConfigured,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) enum TransportProfileSetting {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
     #[default]
-    Absent,
-    Explicit(TransportProfile),
-    Invalid(serde_json::Value),
-}
-
-impl TransportProfileSetting {
-    fn is_absent(&self) -> bool { matches!(self, Self::Absent) }
-}
-
-fn decode_present_transport_profile<'de, D: serde::Deserializer<'de>>(d: D) -> Result<TransportProfileSetting, D::Error> {
-    let value = serde_json::Value::deserialize(d)?;
-    Ok(match serde_json::from_value(value.clone()) {
-        Ok(profile) => TransportProfileSetting::Explicit(profile),
-        Err(_) => TransportProfileSetting::Invalid(value),
-    })
-}
-
-fn encode_transport_profile<S: serde::Serializer>(value: &TransportProfileSetting, serializer: S) -> Result<S::Ok, S::Error> {
-    match value {
-        TransportProfileSetting::Absent => serializer.serialize_none(),
-        TransportProfileSetting::Explicit(profile) => profile.serialize(serializer),
-        TransportProfileSetting::Invalid(raw) => raw.serialize(serializer),
-    }
-}
-
-/// A complete, saved transport tuple. This value is configuration, not proof
-/// that any service, listener or process actually implements it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ActiveTransportConfig {
-    pub(crate) profile: TransportProfile,
-    pub(crate) dns: bool,
-    pub(crate) client_proxy: bool,
-    pub(crate) tcp_proxy: bool,
-    pub(crate) dns_alias: bool,
-}
-
-impl ActiveTransportConfig {
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        if (self.client_proxy && !self.tcp_proxy) || self.dns_alias != (self.dns && self.client_proxy) {
-            return Err("contradictory transport capabilities".into());
-        }
-        if self.profile == TransportProfile::SystemTcp
-            && (self.dns || self.dns_alias || self.client_proxy != self.tcp_proxy) {
-            return Err("contradictory system transport configuration".into());
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TransportRequirements {
-    pub(crate) active_config: ActiveTransportConfig,
-    pub(crate) carrier: bool,
-    /// Missing watchdog fields do not borrow a default as new authority.
-    pub(crate) watchdog: Option<bool>,
-}
-
-/// A received component wish. Unspecified and Inactive are both Keep for
-/// effects; neither is a negative choice or runtime readiness evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TransportWish { Set(bool), Unspecified, Inactive }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TransportEffects {
-    pub(crate) dns: TransportWish,
-    pub(crate) local_proxy: TransportWish,
-    pub(crate) builtin_exits: TransportWish,
-    pub(crate) group_proxy: TransportWish,
-    pub(crate) own_proxy_enabled: TransportWish,
-    pub(crate) carrier: TransportWish,
-    pub(crate) watchdog: TransportWish,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TransportChoices {
-    pub(crate) dns: Option<bool>,
-    pub(crate) local_proxy: Option<bool>,
-    pub(crate) builtin_exits: Option<bool>,
-    pub(crate) group_proxy: Option<bool>,
-    pub(crate) own_proxy_enabled: Option<bool>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum TransportIntent {
-    Missing,
-    Legacy(Settings),
-    Explicit { settings: Settings, requirements: TransportRequirements },
-    Broken(String),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum TransportChoice {
-    Dns(bool), LocalProxy(bool), BuiltinExits(bool), GroupProxy(bool),
-    OwnProxyEnabled(bool), AutoPatch(bool), PatchDeclined(bool),
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TransportEdit {
-    pub(crate) value_changed: bool,
-    pub(crate) presence_changed: bool,
-}
-
-#[derive(Clone, Copy)]
-struct TransportField {
-    key: &'static str,
-    required: u8,
-    get: fn(&Settings) -> bool,
-    set: fn(&mut Settings, bool),
-}
-const SYSTEM_FIELD: u8 = 1;
-const EXISTING_FIELD: u8 = 2;
-const WATCHDOG_FIELD: u8 = 4;
-const TRANSPORT_FIELDS: [TransportField; 7] = [
-    TransportField { key: "dns", required: SYSTEM_FIELD | EXISTING_FIELD, get: |s| s.dns, set: |s, v| s.dns = v },
-    TransportField { key: "local_proxy", required: SYSTEM_FIELD | EXISTING_FIELD, get: |s| s.local_proxy, set: |s, v| s.local_proxy = v },
-    TransportField { key: "builtin_exits", required: EXISTING_FIELD, get: |s| s.builtin_exits, set: |s, v| s.builtin_exits = v },
-    TransportField { key: "group_proxy", required: EXISTING_FIELD, get: |s| s.group_proxy, set: |s, v| s.group_proxy = v },
-    TransportField { key: "own_proxy_enabled", required: EXISTING_FIELD, get: |s| s.own_proxy_enabled, set: |s, v| s.own_proxy_enabled = v },
-    TransportField { key: "auto_patch", required: WATCHDOG_FIELD, get: |s| s.auto_patch, set: |s, v| s.auto_patch = v },
-    TransportField { key: "patch_declined", required: WATCHDOG_FIELD, get: |s| s.patch_declined, set: |s, v| s.patch_declined = v },
-];
-
-#[derive(Debug, Clone)]
-pub(crate) struct TransportInput {
-    present: [bool; 7],
-    baseline: [bool; 7],
-    profile_baseline: TransportProfileSetting,
-    unreadable: bool,
-}
-
-impl Default for TransportInput {
-    fn default() -> Self {
-        Self { present: [false; 7], baseline: [false; 7],
-            profile_baseline: TransportProfileSetting::Absent, unreadable: false }
-    }
+    System,
+    Light,
+    Dark,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Absence is a legacy file, regardless of the struct's default.
-    #[serde(default, deserialize_with = "decode_present_transport_profile", serialize_with = "encode_transport_profile", skip_serializing_if = "TransportProfileSetting::is_absent")]
-    pub(crate) transport_profile: TransportProfileSetting,
-    #[serde(skip)]
-    pub(crate) transport_input: TransportInput,
-    /// WSL intent; None preserves the distinction for older settings files.
-    pub wsl: Option<crate::wsl_api::WslPreferences>,
     /// Switch 1: the client patch that lifts the account-region block.
     pub client_patch: bool,
 
@@ -191,8 +44,8 @@ pub struct Settings {
     /// wiped (D27).
     ///
     /// Read by the *watchdog process*, not just the window, which is why it goes
-    /// through the settings reader rather than being consulted from an
-    /// in-memory `Settings` the watchdog never sees.
+    /// through `auto_patch_wanted()` and its cache rather than being consulted
+    /// from an in-memory `Settings` the watchdog never sees.
     pub auto_patch: bool,
 
     #[serde(default)]
@@ -233,7 +86,6 @@ pub struct Settings {
     /// on when any of its parts is, which keeps one truth instead of two.
     pub dns: bool,
     pub local_proxy: bool,
-    pub builtin_exits: bool,
     pub group_proxy: bool,
 
     /// Diagnostics only, set by hand in `settings.json`, never by the window:
@@ -296,15 +148,16 @@ pub struct Settings {
     /// Installs the user pointed at by hand, on top of the ones found by the
     /// scan (the pencil next to each path).
     pub manual_paths: Vec<PathBuf>,
+
+    /// UI color theme preference (`system`, `light`, or `dark`).
+    #[serde(default)]
+    pub theme: ThemeMode,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        // Group proxy is opt-in; the other region bypass defaults remain enabled.
-        let mut settings = Self {
-            transport_profile: TransportProfileSetting::Absent,
-            transport_input: TransportInput::default(),
-            wsl: None,
+        // The built-in bypass ships on. Optional proxies need user configuration.
+        Self {
             client_patch: false,
             auto_patch: true,
             group_key: String::new(),
@@ -315,7 +168,6 @@ impl Default for Settings {
             decline_unrecorded: false,
             dns: true,
             local_proxy: true,
-            builtin_exits: true,
             group_proxy: false,
             debug_route: String::new(),
             disabled_providers: Vec::new(),
@@ -327,9 +179,8 @@ impl Default for Settings {
             own_proxy: String::new(),
             own_proxy_enabled: false,
             manual_paths: Vec::new(),
-        };
-        settings.transport_input.baseline = settings.transport_values();
-        settings
+            theme: ThemeMode::System,
+        }
     }
 }
 
@@ -338,7 +189,6 @@ impl Settings {
         match read() {
             Read::Parsed(s) => s,
             Read::Missing => Self::default(),
-            Read::Unavailable => Self::unavailable(),
             Read::Broken => Self::unreadable(),
         }
     }
@@ -349,34 +199,35 @@ impl Settings {
     fn unreadable() -> Self {
         Self {
             patch_declined: true,
-            transport_input: TransportInput { unreadable: true, ..TransportInput::default() },
             ..Self::default()
         }
     }
 
-    fn unavailable() -> Self {
-        Self { transport_input: TransportInput { unreadable: true, ..TransportInput::default() }, ..Self::default() }
-    }
-
-    /// Compatibility wrapper for the checked settings writer.
+    /// Best-effort write. A failure here must never block an action the user
+    /// asked for, so it is reported as a bool and normally ignored.
     pub fn save(&self) -> bool {
-        self.save_checked().is_ok()
-    }
-
-    pub(crate) fn save_checked(&self) -> Result<(), String> {
-        let json = self.encode_for_save()?;
-        let path = path().ok_or("settings path unavailable")?;
+        let Some(path) = path() else { return false };
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("settings directory: {e}"))?;
+            if std::fs::create_dir_all(dir).is_err() {
+                return false;
+            }
         }
-        write_replacing(&path, &json).map_err(|e| format!("settings write: {e}"))?;
-        // Cache the same decoded bytes that were written, including normalized
-        // watchdog state and the still-absent transport choices.
-        let received = parse(&json).ok_or("written settings could not be decoded")?;
-        if let Ok(mut guard) = CACHE.lock() {
-            *guard = Some((received, Instant::now()));
+        let written = match serde_json::to_string_pretty(self) {
+            Ok(json) => write_replacing(&path, &json).is_ok(),
+            Err(_) => false,
+        };
+        if written {
+            // The writer must see its own write immediately. Without this the
+            // window saves a new provider order and then reads the list back
+            // through a cache that is up to a TTL old, so the change appears not
+            // to have happened at all - for twenty seconds. Other processes
+            // still pick it up on their own TTL, which is the point of the
+            // cache; this only shortcuts the process that made the change.
+            if let Ok(mut guard) = CACHE.lock() {
+                *guard = Some((self.clone(), Instant::now()));
+            }
         }
-        Ok(())
+        written
     }
 
     /// Whether Antigravity is to be patched without a click: auto-patch on, and
@@ -385,167 +236,12 @@ impl Settings {
         self.auto_patch && !self.patch_declined
     }
 
-    fn transport_values(&self) -> [bool; 7] {
-        TRANSPORT_FIELDS.map(|field| (field.get)(self))
+    pub fn group_proxy_configured(&self) -> bool {
+        !self.group_key.trim().is_empty()
     }
 
-    fn validate_transport_edits(&self) -> Result<(), String> {
-        if self.transport_input.unreadable { return Err("settings input is unreadable".into()); }
-        if self.transport_profile != self.transport_input.profile_baseline {
-            return Err("transport_profile requires an explicit profile selection".into());
-        }
-        let values = self.transport_values();
-        for (index, field) in TRANSPORT_FIELDS.iter().enumerate() {
-            if field.required & (SYSTEM_FIELD | EXISTING_FIELD) != 0
-                && !self.transport_input.present[index] && values[index] != self.transport_input.baseline[index] {
-                return Err(format!("{} requires an explicit transport choice", field.key));
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn encode_for_save(&self) -> Result<String, String> {
-        self.validate_transport_edits()?;
-        let mut value = serde_json::to_value(self).map_err(|e| format!("settings serialization: {e}"))?;
-        let object = value.as_object_mut().ok_or("settings serialization is not an object")?;
-        for (index, field) in TRANSPORT_FIELDS.iter().enumerate() {
-            if field.required & (SYSTEM_FIELD | EXISTING_FIELD) != 0 && !self.transport_input.present[index] { object.remove(field.key); }
-        }
-        serde_json::to_string_pretty(&value).map_err(|e| format!("settings serialization: {e}"))
-    }
-
-    pub(crate) fn set_transport_choice(&mut self, choice: TransportChoice) -> Result<TransportEdit, String> {
-        if self.transport_input.unreadable { return Err("settings input is unreadable".into()); }
-        let (index, value) = match choice {
-            TransportChoice::Dns(value) => (0, value), TransportChoice::LocalProxy(value) => (1, value),
-            TransportChoice::BuiltinExits(value) => (2, value), TransportChoice::GroupProxy(value) => (3, value),
-            TransportChoice::OwnProxyEnabled(value) => (4, value), TransportChoice::AutoPatch(value) => (5, value),
-            TransportChoice::PatchDeclined(value) => (6, value),
-        };
-        if index == 0 && value && matches!(self.transport_profile, TransportProfileSetting::Explicit(TransportProfile::SystemTcp)) {
-            return Err("system TCP transport cannot enable DNS ingress".into());
-        }
-        let prior = self.transport_values()[index];
-        let presence_changed = !self.transport_input.present[index];
-        (TRANSPORT_FIELDS[index].set)(self, value);
-        self.transport_input.present[index] = true;
-        Ok(TransportEdit { value_changed: prior != value, presence_changed })
-    }
-
-    pub(crate) fn select_system_tcp(&mut self) -> Result<TransportEdit, String> {
-        self.select_transport_profile(TransportProfile::SystemTcp, [false, true, self.builtin_exits, self.group_proxy, self.own_proxy_enabled])
-    }
-
-    pub(crate) fn select_existing_configured(&mut self, dns: bool, local_proxy: bool, builtin_exits: bool, group_proxy: bool, own_proxy_enabled: bool) -> Result<TransportEdit, String> {
-        self.select_transport_profile(TransportProfile::ExistingConfigured, [dns, local_proxy, builtin_exits, group_proxy, own_proxy_enabled])
-    }
-
-    fn select_transport_profile(&mut self, profile: TransportProfile, values: [bool; 5]) -> Result<TransportEdit, String> {
-        if self.transport_input.unreadable { return Err("settings input is unreadable".into()); }
-        if profile == TransportProfile::SystemTcp && values[0] { return Err("system TCP transport cannot enable DNS ingress".into()); }
-        let mut staged = self.clone();
-        let old = staged.transport_values();
-        let old_profile = staged.transport_profile.clone();
-        let required = match profile { TransportProfile::SystemTcp => SYSTEM_FIELD, TransportProfile::ExistingConfigured => EXISTING_FIELD };
-        let mut presence_changed = matches!(old_profile, TransportProfileSetting::Absent);
-        let mut changed = old_profile != TransportProfileSetting::Explicit(profile);
-        for (index, field) in TRANSPORT_FIELDS.iter().enumerate().filter(|(_, field)| field.required & required != 0) {
-            presence_changed |= !staged.transport_input.present[index];
-            changed |= old[index] != values[index];
-            (field.set)(&mut staged, values[index]);
-            staged.transport_input.present[index] = true;
-        }
-        staged.transport_profile = TransportProfileSetting::Explicit(profile);
-        staged.transport_input.profile_baseline = staged.transport_profile.clone();
-        staged.transport_requirements()?;
-        *self = staged;
-        Ok(TransportEdit { value_changed: changed, presence_changed })
-    }
-
-    pub(crate) fn transport_requirements(&self) -> Result<TransportRequirements, String> {
-        let profile = match self.transport_profile {
-            TransportProfileSetting::Explicit(profile) => profile,
-            TransportProfileSetting::Absent => return Err("transport profile is absent".into()),
-            TransportProfileSetting::Invalid(_) => return Err("transport profile is invalid".into()),
-        };
-        let effects = self.checked_transport_effects()?;
-        let client_proxy = self.local_proxy;
-        let tcp_proxy = [effects.local_proxy, effects.builtin_exits, effects.group_proxy, effects.own_proxy_enabled]
-            .into_iter().any(|wish| wish == TransportWish::Set(true));
-        let active_config = ActiveTransportConfig { profile, dns: self.dns, client_proxy, tcp_proxy, dns_alias: self.dns && client_proxy };
-        active_config.validate()?;
-        let carrier = match effects.carrier {
-            TransportWish::Set(value) => value,
-            _ => return Err("transport carrier wish is unreceived".into()),
-        };
-        let watchdog = match effects.watchdog { TransportWish::Set(value) => Some(value), _ => None };
-        Ok(TransportRequirements { active_config, carrier, watchdog })
-    }
-
-    /// View saved choices including inactive preferences; omission stays None.
-    /// This is a form input, not a route permission or activation receipt.
-    pub(crate) fn transport_choices(&self) -> Result<TransportChoices, String> {
-        self.validate_transport_edits()?;
-        let mut values = [None; 5];
-        for (index, field) in TRANSPORT_FIELDS.iter().enumerate() {
-            if field.required & EXISTING_FIELD != 0 && self.transport_input.present[index] {
-                values[index] = Some((field.get)(self));
-            }
-        }
-        Ok(TransportChoices { dns: values[0], local_proxy: values[1], builtin_exits: values[2], group_proxy: values[3], own_proxy_enabled: values[4] })
-    }
-
-    /// Project one received snapshot into applicable component wishes without
-    /// turning omissions or inactive stored preferences into effects.
-    pub(crate) fn checked_transport_effects(&self) -> Result<TransportEffects, String> {
-        self.validate_transport_edits()?;
-        let profile = match self.transport_profile {
-            TransportProfileSetting::Absent => None,
-            TransportProfileSetting::Explicit(profile) => Some(profile),
-            TransportProfileSetting::Invalid(_) => return Err("transport profile is invalid".into()),
-        };
-        if let Some(profile) = profile {
-            let required = match profile { TransportProfile::SystemTcp => SYSTEM_FIELD, TransportProfile::ExistingConfigured => EXISTING_FIELD };
-            if TRANSPORT_FIELDS.iter().enumerate().any(|(index, field)| field.required & required != 0 && !self.transport_input.present[index]) {
-                return Err("transport tuple has missing or invalid fields".into());
-            }
-            if profile == TransportProfile::SystemTcp && self.dns {
-                return Err("system TCP transport cannot enable DNS ingress".into());
-            }
-        }
-        let mut wishes = [TransportWish::Unspecified; 7];
-        for (index, field) in TRANSPORT_FIELDS.iter().enumerate() {
-            wishes[index] = if profile == Some(TransportProfile::SystemTcp)
-                && field.required & EXISTING_FIELD != 0 && field.required & SYSTEM_FIELD == 0 {
-                TransportWish::Inactive
-            } else if self.transport_input.present[index] {
-                TransportWish::Set((field.get)(self))
-            } else { TransportWish::Unspecified };
-        }
-        let applicable = TRANSPORT_FIELDS.iter().enumerate().filter(|(_, field)| field.required & EXISTING_FIELD != 0);
-        let mut any_true = false;
-        let mut all_known_off = true;
-        for (index, _) in applicable {
-            match wishes[index] {
-                TransportWish::Set(true) => { any_true = true; all_known_off = false; }
-                TransportWish::Set(false) | TransportWish::Inactive => {},
-                TransportWish::Unspecified => all_known_off = false,
-            }
-        }
-        let carrier = if any_true { TransportWish::Set(true) } else if all_known_off { TransportWish::Set(false) } else { TransportWish::Unspecified };
-        let watchdog_received = TRANSPORT_FIELDS.iter().enumerate().all(|(index, field)| field.required & WATCHDOG_FIELD == 0 || self.transport_input.present[index]);
-        let watchdog = if watchdog_received { TransportWish::Set(self.auto_patch_wanted()) } else { TransportWish::Unspecified };
-        Ok(TransportEffects { dns: wishes[0], local_proxy: wishes[1], builtin_exits: wishes[2],
-            group_proxy: wishes[3], own_proxy_enabled: wishes[4], carrier, watchdog })
-    }
-
-    /// Lifecycle wish only. A known wish is not route permission, saved-file
-    /// proof, or an observation that the carrier is running or ready.
-    pub(crate) fn checked_carrier_wish(&self) -> Result<Option<bool>, String> {
-        Ok(match self.checked_transport_effects()?.carrier {
-            TransportWish::Set(value) => Some(value),
-            TransportWish::Unspecified | TransportWish::Inactive => None,
-        })
+    pub fn group_proxy_wanted(&self) -> bool {
+        self.group_proxy && self.group_proxy_configured()
     }
 
     pub fn provider_enabled(&self, name: &str) -> bool {
@@ -568,53 +264,21 @@ impl Settings {
 /// mean opposite things to the watchdog: no file is a machine nobody configured,
 /// and the defaults are right for it; a file that does not parse is usually one
 /// caught mid-write by another process, and the defaults say "patch" (D27).
-pub(crate) enum Read {
+enum Read {
     Parsed(Settings),
     Missing,
     Broken,
-    Unavailable,
 }
 
-pub(crate) fn read() -> Read {
+fn read() -> Read {
     let Some(path) = path() else {
-        return Read::Unavailable;
+        return Read::Missing;
     };
     match std::fs::read_to_string(path) {
         Ok(text) => parse(&text).map_or(Read::Broken, Read::Parsed),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Read::Missing,
         Err(_) => Read::Broken,
     }
-}
-
-/// Receive the existing on-disk snapshot without defaulting missing or broken
-/// input into permission to activate a transport.
-pub(crate) fn checked_transport_intent() -> TransportIntent {
-    transport_intent_from_read(read())
-}
-
-fn transport_intent_from_read(value: Read) -> TransportIntent {
-    match value {
-        Read::Missing => TransportIntent::Missing,
-        Read::Broken | Read::Unavailable => TransportIntent::Broken("settings unavailable or invalid".into()),
-        Read::Parsed(settings) if matches!(settings.transport_profile, TransportProfileSetting::Absent) => TransportIntent::Legacy(settings),
-        Read::Parsed(settings) => match settings.transport_requirements() {
-            Ok(requirements) => TransportIntent::Explicit { settings, requirements },
-            Err(error) => TransportIntent::Broken(error),
-        },
-    }
-}
-
-/// The macOS worker must not turn unreadable saved intent into permission.
-#[cfg(target_os = "macos")]
-pub(crate) fn watchdog_snapshot() -> Result<Settings, String> {
-    let path = path().ok_or("путь настроек автопатча недоступен")?;
-    watchdog_snapshot_at(&path)
-}
-
-#[cfg(target_os = "macos")]
-fn watchdog_snapshot_at(path: &std::path::Path) -> Result<Settings, String> {
-    let text = std::fs::read_to_string(&path).map_err(|error| format!("чтение настроек автопатча: {error}"))?;
-    parse(&text).ok_or_else(|| "настройки автопатча повреждены".into())
 }
 
 /// The file's text as settings, a leading byte-order mark allowed.
@@ -632,20 +296,16 @@ fn parse(text: &str) -> Option<Settings> {
     let value: serde_json::Value =
         serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
     let unrecorded = value.get("patch_declined").is_none();
-    let mut s = Settings::deserialize(&value).ok()?;
+    let group_unrecorded = value.get("group_proxy").is_none();
+    let mut s: Settings = serde_json::from_value(value).ok()?;
     if unrecorded {
         s.patch_declined = !s.client_patch;
         s.decline_unrecorded = true;
     }
-    receive_transport_fields(&value, &mut s);
+    if group_unrecorded || !s.group_proxy_configured() {
+        s.group_proxy = s.group_proxy_configured();
+    }
     Some(s)
-}
-
-fn receive_transport_fields(value: &serde_json::Value, settings: &mut Settings) {
-    settings.transport_input.present = TRANSPORT_FIELDS.map(|field| value.get(field.key).is_some_and(serde_json::Value::is_boolean));
-    settings.transport_input.baseline = settings.transport_values();
-    settings.transport_input.profile_baseline = settings.transport_profile.clone();
-    settings.transport_input.unreadable = false;
 }
 
 /// A temp beside the file, then a rename over it: a reader in another process -
@@ -677,47 +337,11 @@ fn write_replacing(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 fn path() -> Option<PathBuf> {
-    let dir = crate::dns_forwarder::checked_log_dir().ok()?;
+    let dir = crate::dns_forwarder::log_dir();
     if dir.as_os_str().is_empty() {
         return None;
     }
     Some(dir.join(FILE_NAME))
-}
-
-/// Bind handoff to the bytes actually persisted by this settings owner.
-pub(crate) fn saved_intent_sha256(expected: &Settings) -> Result<[u8; 32], String> {
-    let path = path().ok_or_else(|| "settings path unavailable".to_owned())?;
-    let bytes = std::fs::read(path).map_err(|e| format!("settings read failed: {e}"))?;
-    saved_intent_hash(&bytes, expected)
-}
-
-fn saved_intent_hash(bytes: &[u8], expected: &Settings) -> Result<[u8; 32], String> {
-    let serialized = expected.encode_for_save()?;
-    if bytes != serialized.as_bytes() {
-        return Err("saved settings do not match current intent".into());
-    }
-    Ok(Sha256::digest(bytes).into())
-}
-
-/// Receive exactly the saved settings bound by the handoff, without fallback.
-pub(crate) fn receive_saved_intent(expected_sha256: &[u8; 32]) -> Result<Settings, String> {
-    let path = path().ok_or_else(|| "settings path unavailable".to_owned())?;
-    let bytes = std::fs::read(path).map_err(|e| format!("settings read failed: {e}"))?;
-    receive_intent_bytes(&bytes, expected_sha256)
-}
-
-/// Project only the exact bytes received by the existing saved-intent handoff.
-pub(crate) fn receive_saved_transport_intent(expected_sha256: &[u8; 32]) -> Result<TransportIntent, String> {
-    receive_saved_intent(expected_sha256).map(|settings| transport_intent_from_read(Read::Parsed(settings)))
-}
-
-fn receive_intent_bytes(bytes: &[u8], expected_sha256: &[u8; 32]) -> Result<Settings, String> {
-    let actual: [u8; 32] = Sha256::digest(bytes).into();
-    if &actual != expected_sha256 {
-        return Err("saved settings changed during handoff".into());
-    }
-    let text = std::str::from_utf8(bytes).map_err(|e| format!("saved settings are invalid: {e}"))?;
-    parse(text).ok_or_else(|| "saved settings are invalid".into())
 }
 
 /// The settings as a *serving* process must read them.
@@ -750,14 +374,12 @@ fn cached() -> Settings {
     }
 }
 
-/// One serving-settings snapshot for a connection's route selection.
-pub(crate) fn routing_snapshot() -> Settings {
-    cached()
-}
-
 #[cfg(not(test))]
 fn cached_from_disk() -> Settings {
-    const TTL: Duration = Duration::from_secs(20);
+    // Short on purpose: a switch flipped in the window has to reach the running
+    // relay within a couple of seconds, not half a minute. One small file read
+    // per TTL is nothing next to the DNS queries it sits behind.
+    const TTL: Duration = Duration::from_secs(2);
 
     if let Ok(guard) = CACHE.lock() {
         if let Some((s, at)) = guard.as_ref() {
@@ -769,7 +391,6 @@ fn cached_from_disk() -> Settings {
     let fresh = match read() {
         Read::Parsed(s) => s,
         Read::Missing => Settings::default(),
-        Read::Unavailable => Settings::unavailable(),
         // Damaged, or held by something mid-write. Keep serving what was last
         // read - or, with nothing read yet, the defaults minus the one that
         // acts on the user's files - for another TTL. Caching this too matters:
@@ -782,9 +403,32 @@ fn cached_from_disk() -> Settings {
             .unwrap_or_else(Settings::unreadable),
     };
     if let Ok(mut guard) = CACHE.lock() {
+        let changed = guard.as_ref().is_some_and(|(old, _)| {
+            old.disabled_providers != fresh.disabled_providers
+                || old.provider_order != fresh.provider_order
+                || old.custom_dns != fresh.custom_dns
+                || old.rotate_providers != fresh.rotate_providers
+        });
+        if changed {
+            EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         *guard = Some((fresh.clone(), Instant::now()));
     }
     fresh
+}
+
+/// Bumped whenever a re-read finds the DNS pool's settings changed (a provider
+/// switched, reordered, the user's server edited, rotation flipped). The pool
+/// keeps a decision for minutes and a vetted answer for seconds; both were made
+/// under the old settings, so they compare this and start over when it moved.
+static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn pool_epoch() -> u64 {
+    EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn custom_dns_cached() -> String {
+    cached().custom_dns
 }
 
 pub fn disabled_providers_cached() -> Vec<String> {
@@ -832,10 +476,9 @@ pub fn local_proxy_wanted() -> bool {
     cached().local_proxy
 }
 
-/// Whether the user-selected group proxy may be used as a route.
-/// Missing settings or an omitted choice keep it disabled until explicitly enabled.
+/// Whether the configured group proxy may be used as a route.
 pub fn group_proxy_enabled() -> bool {
-    cached().group_proxy
+    cached().group_proxy_wanted()
 }
 
 /// The user's own proxy was set after the group code, so it goes first.
@@ -852,222 +495,18 @@ pub fn debug_route() -> String {
     cached().debug_route.clone()
 }
 
-pub fn builtin_exits_enabled() -> bool {
-    cached().builtin_exits
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn transport_effects_distinguish_omitted_and_inactive_choices() {
-        let legacy = parse(r#"{"auto_patch":true,"patch_declined":false}"#).unwrap();
-        let effects = legacy.checked_transport_effects().unwrap();
-        assert_eq!(effects.watchdog, TransportWish::Set(true));
-        assert_eq!(effects.dns, TransportWish::Unspecified);
-        assert_eq!(effects.local_proxy, TransportWish::Unspecified);
-        assert_eq!(effects.own_proxy_enabled, TransportWish::Unspecified);
-        assert_eq!(effects.carrier, TransportWish::Unspecified);
-
-        let selected = parse(r#"{"transport_profile":"system_tcp","dns":false,"local_proxy":true,"builtin_exits":true,"group_proxy":true,"own_proxy_enabled":true}"#).unwrap();
-        let effects = selected.checked_transport_effects().unwrap();
-        assert_eq!(effects.dns, TransportWish::Set(false));
-        assert_eq!(effects.local_proxy, TransportWish::Set(true));
-        assert_eq!(effects.carrier, TransportWish::Set(true));
-        assert_eq!(effects.builtin_exits, TransportWish::Inactive);
-        assert_eq!(effects.group_proxy, TransportWish::Inactive);
-        assert_eq!(effects.own_proxy_enabled, TransportWish::Inactive);
-        assert!(selected.builtin_exits && selected.group_proxy && selected.own_proxy_enabled);
-        let choices = selected.transport_choices().unwrap();
-        assert_eq!(choices.builtin_exits, Some(true));
-        assert_eq!(choices.group_proxy, Some(true));
-        assert_eq!(choices.own_proxy_enabled, Some(true));
-        assert_eq!(legacy.transport_choices().unwrap(), TransportChoices::default());
-    }
-
-    #[test]
-    fn configured_client_wish_is_part_of_active_identity() {
-        let off = parse(r#"{"transport_profile":"existing_configured","dns":false,"local_proxy":false,"builtin_exits":false,"group_proxy":true,"own_proxy_enabled":false}"#).unwrap().transport_requirements().unwrap();
-        let on = parse(r#"{"transport_profile":"existing_configured","dns":false,"local_proxy":true,"builtin_exits":false,"group_proxy":true,"own_proxy_enabled":false}"#).unwrap().transport_requirements().unwrap();
-        assert!(off.active_config.tcp_proxy && on.active_config.tcp_proxy);
-        assert!(!off.active_config.client_proxy && on.active_config.client_proxy);
-        assert_ne!(off.active_config, on.active_config);
-        let dns = parse(r#"{"transport_profile":"existing_configured","dns":true,"local_proxy":false,"builtin_exits":false,"group_proxy":true,"own_proxy_enabled":false}"#).unwrap().transport_requirements().unwrap();
-        assert!(dns.active_config.dns && dns.active_config.tcp_proxy && !dns.active_config.client_proxy && !dns.active_config.dns_alias);
-        assert!(ActiveTransportConfig { client_proxy: true, tcp_proxy: false, ..off.active_config }.validate().is_err());
-        assert!(serde_json::from_str::<ActiveTransportConfig>(r#"{"profile":"system_tcp","dns":false,"tcp_proxy":true,"dns_alias":false}"#).is_err());
-    }
-
-    #[test]
-    #[ignore = "requires an isolated U14_QA_DIR-bound Settings owner"]
-    fn transport_effects_actual_watchdog_save_keeps_legacy_routes_unspecified() {
-        let root = std::path::PathBuf::from(std::env::var_os("U14_QA_DIR").expect("owned fixture directory"));
-        assert_eq!(path(), Some(root.join(FILE_NAME)), "fixture must bind the actual Settings owner");
-        assert!(matches!(read(), Read::Missing));
-        let mut settings = Settings::load();
-        settings.set_transport_choice(TransportChoice::AutoPatch(true)).unwrap();
-        settings.save_checked().unwrap();
-        let Read::Parsed(saved) = read() else { panic!("saved Settings were not parsed") };
-        let effects = saved.checked_transport_effects().unwrap();
-        assert_eq!(effects.watchdog, TransportWish::Set(true));
-        assert_eq!(effects.carrier, TransportWish::Unspecified);
-        assert_eq!(effects.dns, TransportWish::Unspecified);
-        assert_eq!(effects.local_proxy, TransportWish::Unspecified);
-        assert_eq!(effects.builtin_exits, TransportWish::Unspecified);
-        assert_eq!(effects.group_proxy, TransportWish::Unspecified);
-        assert_eq!(effects.own_proxy_enabled, TransportWish::Unspecified);
-    }
-
-    #[test]
-    fn carrier_wish_requires_received_choices() {
-        assert_eq!(Settings::default().checked_carrier_wish().unwrap(), None);
-        assert_eq!(parse(r#"{"group_proxy":true}"#).unwrap().checked_carrier_wish().unwrap(), Some(true));
-        assert_eq!(parse(r#"{"dns":false,"local_proxy":false,"builtin_exits":false,"group_proxy":false}"#).unwrap().checked_carrier_wish().unwrap(), None);
-        assert_eq!(parse(r#"{"dns":false,"local_proxy":false,"builtin_exits":false,"group_proxy":false,"own_proxy_enabled":false}"#).unwrap().checked_carrier_wish().unwrap(), Some(false));
-        let mut explicit_false = parse("{}").unwrap();
-        let change = explicit_false.set_transport_choice(TransportChoice::GroupProxy(false)).unwrap();
-        assert!(!change.value_changed && change.presence_changed);
-        assert_eq!(explicit_false.checked_carrier_wish().unwrap(), None);
-        let mut bare = parse("{}").unwrap();
-        bare.local_proxy = false;
-        assert!(bare.checked_carrier_wish().is_err());
-        assert!(parse(r#"{"transport_profile":"unknown"}"#).unwrap().checked_carrier_wish().is_err());
-        assert!(parse(r#"{"transport_profile":"system_tcp","dns":true,"local_proxy":true}"#).unwrap().checked_carrier_wish().is_err());
-        let system = parse(r#"{"transport_profile":"system_tcp","dns":false,"local_proxy":true}"#).unwrap();
-        assert_eq!(system.checked_carrier_wish().unwrap(), Some(system.transport_requirements().unwrap().carrier));
-        let existing = parse(r#"{"transport_profile":"existing_configured","dns":false,"local_proxy":false,"builtin_exits":false,"group_proxy":false,"own_proxy_enabled":false}"#).unwrap();
-        assert_eq!(existing.checked_carrier_wish().unwrap(), Some(existing.transport_requirements().unwrap().carrier));
-    }
-
-    #[test]
-    fn transport_intent_preserves_missing_legacy_and_invalid() {
-        assert!(matches!(transport_intent_from_read(Read::Missing), TransportIntent::Missing));
-        assert!(matches!(transport_intent_from_read(Read::Broken), TransportIntent::Broken(_)));
-        assert!(matches!(transport_intent_from_read(Read::Unavailable), TransportIntent::Broken(_)));
-        let old = parse(r#"{"dns":false,"own_proxy":"synthetic"}"#).unwrap();
-        assert!(matches!(old.transport_profile, TransportProfileSetting::Absent));
-        let direct: Settings = serde_json::from_str("{}").unwrap();
-        assert!(matches!(direct.transport_profile, TransportProfileSetting::Absent));
-        assert!(matches!(transport_intent_from_read(Read::Parsed(old)), TransportIntent::Legacy(_)));
-        for bad in [r#"{"transport_profile":"unknown","license_key":"synthetic"}"#, r#"{"transport_profile":null,"license_key":"synthetic"}"#] {
-            let settings = parse(bad).unwrap();
-            assert!(matches!(settings.transport_profile, TransportProfileSetting::Invalid(_)));
-            assert_eq!(settings.license_key, "synthetic");
-            let before: serde_json::Value = serde_json::from_str(bad).unwrap();
-            let after = serde_json::to_value(&settings).unwrap();
-            assert_eq!(before["transport_profile"], after["transport_profile"]);
-            assert!(matches!(transport_intent_from_read(Read::Parsed(settings)), TransportIntent::Broken(_)));
-        }
-        assert!(parse("{").is_none());
-    }
-
-    #[test]
-    fn transport_explicit_tuple_never_uses_omission_defaults() {
-        let valid = parse(r#"{"transport_profile":"system_tcp","dns":false,"local_proxy":true,"builtin_exits":true,"group_proxy":true,"own_proxy":"synthetic"}"#).unwrap();
-        let projected = valid.transport_requirements().unwrap();
-        assert_eq!(projected.active_config.profile, TransportProfile::SystemTcp);
-        assert!(!projected.active_config.dns && !projected.active_config.dns_alias);
-        assert!(projected.active_config.tcp_proxy && projected.carrier);
-        assert_eq!(projected.watchdog, None);
-        assert!(valid.builtin_exits && valid.group_proxy && valid.own_proxy == "synthetic");
-        for json in [r#"{"transport_profile":"system_tcp","local_proxy":true}"#,
-                     r#"{"transport_profile":"system_tcp","dns":false}"#,
-                     r#"{"transport_profile":"system_tcp","dns":true,"local_proxy":true}"#,
-                     r#"{"transport_profile":"existing_configured","dns":false,"local_proxy":false}"#] {
-            let settings = parse(json).unwrap();
-            assert!(matches!(transport_intent_from_read(Read::Parsed(settings)), TransportIntent::Broken(_)));
-        }
-        let explicit_false = parse(r#"{"transport_profile":"system_tcp","dns":false,"local_proxy":false}"#).unwrap();
-        assert!(!explicit_false.transport_requirements().unwrap().carrier);
-        let existing = parse(r#"{"transport_profile":"existing_configured","dns":false,"local_proxy":false,"builtin_exits":false,"group_proxy":false,"own_proxy_enabled":false}"#).unwrap();
-        let requirements = existing.transport_requirements().unwrap();
-        assert_eq!(requirements.active_config.profile, TransportProfile::ExistingConfigured);
-        assert!(!requirements.carrier);
-        let dns_only = parse(r#"{"transport_profile":"existing_configured","dns":true,"local_proxy":false,"builtin_exits":false,"group_proxy":false,"own_proxy_enabled":false}"#).unwrap().transport_requirements().unwrap();
-        assert!(dns_only.active_config.dns && dns_only.carrier);
-        assert!(!dns_only.active_config.dns_alias);
-        let watchdog = parse(r#"{"transport_profile":"system_tcp","dns":false,"local_proxy":true,"auto_patch":true,"patch_declined":false}"#).unwrap().transport_requirements().unwrap();
-        assert_eq!(watchdog.watchdog, Some(true));
-        let bytes = valid.encode_for_save().unwrap().into_bytes();
-        let hash: [u8; 32] = Sha256::digest(&bytes).into();
-        let saved = receive_intent_bytes(&bytes, &hash).unwrap();
-        assert!(matches!(transport_intent_from_read(Read::Parsed(saved)), TransportIntent::Explicit { .. }));
-        assert!(receive_intent_bytes(&bytes, &[0; 32]).is_err());
-    }
-
-    #[test]
-    fn data_cache_keeps_received_presence() {
-        let mut s = Settings::load();
-        s.client_patch = true;
-        s.save_checked().unwrap();
-        let cached = CACHE.lock().unwrap().as_ref().unwrap().0.clone();
-        assert_eq!(cached.encode_for_save().unwrap(), s.encode_for_save().unwrap());
-        assert_eq!(&cached.transport_input.present[..5], &s.transport_input.present[..5]);
-        assert!(cached.transport_input.present[5] && cached.transport_input.present[6]);
-        assert!(!cached.decline_unrecorded);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn mac_worker_requires_current_parsed_intent() {
-        let dir = std::env::temp_dir().join(format!("ag-mac-intent-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("settings.json");
-        assert!(watchdog_snapshot_at(&path).is_err());
-        std::fs::write(&path, "{").unwrap();
-        assert!(watchdog_snapshot_at(&path).is_err());
-        let on = Settings { auto_patch: true, patch_declined: false, ..Settings::default() };
-        std::fs::write(&path, serde_json::to_vec(&on).unwrap()).unwrap();
-        assert!(watchdog_snapshot_at(&path).unwrap().auto_patch_wanted());
-        let off = Settings { auto_patch: false, ..on };
-        std::fs::write(&path, serde_json::to_vec(&off).unwrap()).unwrap();
-        assert!(!watchdog_snapshot_at(&path).unwrap().auto_patch_wanted());
-        std::fs::remove_file(&path).unwrap();
-        assert!(watchdog_snapshot_at(&path).is_err());
-        std::fs::remove_dir(&dir).unwrap();
-    }
-
-    #[test]
-    fn handoff_binds_saved_bytes_and_rejects_invalid_data() {
-        let mut expected = Settings { license_key: "synthetic".into(), ..Settings::default() };
-        expected.set_transport_choice(TransportChoice::Dns(false)).unwrap();
-        let bytes = expected.encode_for_save().unwrap().into_bytes();
-        let hash = saved_intent_hash(&bytes, &expected).unwrap();
-        let received = receive_intent_bytes(&bytes, &hash).unwrap();
-        assert_eq!(received.license_key, "synthetic");
-        assert!(!received.dns);
-        assert!(saved_intent_hash(b"{}", &expected).is_err());
-        assert!(receive_intent_bytes(b"{}", &hash).is_err());
-        let invalid = b"{";
-        let invalid_hash: [u8; 32] = Sha256::digest(invalid).into();
-        assert!(receive_intent_bytes(invalid, &invalid_hash).is_err());
-        let empty_hash: [u8; 32] = Sha256::digest([]).into();
-        assert!(receive_intent_bytes(b"", &empty_hash).is_err());
-    }
-
-    #[test]
-    fn wsl_omission_and_explicit_choice_preserve_other_settings() {
-        let old = r#"{"license_key":"old-key","dns":false,"own_proxy":"example"}"#;
-        let mut settings: Settings = serde_json::from_str(old).unwrap();
-        assert!(settings.wsl.is_none());
-        settings.wsl = Some(crate::wsl_api::WslPreferences {
-            enabled: false,
-            distros: vec!["Ubuntu".into()],
-        });
-        let saved = serde_json::to_string(&settings).unwrap();
-        let restored: Settings = serde_json::from_str(&saved).unwrap();
-        assert_eq!(restored.wsl, settings.wsl);
-        assert_eq!(restored.license_key, "old-key");
-        assert!(!restored.dns);
-        assert_eq!(restored.own_proxy, "example");
-    }
-
-    #[test]
-    fn defaults_keep_group_proxy_opt_in() {
+    fn a_missing_file_reads_as_the_defaults_not_an_error() {
+        // Nothing has been written in a test process, so this exercises the
+        // "first run" path that every new user takes.
         let s = Settings::default();
-        assert!(s.dns && s.local_proxy && s.builtin_exits && s.auto_patch);
-        assert!(!s.group_proxy);
+        assert!(s.dns && s.local_proxy && s.auto_patch);
+        assert!(!s.group_proxy_wanted());
         assert!(s.rotate_providers, "the pool races by default");
         assert!(
             !s.client_patch,
@@ -1080,10 +519,15 @@ mod tests {
     }
 
     #[test]
-    fn group_proxy_omission_and_explicit_choices() {
-        assert!(!parse(r#"{}"#).unwrap().group_proxy);
-        assert!(parse(r#"{"group_proxy":true}"#).unwrap().group_proxy);
-        assert!(!parse(r#"{"group_proxy":false}"#).unwrap().group_proxy);
+    fn legacy_group_switch_requires_a_code_and_keeps_explicit_opt_out() {
+        let empty = parse(r#"{"group_proxy":true,"group_key":" "}"#).unwrap();
+        assert!(!empty.group_proxy);
+        assert!(!empty.group_proxy_wanted());
+        let enabled = parse(r#"{"group_proxy":true,"group_key":"saved"}"#).unwrap();
+        assert!(enabled.group_proxy_wanted());
+        let disabled = parse(r#"{"group_proxy":false,"group_key":"saved"}"#).unwrap();
+        assert!(disabled.group_proxy_configured());
+        assert!(!disabled.group_proxy_wanted());
     }
 
     /// G38 under D27: switching the patch off keeps it off, whatever auto-patch
@@ -1182,5 +626,20 @@ mod tests {
         let s: Settings = serde_json::from_str(json).expect("unknown fields are ignored");
         assert!(!s.dns);
         assert!(s.local_proxy, "fields left out keep their default");
+        assert_eq!(s.theme, ThemeMode::System);
+    }
+
+    #[test]
+    fn theme_mode_defaults_to_system_and_round_trips() {
+        assert_eq!(Settings::default().theme, ThemeMode::System);
+        for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
+            let s = Settings {
+                theme: mode,
+                ..Settings::default()
+            };
+            let json = serde_json::to_string(&s).unwrap();
+            let parsed = parse(&json).unwrap();
+            assert_eq!(parsed.theme, mode);
+        }
     }
 }

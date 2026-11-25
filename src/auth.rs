@@ -5,23 +5,28 @@ use sha2::{Digest, Sha256};
 // * The base secret below is COMMITTED on purpose. A build made from the public
 //   GitHub sources must accept the very same keys the author hands out in
 //   Telegram, which is only possible if the secret ships in the source.
-// * Keys are salted with the crate version (env!("CARGO_PKG_VERSION")), so a key
-//   minted for one release does NOT validate on any other release. After every
-//   update users grab a fresh, free key from t.me/nova_txt.
+// * Keys are salted with the crate's MAJOR.MINOR (env!("CARGO_PKG_VERSION") cut
+//   to two parts), so a key minted for 2.32.1 also opens 2.32.4 but NOT 2.33.0.
+//   After a minor/major bump users grab a fresh, free key from t.me/nova_txt.
 //
 // This is not DRM: a determined user could derive keys from these public
 // sources. The point is simply to route ordinary users through the Telegram
 // group for their per-version key.
 const LICENSE_BASE_SECRET: &str = ")Q.QFyU+oOs#Z:jmtxonGfZi+w#|XG4<";
-// Must match dist_keygen.py exactly (base + separator + version).
+// Must match build_rust.py / dist_keygen.py exactly (base + separator + MAJOR.MINOR).
 const LICENSE_VERSION_SEP: &str = "::";
+
+/// The part of a version a key is bound to: `2.32.1` -> `2.32`.
+fn license_version(version: &str) -> String {
+    version.split('.').take(2).collect::<Vec<_>>().join(".")
+}
 
 fn key_secret() -> String {
     format!(
         "{}{}{}",
         LICENSE_BASE_SECRET,
         LICENSE_VERSION_SEP,
-        env!("CARGO_PKG_VERSION")
+        license_version(env!("CARGO_PKG_VERSION"))
     )
 }
 
@@ -55,33 +60,14 @@ pub fn verify_key(key: &str) -> bool {
     result == 0
 }
 
-/// Decide local application entry without changing or storing a licence key.
-pub(crate) fn entry_allowed(key: &str, debug_skip: bool) -> bool {
-    entry_allowed_for(verify_key(key), cfg!(feature = "personal-build"), debug_skip)
-}
-
-fn entry_allowed_for(valid_key: bool, personal_build: bool, debug_skip: bool) -> bool {
-    valid_key || personal_build || debug_skip
+/// Check local startup entry using this build's licence policy.
+pub(crate) fn entry_allowed(key: &str) -> bool {
+    cfg!(feature = "personal-build") || verify_key(key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn entry_policy_preserves_default_and_debug_paths() {
-        assert!(!entry_allowed_for(false, false, false));
-        assert!(entry_allowed_for(true, false, false));
-        assert!(entry_allowed_for(false, true, false));
-        assert!(entry_allowed_for(false, false, true));
-        assert!(!verify_key("not-a-key"));
-    }
-
-    #[test]
-    fn configured_feature_controls_invalid_local_entry() {
-        assert_eq!(entry_allowed("not-a-key", false), cfg!(feature = "personal-build"));
-        assert!(!verify_key("not-a-key"));
-    }
 
     /// Mints a key the way dist_keygen.py does, for an arbitrary secret.
     fn mint_key(nonce: &str, secret: &str) -> String {
@@ -109,6 +95,21 @@ mod tests {
     }
 
     #[test]
+    fn a_key_survives_patch_versions_but_not_a_minor_bump() {
+        assert_eq!(license_version("2.32.1"), "2.32");
+        assert_eq!(license_version("2.32.1"), license_version("2.32.4"));
+        assert_ne!(license_version("2.32.1"), license_version("2.33.0"));
+        assert_ne!(license_version("2.32.1"), license_version("3.32.1"));
+    }
+
+    #[test]
+    fn configured_feature_controls_invalid_local_entry() {
+        const INVALID_KEY: &str = "not-a-key";
+        assert_eq!(entry_allowed(INVALID_KEY), cfg!(feature = "personal-build"));
+        assert!(!verify_key(INVALID_KEY));
+    }
+
+    #[test]
     fn rejects_garbage() {
         assert!(!verify_key("not-a-key"));
         assert!(!verify_key(""));
@@ -121,4 +122,3 @@ mod tests {
         assert!(verify_key(&formatted));
     }
 }
-

@@ -37,18 +37,20 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The refusal, as the language server logs it. Matched ASCII-case-insensitively
 /// and never on the whole `FAILED_PRECONDITION` line: that status wraps other
 /// preconditions too, and only this one is about where the request came from.
 const REGION_400: &str = "user location is not supported";
-const REGION_REASON: &str = "unsupported_location";
-const REGION_NOT_ELIGIBLE: &str = "location_not_eligible";
 
-fn is_region_reason(reason: &str) -> bool {
-    reason.eq_ignore_ascii_case(REGION_REASON) || reason.eq_ignore_ascii_case(REGION_NOT_ELIGIBLE)
-}
+/// The same refusal as it comes back from the sign-in call: `onboardUser` answers
+/// `403 PERMISSION_DENIED` with `reason: UNSUPPORTED_LOCATION` (Â«account is not
+/// currently available in your locationÂ»), not the 400 above - seen 2026-11-11
+/// on a fresh login through the group route, where the relay read nothing and
+/// kept the route that had just been refused. The JSON form is matched, once per
+/// refusal: the same word is repeated in the `API Error:` line after it.
+const REGION_403: &str = "\"reason\": \"unsupported_location\"";
 
 /// A model answer, as the language server logs it: the generation call and the
 /// id of the response it got back, on one line. Both halves: `loadCodeAssist`
@@ -96,23 +98,13 @@ const DROP_CLOSED_CONN: &str = "use of closed network connection";
 /// working in; the tail is what carries the news.
 const MAX_READ: u64 = 1024 * 1024;
 
-#[cfg(test)]
-pub(crate) fn test_max_read() -> u64 { MAX_READ }
-
 /// How many products the scan is willing to look at. A user profile does not
 /// hold more than a handful of `Antigravity*` folders, and a bound keeps a
 /// pathological `%APPDATA%` from turning a 15 s tick into a directory walk.
 const MAX_PRODUCTS: usize = 8;
 
 /// Where each watched file was read up to.
-static OFFSETS: Mutex<Option<HashMap<PathBuf, LogCursor>>> = Mutex::new(None);
-
-#[derive(Clone, Default)]
-struct LogCursor {
-    offset: u64,
-    source: Option<LogSourceId>,
-    continuous: bool,
-}
+static OFFSETS: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
 
 /// The gate host each file last named in a `URL:` line, carried across passes:
 /// a refusal line names no host, and the call it refused was logged in an
@@ -143,81 +135,12 @@ pub struct Tally {
     /// `URL: https://…` line before it in this file. The client keeps a
     /// connection pool per host, and the two can sit on different routes.
     pub refused_host: Option<String>,
-    pub(crate) refused_endpoint: Option<EndpointEvent>,
     /// The host the newest answer's own line names.
     pub answered_host: Option<String>,
-    pub(crate) answered_endpoint: Option<EndpointEvent>,
     /// Generation attempts the connection died under (EOF), and the newest.
     pub drops: usize,
     pub dropped_ago: Option<Duration>,
     pub dropped_host: Option<String>,
-    pub(crate) direct_signals: Vec<DirectSignal>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DirectSignalKind { Drop, Answer, Refusal }
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct LogSourceId { volume: u64, file: [u8; 16] }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SignalContinuity { Proven, Fence }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DirectSignal {
-    pub(crate) kind: DirectSignalKind,
-    pub(crate) at: Option<Instant>,
-    pub(crate) host: Option<String>,
-    pub(crate) source: Option<LogSourceId>,
-    pub(crate) record_start: u64,
-    pub(crate) record_end: u64,
-    pub(crate) continuity: SignalContinuity,
-    pub(crate) conflicting_record: bool,
-}
-
-#[cfg(unix)]
-fn source_id(_: &File, metadata: &fs::Metadata) -> Option<LogSourceId> {
-    use std::os::unix::fs::MetadataExt;
-    let mut file = [0u8; 16];
-    file[..8].copy_from_slice(&metadata.ino().to_ne_bytes());
-    Some(LogSourceId { volume: metadata.dev(), file })
-}
-
-#[cfg(windows)]
-fn source_id(file: &File, _: &fs::Metadata) -> Option<LogSourceId> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandleEx, FileIdInfo, FILE_ID_INFO};
-    let mut info = FILE_ID_INFO::default();
-    // The retained File owns this valid handle throughout the call, and the
-    // buffer has the size and layout required by FileIdInfo.
-    let ok = unsafe {
-        GetFileInformationByHandleEx(file.as_raw_handle(), FileIdInfo,
-            (&mut info as *mut FILE_ID_INFO).cast(), std::mem::size_of::<FILE_ID_INFO>() as u32)
-    };
-    (ok != 0).then_some(LogSourceId { volume: info.VolumeSerialNumber, file: info.FileId.Identifier })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn source_id(_: &File, _: &fs::Metadata) -> Option<LogSourceId> { None }
-
-#[cfg(test)]
-pub(crate) fn test_source_id(file: &File) -> Option<LogSourceId> {
-    source_id(file, &file.metadata().ok()?)
-}
-
-/// A placed event and the host named on that same line are inseparable. A
-/// hostless or conflicting equal-time event cannot borrow another event's host.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EndpointEvent { pub(crate) age: Duration, pub(crate) host: Option<String> }
-
-pub(crate) fn merge_endpoint_event(current: &mut Option<EndpointEvent>, incoming: Option<EndpointEvent>) {
-    let Some(incoming) = incoming else { return; };
-    match current {
-        None => *current = Some(incoming),
-        Some(existing) if incoming.age < existing.age => *existing = incoming,
-        Some(existing) if incoming.age == existing.age && incoming.host != existing.host => existing.host = None,
-        _ => {}
-    }
 }
 
 impl Tally {
@@ -225,8 +148,7 @@ impl Tally {
         self.refusals == 0 && self.answers == 0 && self.drops == 0
     }
 
-    fn add(&mut self, mut other: Tally) {
-        self.direct_signals.append(&mut other.direct_signals);
+    fn add(&mut self, other: Tally) {
         self.refusals += other.refusals;
         self.answers += other.answers;
         self.drops += other.drops;
@@ -256,8 +178,6 @@ impl Tally {
         }
         self.refused_ago = newer(self.refused_ago, other.refused_ago);
         self.answered_ago = newer(self.answered_ago, other.answered_ago);
-        merge_endpoint_event(&mut self.refused_endpoint, other.refused_endpoint);
-        merge_endpoint_event(&mut self.answered_endpoint, other.answered_endpoint);
     }
 }
 
@@ -277,56 +197,30 @@ pub fn poll() -> Vec<(PathBuf, Tally)> {
         return out;
     };
     let offsets = guard.get_or_insert_with(HashMap::new);
+    let now = crate::utils::local_clock();
     let started = FIRST_PASS_DONE.swap(true, std::sync::atomic::Ordering::Relaxed);
     let mut hosts = LAST_HOST.lock().ok();
-    let now = crate::utils::local_clock();
-    let anchor = Instant::now();
     for path in candidate_logs() {
+        let first_sight = !offsets.contains_key(&path);
+        // A file new since the first pass is read from its start (see above).
+        let from = match offsets.get(&path).copied() {
+            None if started => Some(0),
+            other => other,
+        };
         let mut last_host = hosts
             .as_mut()
             .and_then(|h| h.get_or_insert_with(HashMap::new).get(&path).cloned());
-        let (first_sight, tally) = poll_path(&path, offsets, started, now, anchor, &mut last_host);
+        let (next, tally) = scan(&path, from, now, &mut last_host);
         if let (Some(h), Some(host)) = (hosts.as_mut(), last_host) {
             h.get_or_insert_with(HashMap::new)
                 .insert(path.clone(), host);
         }
+        offsets.insert(path.clone(), next);
         if (!first_sight || started) && !tally.is_empty() {
             out.push((path, tally));
         }
     }
     out
-}
-
-fn poll_path(
-    path: &Path,
-    offsets: &mut HashMap<PathBuf, LogCursor>,
-    started: bool,
-    now: Option<crate::utils::LocalClock>,
-    anchor: Instant,
-    last_host: &mut Option<String>,
-) -> (bool, Tally) {
-    let first_sight = !offsets.contains_key(path);
-    let from = offsets.get(path).cloned().or_else(|| started.then(LogCursor::default));
-    let (next, tally) = scan_cursor(path, from, now, anchor, last_host);
-    offsets.insert(path.to_path_buf(), next);
-    (first_sight, tally)
-}
-
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct TestLogCursor {
-    offsets: HashMap<PathBuf, LogCursor>,
-    last_host: Option<String>,
-}
-
-#[cfg(test)]
-pub(crate) fn test_poll_log(
-    cursor: &mut TestLogCursor,
-    path: &Path,
-    now: Option<crate::utils::LocalClock>,
-    anchor: Instant,
-) -> Tally {
-    poll_path(path, &mut cursor.offsets, true, now, anchor, &mut cursor.last_host).1
 }
 
 /// Reads `path` from `from` (or from its end, when it has never been read) and
@@ -335,98 +229,47 @@ pub(crate) fn test_poll_log(
 /// flush split across two passes is read once, whole, on the second.
 ///
 /// Pure in the sense that matters for a test: no static, one file, one answer.
-#[cfg(test)]
 fn scan(
     path: &Path,
     from: Option<u64>,
     now: Option<crate::utils::LocalClock>,
     last_host: &mut Option<String>,
 ) -> (u64, Tally) {
-    scan_with_anchor(path, from, now, Instant::now(), last_host)
-}
-
-#[cfg(test)]
-pub(crate) fn test_scan_log(
-    path: &Path,
-    from: Option<u64>,
-    now: Option<crate::utils::LocalClock>,
-    anchor: Instant,
-) -> (u64, Tally) {
-    scan_with_anchor(path, from, now, anchor, &mut None)
-}
-
-fn scan_with_anchor(
-    path: &Path,
-    from: Option<u64>,
-    now: Option<crate::utils::LocalClock>,
-    anchor: Instant,
-    last_host: &mut Option<String>,
-) -> (u64, Tally) {
-    let cursor = from.map(|offset| LogCursor { offset, ..LogCursor::default() });
-    let (next, tally) = scan_cursor(path, cursor, now, anchor, last_host);
-    (next.offset, tally)
-}
-
-fn scan_cursor(
-    path: &Path,
-    cursor: Option<LogCursor>,
-    now: Option<crate::utils::LocalClock>,
-    anchor: Instant,
-    last_host: &mut Option<String>,
-) -> (LogCursor, Tally) {
-    let from = cursor.as_ref().map(|c| c.offset);
-    let failed = || LogCursor { offset: from.unwrap_or(0), ..LogCursor::default() };
-    let Ok(mut f) = File::open(path) else {
-        return (failed(), Tally::default());
+    let Ok(len) = fs::metadata(path).map(|m| m.len()) else {
+        return (from.unwrap_or(0), Tally::default());
     };
-    let Ok(metadata) = f.metadata() else {
-        return (failed(), Tally::default());
-    };
-    let len = metadata.len();
-    let source = source_id(&f, &metadata);
     let Some(from) = from else {
         // Never seen: history is not news.
-        return (LogCursor { offset: len, source, continuous: false }, Tally::default());
+        return (len, Tally::default());
     };
     // Shrunk means rotated or restarted, and everything in it is new.
     let mut start = if len < from { 0 } else { from };
     if len == start {
-        let continuous = cursor.as_ref().is_some_and(|c| c.continuous && c.source.is_some() && c.source == source && len == from);
-        return (LogCursor { offset: len, source, continuous }, Tally::default());
+        return (len, Tally::default());
     }
-    let skipped = len - start > MAX_READ;
-    if skipped {
+    if len - start > MAX_READ {
         start = len - MAX_READ;
     }
-    let mut starts_at_boundary = start == 0;
-    if start > 0 && f.seek(SeekFrom::Start(start - 1)).is_ok() {
-        let mut prior = [0u8; 1];
-        starts_at_boundary = f.read_exact(&mut prior).is_ok() && prior[0] == b'\n';
-    }
+    let Ok(mut f) = File::open(path) else {
+        return (from, Tally::default());
+    };
     if f.seek(SeekFrom::Start(start)).is_err() {
-        return (failed(), Tally::default());
+        return (from, Tally::default());
     }
     let mut buf = Vec::with_capacity((len - start) as usize);
-    if (&mut f).take(len - start).read_to_end(&mut buf).is_err() {
-        return (failed(), Tally::default());
+    if f.take(len - start).read_to_end(&mut buf).is_err() {
+        return (from, Tally::default());
     }
-    let full_read = buf.len() as u64 == len - start;
-    let continues = full_read && starts_at_boundary && !skipped && start == from && source.is_some()
-        && cursor.as_ref().is_some_and(|c| c.continuous && c.source == source);
     let Some(last_nl) = buf.iter().rposition(|b| *b == b'\n') else {
         // No complete line yet. Wait for the rest - unless the slice is the
         // whole read budget, which is one line nobody will ever finish.
         if buf.len() as u64 >= MAX_READ {
-            return (LogCursor { offset: len, source, continuous: false }, Tally::default());
+            return (len, Tally::default());
         }
-        return (LogCursor { offset: start, source, continuous: continues }, Tally::default());
+        return (start, Tally::default());
     };
     let complete = &buf[..=last_nl];
-    let tally = tally_signals(complete, now, last_host, start, anchor, source.clone(), starts_at_boundary, continues);
-    // A delivered fenced signal establishes the start of a fresh observed run.
-    // An unconsumed suffix is reread from the last complete-record boundary.
-    let continuous = full_read && source.is_some() && (continues || !tally.direct_signals.is_empty());
-    (LogCursor { offset: start + last_nl as u64 + 1, source, continuous }, tally)
+    (start + last_nl as u64 + 1, tally(complete, now, last_host))
 }
 
 /// Refusals and answers in a stretch of complete lines, with the newest of each
@@ -436,26 +279,8 @@ fn tally(
     now: Option<crate::utils::LocalClock>,
     last_host: &mut Option<String>,
 ) -> Tally {
-    tally_signals(chunk, now, last_host, 0, Instant::now(), None, false, false)
-}
-
-fn tally_signals(
-    chunk: &[u8],
-    now: Option<crate::utils::LocalClock>,
-    last_host: &mut Option<String>,
-    offset: u64,
-    anchor: Instant,
-    source: Option<LogSourceId>,
-    first_complete: bool,
-    continues: bool,
-) -> Tally {
     let mut out = Tally::default();
-    let mut position = offset;
-    let mut boundary = first_complete;
-    let mut prior_record = continues;
-    for record in chunk.split_inclusive(|b| *b == b'\n') {
-        let end = position + record.len() as u64;
-        let line = record.strip_suffix(b"\n").unwrap_or(record);
+    for line in chunk.split(|b| *b == b'\n') {
         let named = url_host(line);
         if named.is_some() {
             *last_host = named.clone();
@@ -463,40 +288,20 @@ fn tally_signals(
         let refusals = count_refusals(line);
         let answered = is_answer(line);
         let dropped = is_stream_drop(line);
-        let kind_count = usize::from(refusals > 0) + usize::from(answered) + usize::from(dropped);
+        if refusals == 0 && !answered && !dropped {
+            continue;
+        }
         let ago = now.and_then(|now| {
             let text = String::from_utf8_lossy(line);
             parse_stamp(&text)
                 .and_then(|at| age_secs(at, now))
                 .map(|s| Duration::from_secs(s as u64))
         });
-        if boundary && record.ends_with(b"\n") {
-            let marker = b"URL:";
-            let unique_url = match_offsets_ci(line, marker).count() == 1;
-            let signal_host = if unique_url { named.clone() } else { None };
-            let continuity = if source.is_some() && prior_record { SignalContinuity::Proven } else { SignalContinuity::Fence };
-            for (present, kind) in [(dropped, DirectSignalKind::Drop), (answered, DirectSignalKind::Answer), (refusals > 0, DirectSignalKind::Refusal)] {
-                if present {
-                    out.direct_signals.push(DirectSignal {
-                        kind, at: ago.and_then(|age| anchor.checked_sub(age)), host: signal_host.clone(),
-                        source: source.clone(), record_start: position, record_end: end,
-                        continuity, conflicting_record: kind_count > 1,
-                    });
-                }
-            }
-            if kind_count > 0 { prior_record = true; }
-        }
-        position = end;
-        boundary = record.ends_with(b"\n");
-        if refusals == 0 && !answered && !dropped {
-            continue;
-        }
         if refusals > 0 {
             out.add(Tally {
                 refusals,
                 refused_ago: ago,
                 refused_host: last_host.clone(),
-                refused_endpoint: ago.map(|age| EndpointEvent { age, host: named.clone() }),
                 ..Tally::default()
             });
         }
@@ -512,8 +317,7 @@ fn tally_signals(
             out.add(Tally {
                 answers: 1,
                 answered_ago: ago,
-                answered_host: named.clone().or_else(|| last_host.clone()),
-                answered_endpoint: ago.map(|age| EndpointEvent { age, host: named }),
+                answered_host: named.or_else(|| last_host.clone()),
                 ..Tally::default()
             });
         }
@@ -525,19 +329,14 @@ fn tally_signals(
 /// other line or a host that is not one of ours.
 fn url_host(line: &[u8]) -> Option<String> {
     const MARK: &[u8] = b"URL: https://";
-    let at = match_offsets_ci(line, MARK).next()? + MARK.len();
+    let at = line.windows(MARK.len()).position(|w| w == MARK)? + MARK.len();
     let rest = &line[at..];
     let end = rest
         .iter()
         .position(|b| *b == b'/' || *b == b':' || b.is_ascii_whitespace())
         .unwrap_or(rest.len());
     let host = String::from_utf8_lossy(&rest[..end]).to_ascii_lowercase();
-    let port = if rest.get(end) == Some(&b':') {
-        let suffix = &rest[end + 1..];
-        let length = suffix.iter().position(|b| *b == b'/' || b.is_ascii_whitespace()).unwrap_or(suffix.len());
-        std::str::from_utf8(&suffix[..length]).ok()?.parse::<u16>().ok()?
-    } else { 443 };
-    crate::gate_hosts::is_public_dns_target(&host, port).then_some(host)
+    crate::proxy::is_gate_host(&host).then_some(host)
 }
 
 /// Whether a line is one failed generation attempt the connection died under.
@@ -556,67 +355,29 @@ fn is_answer(line: &[u8]) -> bool {
 }
 
 fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
-    match_offsets_ci(hay, needle).next().is_some()
-}
-
-fn match_offsets_ci<'a>(hay: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
-    assert!(!needle.is_empty(), "window size must be non-zero");
-    let starts = match hay.len().checked_sub(needle.len()) {
-        Some(last) => &hay[..=last],
-        None => &hay[..0],
-    };
-    let lower = needle[0].to_ascii_lowercase();
-    let upper = needle[0].to_ascii_uppercase();
-    let one = (lower == upper).then(|| memchr::memchr_iter(lower, starts));
-    let two = (lower != upper).then(|| memchr::memchr2_iter(lower, upper, starts));
-
-    // The first byte only rules out impossible starts. The original whole
-    // window comparison is authoritative, and overlapping offsets are kept.
-    one.into_iter().flatten().chain(two.into_iter().flatten())
-        .filter(move |&start| hay[start..start + needle.len()].eq_ignore_ascii_case(needle))
+    hay.len() >= needle.len()
+        && hay
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// Occurrences of the refusal in a chunk of log, case-insensitively. Byte-wise,
 /// because the log is a stream of glog lines that a partial last line may cut
 /// anywhere, and a UTF-8 boundary is not something worth failing on.
 fn count_refusals(buf: &[u8]) -> usize {
-    buf.split(|byte| *byte == b'\n').map(count_refusal_line).sum()
+    [REGION_400, REGION_403]
+        .iter()
+        .map(|n| count_needle(buf, n.as_bytes()))
+        .sum()
 }
 
-fn count_refusal_line(buf: &[u8]) -> usize {
-    let needle = REGION_400.as_bytes();
-    let legacy = match_offsets_ci(buf, needle).count();
-    if legacy != 0 { return legacy; }
-    let key = b"\"reason\"";
-    let structured = match_offsets_ci(buf, key).filter(|index| {
-        let mut tail = &buf[*index + key.len()..];
-        while tail.first().is_some_and(u8::is_ascii_whitespace) { tail = &tail[1..]; }
-        if !tail.starts_with(b":") { return false; }
-        tail = &tail[1..];
-        while tail.first().is_some_and(u8::is_ascii_whitespace) { tail = &tail[1..]; }
-        if !tail.starts_with(b"\"") { return false; }
-        let Some(end) = tail[1..].iter().position(|byte| *byte == b'"') else { return false; };
-        std::str::from_utf8(&tail[1..1 + end]).ok().is_some_and(is_region_reason)
-    }).count();
-    let json_start = buf.iter().find(|byte| !byte.is_ascii_whitespace());
-    if structured == 0 && matches!(json_start, Some(b'{') | Some(b'[')) && json_region_reason(buf) { 1 } else { structured }
-}
-
-fn json_region_reason(body: &[u8]) -> bool {
-    fn contains_reason(value: &serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::Object(fields) => fields.iter().any(|(key, value)|
-                (key.eq_ignore_ascii_case("reason") && value.as_str().is_some_and(is_region_reason))
-                    || contains_reason(value)),
-            serde_json::Value::Array(items) => items.iter().any(contains_reason),
-            _ => false,
-        }
+fn count_needle(buf: &[u8], needle: &[u8]) -> usize {
+    if buf.len() < needle.len() {
+        return 0;
     }
-    serde_json::from_slice::<serde_json::Value>(body).ok().is_some_and(|value| contains_reason(&value))
-}
-
-pub(crate) fn is_region_refusal(body: &[u8]) -> bool {
-    count_refusals(body) != 0 || json_region_reason(body)
+    buf.windows(needle.len())
+        .filter(|w| w.eq_ignore_ascii_case(needle))
+        .count()
 }
 
 /// The language-server logs of every Antigravity product under the user's
@@ -626,102 +387,67 @@ pub(crate) fn is_region_refusal(body: &[u8]) -> bool {
 /// fork, writes `<product>\logs\<session stamp>\ls-main.log`, one folder per
 /// launch - so for it only the newest session is watched. Product folders are
 /// matched by prefix rather than listed, so a rebranded build is picked up too.
-/// The CLI (`agy`) and the extension backend write the same glog format
-/// to `~/.gemini/antigravity-cli/log` and `~/.gemini/antigravity/log`,
-/// respectively. Watch the newest `cli-*.log` from each.
+/// The CLI (`agy`) writes `~\.gemini\antigravity-cli\log\cli-<stamp>.log`, one
+/// per session, in the same glog format - found 2026-09-18, and watched from
+/// 2.14.0_1 on (before that "CLI log location unknown"). The VS Code
+/// extension's backend writes the same files under `~\.geminintigravity\log`.
 /// Public because the window holds the list rather than rebuilding it: this
 /// walks `%APPDATA%` and then the IDE's `logs` folder, which has one sub-folder
 /// per launch, and a window ticking every three seconds must not do that.
 pub fn candidate_logs() -> Vec<PathBuf> {
-    let root = profile_root();
-    #[cfg(target_os = "macos")]
-    let macos_logs = std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join("Library").join("Logs"));
-    #[cfg(not(target_os = "macos"))]
-    let macos_logs: Option<PathBuf> = None;
-
-    let gemini_root = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(|home| PathBuf::from(home).join(".gemini"));
-    candidate_logs_in(
-        root.as_deref(),
-        macos_logs.as_deref(),
-        gemini_root.as_deref(),
-        cfg!(not(target_os = "macos")),
-    )
-    .unwrap_or_default()
-}
-
-fn candidate_logs_in(
-    profile_root: Option<&Path>,
-    macos_logs: Option<&Path>,
-    gemini_root: Option<&Path>,
-    require_profile: bool,
-) -> Option<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    let entries = match profile_root.and_then(|root| fs::read_dir(root).ok()) {
-        Some(entries) => Some(entries),
-        None if require_profile => return None,
-        None => None,
+    let Some(root) = profile_root() else {
+        return Vec::new();
     };
-    if let Some(entries) = entries {
-            let mut products = 0usize;
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if !name.to_ascii_lowercase().starts_with("antigravity") {
-                    continue;
-                }
-                products += 1;
-                if products > MAX_PRODUCTS {
-                    break;
-                }
-                let logs = entry.path().join("logs");
-                let desktop = logs.join("language_server.log");
-                if desktop.is_file() {
-                    out.push(desktop);
-                }
-                if let Some(session) = newest_session(&logs) {
-                    let ide = session.join("ls-main.log");
-                    if ide.is_file() {
-                        out.push(ide);
-                    }
-                }
-            }
-    }
-    if let Some(logs_dir) = macos_logs {
-        if let Ok(entries) = fs::read_dir(logs_dir) {
-            let mut products = 0usize;
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if !name.to_ascii_lowercase().starts_with("antigravity") {
-                    continue;
-                }
-                products += 1;
-                if products > MAX_PRODUCTS {
-                    break;
-                }
-                let desktop = entry.path().join("language_server.log");
-                if desktop.is_file() && !out.contains(&desktop) {
-                    out.push(desktop);
-                }
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut products = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.to_ascii_lowercase().starts_with("antigravity") {
+            continue;
+        }
+        products += 1;
+        if products > MAX_PRODUCTS {
+            break;
+        }
+        let logs = entry.path().join("logs");
+        let desktop = logs.join("language_server.log");
+        if desktop.is_file() {
+            out.push(desktop);
+        }
+        if let Some(session) = newest_session(&logs) {
+            let ide = session.join("ls-main.log");
+            if ide.is_file() {
+                out.push(ide);
             }
         }
     }
-    if let Some(gemini_root) = gemini_root {
-        for product in ["antigravity-cli", "antigravity"] {
-            if let Some(log) = newest_cli_log(&gemini_root.join(product).join("log")) {
-                out.push(log);
-            }
+    for app_dir in CLI_APP_DIRS {
+        if let Some(cli) = newest_cli_log(app_dir) {
+            out.push(cli);
         }
     }
-    Some(out)
+    out
 }
 
-/// One backend's current session log: the newest `cli-*.log`.
-fn newest_cli_log(dir: &Path) -> Option<PathBuf> {
+/// `~/.gemini/<dir>/log` folders the `agy` backend writes `cli-<stamp>.log` to.
+/// `antigravity-cli` is the CLI's own; `antigravity` is the backend the VS Code
+/// extension (and IDE 2.6.0) downloads to `~/.gemini/bin` and starts as
+/// `agy --hub --app_data_dir=antigravity` - measured 2026-11-07: its model
+/// answers (`streamGenerateContent … ResponseID:`) and region refusals land
+/// there, in the same glog format, and nowhere else.
+const CLI_APP_DIRS: [&str; 2] = ["antigravity-cli", "antigravity"];
+
+/// One backend's current session log: the newest `cli-*.log` in its folder.
+fn newest_cli_log(app_dir: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let dir = PathBuf::from(home)
+        .join(".gemini")
+        .join(app_dir)
+        .join("log");
     fs::read_dir(dir)
         .ok()?
         .flatten()
@@ -757,15 +483,14 @@ fn profile_root() -> Option<PathBuf> {
     std::env::var("APPDATA").ok().map(PathBuf::from)
 }
 
-#[cfg(target_os = "macos")]
-fn profile_root() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
-}
-
 /// Linux keeps the same layout under `~/.config`; nothing tails it there yet
 /// because the DNS layer it would steer is not ported, but the path is right.
+/// macOS: Electron keeps the profile under `~/Library/Application Support`.
+#[cfg(target_os = "macos")]
+fn profile_root() -> Option<PathBuf> {
+    Some(crate::macos::application_support())
+}
+
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn profile_root() -> Option<PathBuf> {
     match std::env::var("XDG_CONFIG_HOME") {
@@ -1346,395 +1071,6 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    #[test]
-    fn ascii_case_offsets_match_scalar_windows() {
-        let mut false_hits = b"aX".repeat(128);
-        false_hits.extend_from_slice(b"AB");
-        let cases: &[(&[u8], &[u8])] = &[
-            (b"xxAbCyy aBc", b"aBc"),
-            (b"--Ab", b"aB"),
-            (b"aAaA", b"AA"),
-            (b"__!!", b"!"),
-            (b"", b"a"),
-            (b"a", b"ab"),
-            (&[0xee, b'A', 0xee, b'a', 0xce, b'A'], &[0xee, b'a']),
-            (&[0xc0, b'A'], &[0xe0, b'a']),
-            (&false_hits, b"aB"),
-        ];
-        for &(hay, needle) in cases {
-            let expected: Vec<_> = hay.windows(needle.len()).enumerate()
-                .filter_map(|(at, window)| window.eq_ignore_ascii_case(needle).then_some(at)).collect();
-            let actual: Vec<_> = match_offsets_ci(hay, needle).collect();
-            assert!(actual == expected, "ASCII-case offset mismatch");
-            assert!(contains_ci(hay, needle) == !expected.is_empty(), "ASCII-case containment mismatch");
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "window size must be non-zero")]
-    fn ascii_case_search_preserves_empty_needle_panic() {
-        let _ = contains_ci(b"", b"");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_open_handle_file_identity_is_stable_and_distinct() {
-        let first_path = temp_log("identity-first");
-        let second_path = temp_log("identity-second");
-        append(&first_path, SIGNAL_A);
-        append(&second_path, SIGNAL_A);
-        let first = File::open(&first_path).unwrap();
-        let same = File::open(&first_path).unwrap();
-        let second = File::open(&second_path).unwrap();
-        let a = source_id(&first, &first.metadata().unwrap()).expect("native file identity");
-        let b = source_id(&same, &same.metadata().unwrap()).expect("same native file identity");
-        let c = source_id(&second, &second.metadata().unwrap()).expect("distinct native file identity");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        drop((first, same, second));
-        let _ = fs::remove_file(first_path);
-        let _ = fs::remove_file(second_path);
-    }
-
-    const SIGNAL_A: &str = "I0901 15:09:24.000000 URL: https://aicode.googleapis.com/v1 streamGenerateContent ResponseID: a\n";
-    const SIGNAL_B: &str = "I0901 15:09:25.000000 URL: https://cloudcode-pa.googleapis.com/v1 streamGenerateContent ResponseID: b\n";
-    const SIGNAL_DROP: &str = "I0901 15:09:23.000000 URL: https://aicode.googleapis.com/v1 streamGenerateContent attempt failed (EOF)\n";
-
-    #[test]
-    fn poll_budget_skip_preserves_complete_boundary_refusal_and_fences_cut_prefix() {
-        const REFUSAL_LINE: &[u8] = b"I0901 15:09:24.000000 URL: https://aicode.googleapis.com/v1 user location is not supported\n";
-        for (name, prefix, tail_prefix) in [
-            ("budget-boundary", &b"noise\n"[..], &b""[..]),
-            ("budget-cut", &b"abcdef"[..], &b"partial\n"[..]),
-        ] {
-            let path = temp_log(name);
-            let mut cursor = TestLogCursor::default();
-            let anchor = Instant::now();
-            append(&path, SIGNAL_DROP);
-            let seed = test_poll_log(&mut cursor, &path, None, anchor);
-            assert_eq!(seed.direct_signals.len(), 1);
-            let mut tail = Vec::new();
-            tail.extend_from_slice(tail_prefix);
-            tail.extend_from_slice(REFUSAL_LINE);
-            tail.resize(MAX_READ as usize, b'x');
-            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-            file.write_all(prefix).unwrap();
-            file.write_all(&tail).unwrap();
-            drop(file);
-            let result = test_poll_log(&mut cursor, &path, None, anchor);
-            assert_eq!(result.refusals, 1);
-            assert_eq!(result.direct_signals.len(), 1);
-            assert_eq!(result.direct_signals[0].kind, DirectSignalKind::Refusal);
-            assert_eq!(result.direct_signals[0].continuity, SignalContinuity::Fence);
-            assert_eq!(result.direct_signals[0].record_start,
-                SIGNAL_DROP.len() as u64 + prefix.len() as u64 + tail_prefix.len() as u64);
-            let _ = fs::remove_file(path);
-        }
-    }
-
-    #[test]
-    fn poll_cursor_proves_separate_appends_and_preserves_answer_order() {
-        let path = temp_log("poll-cursor");
-        let mut offsets = HashMap::new();
-        let mut host = None;
-        let anchor = Instant::now();
-        append(&path, SIGNAL_DROP);
-        let (_, first) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        append(&path, SIGNAL_DROP);
-        let (_, second) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert_eq!(first.direct_signals[0].continuity, SignalContinuity::Fence);
-        if first.direct_signals[0].source.is_some() {
-            assert_eq!(second.direct_signals[0].continuity, SignalContinuity::Proven);
-        } else { assert_eq!(second.direct_signals[0].continuity, SignalContinuity::Fence); }
-        assert_eq!(first.direct_signals[0].record_end, second.direct_signals[0].record_start);
-        append(&path, SIGNAL_A);
-        let (_, answer) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        append(&path, SIGNAL_DROP);
-        let (_, drop_after) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert_eq!(answer.direct_signals[0].kind, DirectSignalKind::Answer);
-        assert_eq!(drop_after.direct_signals[0].kind, DirectSignalKind::Drop);
-        if answer.direct_signals[0].source.is_some() {
-            assert_eq!(answer.direct_signals[0].continuity, SignalContinuity::Proven);
-            assert_eq!(drop_after.direct_signals[0].continuity, SignalContinuity::Proven);
-        }
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn poll_cursor_preserves_partial_and_fences_missing_truncation_and_replay() {
-        let path = temp_log("poll-gaps");
-        let mut offsets = HashMap::new();
-        let mut host = None;
-        let anchor = Instant::now();
-        append(&path, SIGNAL_DROP);
-        let (_, first) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        let original = offsets.get(&path).unwrap().clone();
-        let half = SIGNAL_A.len() / 2;
-        append(&path, &SIGNAL_A[..half]);
-        let (_, partial) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert!(partial.direct_signals.is_empty());
-        append(&path, &SIGNAL_A[half..]);
-        let (_, complete) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        let expected = if first.direct_signals[0].source.is_some() { SignalContinuity::Proven } else { SignalContinuity::Fence };
-        assert_eq!(complete.direct_signals[0].continuity, expected);
-        // A replayed cursor is not generated by poll; receiver must deduplicate
-        // its actual source/span if a previously delivered batch is redelivered.
-        assert_eq!(first.direct_signals[0].record_start, 0);
-        assert!(original.offset > 0);
-        fs::remove_file(&path).unwrap();
-        let (_, missing) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert!(missing.direct_signals.is_empty());
-        append(&path, SIGNAL_DROP);
-        let (_, replacement) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert_eq!(replacement.direct_signals[0].continuity, SignalContinuity::Fence);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn poll_cursor_preserves_empty_and_partial_but_retains_undelivered_gap() {
-        let path = temp_log("poll-pending-gap");
-        let mut offsets = HashMap::new();
-        let mut host = None;
-        let anchor = Instant::now();
-        append(&path, SIGNAL_DROP);
-        let (_, first) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        let (_, empty) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert!(empty.direct_signals.is_empty());
-        append(&path, "ordinary line\n");
-        let (_, noise) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert!(noise.direct_signals.is_empty());
-        let half = SIGNAL_DROP.len() / 2;
-        append(&path, &SIGNAL_DROP[..half]);
-        for _ in 0..2 {
-            let (_, partial) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-            assert!(partial.direct_signals.is_empty());
-        }
-        append(&path, &SIGNAL_DROP[half..]);
-        let (_, completed) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        let expected = if first.direct_signals[0].source.is_some() { SignalContinuity::Proven } else { SignalContinuity::Fence };
-        assert_eq!(completed.direct_signals[0].continuity, expected);
-
-        fs::remove_file(&path).unwrap();
-        let _ = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        append(&path, "ordinary line\n");
-        let (_, after_gap) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert!(after_gap.direct_signals.is_empty());
-        append(&path, "another line\n");
-        let (_, more_noise) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert!(more_noise.direct_signals.is_empty());
-        append(&path, SIGNAL_DROP);
-        let (_, fenced) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert_eq!(fenced.direct_signals[0].continuity, SignalContinuity::Fence);
-        append(&path, SIGNAL_DROP);
-        let (_, after_fence) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        if fenced.direct_signals[0].source.is_some() {
-            assert_eq!(after_fence.direct_signals[0].continuity, SignalContinuity::Proven);
-        }
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn poll_cursor_fences_missing_identity_and_skipped_bytes() {
-        let path = temp_log("poll-skip");
-        let mut offsets = HashMap::new();
-        let mut host = None;
-        let anchor = Instant::now();
-        append(&path, SIGNAL_DROP);
-        let _ = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        // Simulate an unavailable prior OS identity; the next real scan still
-        // obtains its own identity from the opened handle.
-        offsets.get_mut(&path).unwrap().source = None;
-        append(&path, SIGNAL_DROP);
-        let (_, missing_id) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert_eq!(missing_id.direct_signals[0].continuity, SignalContinuity::Fence);
-        let mut data = vec![b'x'; MAX_READ as usize + 1];
-        data.push(b'\n');
-        data.extend_from_slice(SIGNAL_A.as_bytes());
-        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(&data).unwrap();
-        drop(f);
-        let (_, skipped) = poll_path(&path, &mut offsets, true, None, anchor, &mut host);
-        assert_eq!(skipped.direct_signals.len(), 1);
-        assert_eq!(skipped.direct_signals[0].continuity, SignalContinuity::Fence);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn same_poll_anchor_preserves_equal_second_tie_across_files() {
-        let first = temp_log("anchor-first");
-        let second = temp_log("anchor-second");
-        append(&first, SIGNAL_A);
-        append(&second, SIGNAL_A);
-        let anchor = Instant::now();
-        let now = Some(clock(9, 1, 15, 9, 30));
-        let (_, a) = scan_with_anchor(&first, Some(0), now, anchor, &mut None);
-        let (_, b) = scan_with_anchor(&second, Some(0), now, anchor, &mut None);
-        assert!(a.direct_signals[0].at.is_some());
-        assert_eq!(a.direct_signals[0].at, b.direct_signals[0].at);
-        if let Some(id) = a.direct_signals[0].source.clone() {
-            let mut ids = std::collections::HashSet::new();
-            assert!(ids.insert(id.clone()));
-            assert!(!ids.insert(id));
-        }
-        let _ = fs::remove_file(first);
-        let _ = fs::remove_file(second);
-    }
-
-    #[test]
-    fn direct_scan_keeps_distinct_records_and_order() {
-        let path = temp_log("direct-order");
-        append(&path, SIGNAL_DROP);
-        append(&path, SIGNAL_A);
-        append(&path, SIGNAL_DROP);
-        append(&path, SIGNAL_B);
-        append(&path, SIGNAL_A);
-        let (_, tally) = scan(&path, Some(0), Some(clock(9, 1, 15, 9, 30)), &mut None);
-        assert_eq!(tally.answers, 3);
-        assert_eq!(tally.drops, 2);
-        let signals = &tally.direct_signals;
-        assert_eq!(signals.iter().map(|s| &s.kind).collect::<Vec<_>>(), vec![&DirectSignalKind::Drop, &DirectSignalKind::Answer, &DirectSignalKind::Drop, &DirectSignalKind::Answer, &DirectSignalKind::Answer]);
-        assert_eq!(signals[1].host.as_deref(), Some("aicode.googleapis.com"));
-        assert_eq!(signals[3].host.as_deref(), Some("cloudcode-pa.googleapis.com"));
-        assert!(signals.windows(2).all(|pair| pair[0].record_end == pair[1].record_start));
-        assert_eq!(signals[0].continuity, SignalContinuity::Fence);
-        if signals[0].source.is_some() { assert_eq!(signals[1].continuity, SignalContinuity::Proven); }
-        else { assert!(signals.iter().all(|s| s.continuity == SignalContinuity::Fence)); }
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn direct_scan_fences_partial_replay_truncation_and_conflicts() {
-        let path = temp_log("direct-boundaries");
-        let half = SIGNAL_A.len() / 2;
-        append(&path, &SIGNAL_A[..half]);
-        let (offset, first) = scan(&path, Some(0), None, &mut None);
-        assert!(first.direct_signals.is_empty());
-        append(&path, &SIGNAL_A[half..]);
-        let (end, complete) = scan(&path, Some(offset), None, &mut None);
-        assert_eq!(complete.direct_signals.len(), 1);
-        assert_eq!(complete.direct_signals[0].continuity, SignalContinuity::Fence);
-        assert!(complete.direct_signals[0].at.is_none());
-        let (_, replay) = scan(&path, Some(offset), None, &mut None);
-        assert_eq!(complete.direct_signals, replay.direct_signals);
-        append(&path, SIGNAL_A);
-        let (longer_end, appended) = scan(&path, Some(end), None, &mut None);
-        assert_eq!(appended.direct_signals.len(), 1);
-        fs::write(&path, SIGNAL_DROP).unwrap();
-        assert!(fs::metadata(&path).unwrap().len() < longer_end, "fixture must shrink");
-        let (_, truncated) = scan(&path, Some(longer_end), None, &mut None);
-        assert_eq!(truncated.direct_signals.len(), 1);
-        assert_eq!(truncated.direct_signals[0].continuity, SignalContinuity::Fence);
-        let conflict = b"URL: https://aicode.googleapis.com/v1 streamGenerateContent ResponseID: a attempt failed (EOF)\n";
-        let tally = tally_signals(conflict, None, &mut None, 0, Instant::now(), None, true, false);
-        assert_eq!(tally.direct_signals.len(), 2);
-        assert!(tally.direct_signals.iter().all(|s| s.conflicting_record && s.source.is_none() && s.continuity == SignalContinuity::Fence));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn direct_scan_skips_cut_prefix_and_never_inherits_host() {
-        let path = temp_log("direct-cut");
-        append(&path, SIGNAL_A);
-        append(&path, "user location is not supported\n");
-        let (_, tally) = scan(&path, Some(1), None, &mut Some("aicode.googleapis.com".into()));
-        assert_eq!(tally.direct_signals.len(), 1);
-        assert_eq!(tally.direct_signals[0].kind, DirectSignalKind::Refusal);
-        assert_eq!(tally.direct_signals[0].host, None);
-        assert_eq!(tally.direct_signals[0].continuity, SignalContinuity::Fence);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn direct_scan_fences_rotation_and_budget_skip() {
-        let path = temp_log("direct-rotation");
-        append(&path, SIGNAL_A);
-        let (offset, _) = scan(&path, Some(0), None, &mut None);
-        fs::remove_file(&path).unwrap();
-        append(&path, SIGNAL_B);
-        let (_, rotated) = scan(&path, Some(offset + 1), None, &mut None);
-        assert_eq!(rotated.direct_signals[0].continuity, SignalContinuity::Fence);
-        let mut data = vec![b'x'; MAX_READ as usize + 1];
-        data.extend_from_slice(b"\n");
-        data.extend_from_slice(SIGNAL_A.as_bytes());
-        fs::write(&path, data).unwrap();
-        let (_, skipped) = scan(&path, Some(0), None, &mut None);
-        assert_eq!(skipped.direct_signals.len(), 1);
-        assert_eq!(skipped.direct_signals[0].continuity, SignalContinuity::Fence);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn direct_tally_add_retains_all_record_spans() {
-        let left = tally_signals(SIGNAL_A.as_bytes(), None, &mut None, 0, Instant::now(), None, true, false);
-        let right = tally_signals(SIGNAL_B.as_bytes(), None, &mut None, SIGNAL_A.len() as u64, Instant::now(), None, true, false);
-        let mut combined = left;
-        combined.add(right);
-        assert_eq!(combined.answers, 2);
-        assert_eq!(combined.direct_signals.len(), 2);
-        assert_ne!(combined.direct_signals[0].host, combined.direct_signals[1].host);
-        assert_eq!(combined.direct_signals[0].record_end, combined.direct_signals[1].record_start);
-    }
-
-    #[test]
-    fn missing_profile_retains_non_macos_early_return() {
-        assert!(candidate_logs_in(None, None, None, true).is_none());
-        assert_eq!(candidate_logs_in(None, None, None, false), Some(Vec::new()));
-    }
-
-    #[test]
-    fn candidate_logs_select_one_current_cli_log_per_backend() {
-        use std::fs::FileTimes;
-        use std::time::SystemTime;
-
-        let root = fs::canonicalize(std::env::temp_dir())
-            .unwrap()
-            .join(format!("ag_cli_log_candidates_{}", std::process::id()));
-        fs::create_dir(&root).unwrap();
-        let profile = root.join("profile");
-        fs::create_dir(&profile).unwrap();
-        let gemini_root = root.join(".gemini");
-        let cli_logs = gemini_root.join("antigravity-cli").join("log");
-        let extension_logs = gemini_root.join("antigravity").join("log");
-        let candidates = || candidate_logs_in(Some(&profile), None, Some(&gemini_root), true).unwrap();
-        let missing = candidates();
-        fs::create_dir_all(&cli_logs).unwrap();
-        let empty = candidates();
-
-        let write_log = |path: &Path, seconds_since_epoch| {
-            let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds_since_epoch);
-            File::create(path)
-                .unwrap()
-                .set_times(FileTimes::new().set_modified(modified))
-                .unwrap();
-        };
-        let cli_old = cli_logs.join("cli-old.log");
-        let cli_current = cli_logs.join("cli-current.log");
-        write_log(&cli_old, 1_600_000_000);
-        write_log(&cli_current, 1_600_000_060);
-        let cli_only = candidates();
-
-        fs::create_dir_all(&extension_logs).unwrap();
-        let extension_current = extension_logs.join("cli-current.log");
-        write_log(&extension_current, 1_600_000_000);
-        write_log(&extension_logs.join("cli-archive.log"), 1_600_000_000);
-        let both = candidates();
-        let macos_without_profile = candidate_logs_in(None, None, Some(&gemini_root), false);
-        let windows_without_profile = candidate_logs_in(None, None, Some(&gemini_root), true);
-        fs::remove_file(&cli_current).unwrap();
-        fs::remove_file(&cli_old).unwrap();
-        fs::remove_dir(&cli_logs).unwrap();
-        let extension_only = candidates();
-        fs::remove_dir_all(root).unwrap();
-
-        assert!(missing.is_empty());
-        assert!(empty.is_empty());
-        assert_eq!(cli_only, [cli_current.clone()]);
-        assert_eq!(extension_only, [extension_current.clone()]);
-        assert_eq!(both, [cli_current, extension_current]);
-        assert_eq!(macos_without_profile, Some(both));
-        assert_eq!(windows_without_profile, None);
-    }
-
     fn temp_log(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("ag_unlocker_ls_log_tests");
         fs::create_dir_all(&dir).expect("temp dir");
@@ -1752,6 +1088,26 @@ mod tests {
         f.write_all(text.as_bytes()).expect("write");
     }
 
+    #[test]
+    fn the_sign_in_refusal_403_counts_as_a_region_refusal() {
+        let body = b"{
+  \"error\": {
+    \"code\": 403,
+    \"status\": \"PERMISSION_DENIED\",
+    \"details\": [
+      {
+        \"reason\": \"UNSUPPORTED_LOCATION\",
+        \"domain\": \"cloudaicompanion.googleapis.com\"
+      }
+    ]
+  }
+}
+API Error: {Reason:UNSUPPORTED_LOCATION}
+";
+        assert_eq!(count_refusals(body), 1);
+        assert_eq!(count_refusals(b"PERMISSION_DENIED (code 403): You do not have a valid license"), 0);
+    }
+
     const REFUSAL: &str = "E0901 15:09:24.614939 1 stream_handler.go:101] FAILED_PRECONDITION (code 400): User location is not supported for the API use.\n";
     const NOISE: &str = "I0901 15:09:24.639090 1 server.go:427] Setting GOMAXPROCS to 4\n";
 
@@ -1763,15 +1119,6 @@ mod tests {
 
     #[test]
     fn counts_the_refusal_case_insensitively_and_nothing_else() {
-        assert_eq!(count_refusals(br#"{"reason": "UNSUPPORTED_LOCATION"}"#), 1);
-        assert_eq!(count_refusals(br#"{"reason": "LOCATION_NOT_ELIGIBLE"}"#), 1);
-        assert_eq!(count_refusals(br#"{"other": "unsupported_location"}"#), 0);
-        assert_eq!(count_refusals(br#"user location is not supported {"reason":"unsupported_location"}"#), 1);
-        assert_eq!(count_refusals(b"user location is not supported\n{\"reason\":\"unsupported_location\"}"), 2);
-        assert!(is_region_refusal(br#"{"error":{"reason":"unsupported_\u006cocation"}}"#));
-        assert_eq!(url_host(b"URL: https://AICODE.GOOGLEAPIS.COM.:443/v1"), Some("aicode.googleapis.com.".into()));
-        assert!(url_host(b"URL: https://aicode.googleapis.com:8443/v1").is_none());
-        assert!(url_host(b"URL: https://x.aicode.googleapis.com/v1").is_none());
         assert_eq!(count_refusals(REFUSAL.as_bytes()), 1);
         assert_eq!(count_refusals(NOISE.as_bytes()), 0);
         assert_eq!(
@@ -1784,53 +1131,6 @@ mod tests {
             "the status alone is not the region gate"
         );
         assert_eq!(count_refusals(b""), 0);
-    }
-
-    #[test]
-    fn endpoint_feedback_never_inherits_a_previous_url() {
-        let mut last = Some("cloudcode-pa.googleapis.com".to_owned());
-        let missing = tally(b"user location is not supported\n", None, &mut last);
-        assert_eq!(missing.refused_host.as_deref(), Some("cloudcode-pa.googleapis.com"));
-        assert_eq!(missing.refused_endpoint, None);
-        let explicit = tally(b"URL: https://aicode.googleapis.com/x user location is not supported\n", None, &mut last);
-        assert_eq!(explicit.refused_endpoint, None, "an unplaceable line cannot authorize endpoint feedback");
-        assert_eq!(url_host(b"URL: https://aicode.googleapis.com/x"), Some("aicode.googleapis.com".into()));
-    }
-
-    #[test]
-    fn endpoint_events_never_borrow_an_older_or_conflicting_host() {
-        let newer = EndpointEvent { age: Duration::from_secs(1), host: None };
-        let older = EndpointEvent { age: Duration::from_secs(2), host: Some("cloudcode-pa.googleapis.com".into()) };
-        for answer in [false, true] {
-            let mut tally = Tally::default();
-            let make = |event: Option<EndpointEvent>| if answer {
-                Tally { answers: 1, answered_ago: event.as_ref().map(|event| event.age), answered_endpoint: event, ..Tally::default() }
-            } else {
-                Tally { refusals: 1, refused_ago: event.as_ref().map(|event| event.age), refused_endpoint: event, ..Tally::default() }
-            };
-            tally.add(make(Some(newer.clone())));
-            tally.add(make(Some(older.clone())));
-            let mut unplaceable = make(None);
-            if answer { unplaceable.answered_host = Some("aicode.googleapis.com".into()); }
-            else { unplaceable.refused_host = Some("aicode.googleapis.com".into()); }
-            tally.add(unplaceable);
-            let selected = if answer { &tally.answered_endpoint } else { &tally.refused_endpoint };
-            assert_eq!(selected.as_ref(), Some(&newer));
-            tally.add(make(Some(EndpointEvent { age: newer.age, host: Some("aicode.googleapis.com".into()) })));
-            let selected = if answer { &tally.answered_endpoint } else { &tally.refused_endpoint };
-            assert_eq!(selected.as_ref(), Some(&newer));
-        }
-    }
-
-    #[test]
-    fn endpoint_url_requires_https_exact_host_and_port() {
-        for host in ["cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com", "aicode.googleapis.com"] {
-            assert!(url_host(format!("URL: https://{host}:443/v1").as_bytes()).is_some());
-            assert!(url_host(format!("URL: https://{host}:8443/v1").as_bytes()).is_none());
-            assert!(url_host(format!("URL: http://{host}/v1").as_bytes()).is_none());
-            assert!(url_host(format!("URL: https://x.{host}/v1").as_bytes()).is_none());
-        }
-        assert_eq!(url_host(b"URL: HTTPS://AICODE.GOOGLEAPIS.COM.:443/v1"), Some("aicode.googleapis.com.".into()));
     }
 
     fn refusals_in(path: &Path, from: Option<u64>) -> (u64, usize) {

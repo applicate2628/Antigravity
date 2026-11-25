@@ -1,8 +1,12 @@
-//! One Settings writer at a time. Windows internal roles never acquire it.
+//! One window at a time: a newer copy closes the older ones when it starts.
 //!
-//! The Windows main thread retains a cooperative current-user native lease.
-//! Internal gateway/runtime roles dispatch before this owner is constructed.
-//! Linux retains its established process-selection behavior below.
+//! Two windows of different versions share one settings file, one service and
+//! one set of switches, and each re-applies its own idea of them on every
+//! refresh - an older one put its relay and route state back under the newer
+//! one, and the model did not answer until the old window was closed by hand
+//! (field report, 2026-10-15). Only *windows* are matched: the services run
+//! under other names (`ag_dns.exe` on Windows, `ag_proxy` on Linux) and carry a
+//! flag, and the pkexec helper carries one too, so none of them is touched.
 
 /// Whether a process image name is a copy of the unlocker window: the exe this
 /// one runs as, or any other release of it (`AG_<version>.exe` on Windows).
@@ -29,7 +33,6 @@ fn is_service_args(args: &[String]) -> bool {
 
 /// Closes every other copy of the window. Best effort and silent: a copy that
 /// refuses to die (another user's, a higher integrity level) is left running.
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn close_others() {
     let Ok(me) = std::env::current_exe() else {
         return;
@@ -42,24 +45,37 @@ pub fn close_others() {
 }
 
 #[cfg(target_os = "windows")]
-#[path = "gui_instance.rs"]
-mod gui_instance;
-#[cfg(target_os = "windows")]
-pub(crate) use gui_instance::{
-    receive_replacement, request_elevation, ElevationProgress, GuiApplyContinuation, GuiRetirementInputRef,
-    GuiCurrentExpectation, GuiReplacementAction, GuiReplacementReady, GuiReplacementTarget, ReceivedReplacement,
-    GuiTargetExpectation, GuiTargetKind, GUI_REPLACEMENT_FLAG,
-};
+mod platform {
+    use std::process::Command;
 
-#[cfg(target_os = "windows")]
-pub fn acquire_gui_writer(
-) -> Result<crate::windows_coordinator::windows_installation::SettingsWriterLease, String> {
-    let lease = crate::windows_coordinator::windows_installation::admit_settings_writer()?;
-    gui_instance::receive_visible_gui_conflicts()?;
-    Ok(lease)
+    use super::is_window_name;
+
+    pub fn close_others(own: &str) {
+        let mut cmd = Command::new("tasklist");
+        cmd.args(["/FO", "CSV", "/NH"]);
+        let Ok(out) = crate::utils::no_window(&mut cmd).output() else {
+            return;
+        };
+        let me = std::process::id();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut cols = line.split("\",\"").map(|c| c.trim_matches('"'));
+            let (Some(name), Some(pid)) = (cols.next(), cols.next()) else {
+                continue;
+            };
+            let Ok(pid) = pid.parse::<u32>() else {
+                continue;
+            };
+            if pid == me || !is_window_name(name, own) {
+                continue;
+            }
+            let mut kill = Command::new("taskkill");
+            kill.args(["/F", "/PID", &pid.to_string()]);
+            let _ = crate::utils::no_window(&mut kill).output();
+        }
+    }
 }
 
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+#[cfg(not(target_os = "windows"))]
 mod platform {
     use super::{is_service_args, is_window_name};
 
@@ -108,73 +124,6 @@ mod platform {
         }
     }
 }
-
-#[cfg(target_os = "macos")]
-mod platform {
-    use std::fs::{File, OpenOptions};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-    pub fn acquire_gui_writer() -> Result<File, String> {
-        let directory = crate::dns_forwarder::checked_log_dir()?;
-        if !directory.is_absolute() {
-            return Err("путь настроек должен быть абсолютным".into());
-        }
-        std::fs::create_dir_all(&directory).map_err(|error| format!("каталог настроек: {error}"))?;
-        acquire_writer(&directory, "settings-writer.lock", libc::O_NOFOLLOW)
-    }
-
-    pub fn acquire_watchdog_worker() -> Result<File, String> {
-        let directory = crate::background::install_dir()?;
-        let held_directory = crate::background::watchdog_directory()?;
-        let file = acquire_writer(&directory, "watchdog-worker.lock", libc::O_NOFOLLOW_ANY)?;
-        crate::background::recheck_watchdog_directory(&held_directory)?;
-        Ok(file)
-    }
-
-    pub(crate) fn acquire_proxy_environment_writer() -> Result<(std::path::PathBuf, File), String> {
-        let home = crate::dns_forwarder::unix_user_home()?;
-        if !home.is_absolute() { return Err("домашний каталог для блокировки прокси должен быть абсолютным".into()); }
-        let guard = crate::background::in_owned_macos_directory(&home, || {
-            acquire_writer(&home, ".agunlocker-proxy-environment.lock", libc::O_NOFOLLOW_ANY | libc::O_NONBLOCK)
-        })
-            .map_err(|error| format!("блокировка среды прокси: {error}"))?;
-        Ok((home, guard))
-    }
-
-    fn acquire_writer(directory: &std::path::Path, name: &str, flags: i32) -> Result<File, String> {
-        let path = directory.join(name);
-        let file = OpenOptions::new().read(true).write(true).create(true).mode(0o600)
-            .custom_flags(flags | libc::O_CLOEXEC).open(&path)
-            .map_err(|error| format!("файл блокировки настроек: {error}"))?;
-        let recheck = || -> Result<(), String> {
-            let held = file.metadata().map_err(|error| error.to_string())?;
-            let entry = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-            if !held.is_file() || !entry.is_file() || held.uid() != unsafe { libc::geteuid() }
-                || held.nlink() != 1 || held.len() != 0 || held.mode() & 0o077 != 0
-                || held.dev() != entry.dev() || held.ino() != entry.ino()
-                || held.uid() != entry.uid() || held.mode() != entry.mode() || entry.nlink() != 1 {
-                return Err("небезопасная или изменённая блокировка настроек".into());
-            }
-            Ok(())
-        };
-        recheck()?;
-        file.try_lock().map_err(|error| match error {
-            std::fs::TryLockError::WouldBlock => "другое окно уже использует настройки".to_owned(),
-            std::fs::TryLockError::Error(error) => format!("блокировка настроек: {error}"),
-        })?;
-        recheck()?;
-        Ok(file)
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub use platform::acquire_gui_writer;
-
-#[cfg(target_os = "macos")]
-pub use platform::acquire_watchdog_worker;
-
-#[cfg(target_os = "macos")]
-pub(crate) use platform::acquire_proxy_environment_writer;
 
 #[cfg(test)]
 mod tests {

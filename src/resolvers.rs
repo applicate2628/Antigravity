@@ -1,252 +1,14 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::dns_client;
 use rustls::pki_types::ServerName;
 use rustls::ClientConnection;
-
-/// A parent retains this work before its outer query/open/warm worker starts.
-/// The receiver thread is supplied by that actual parent, not guessed here.
-pub(crate) struct ResolverWork {
-    state: Mutex<ResolverWorkState>,
-    cancelled: ResolverCancellation,
-    receiver: thread::Thread,
-    #[cfg(test)]
-    fixture: Option<Arc<ResolverFixture>>,
-    #[cfg(test)]
-    force_expired_after_attempt: bool,
-    #[cfg(test)]
-    legacy_settings: Option<crate::settings::Settings>,
-    #[cfg(test)]
-    legacy_input_observer: Option<Arc<dyn Fn(usize, &[u8], &DnsSourceWitness) + Send + Sync>>,
-}
-
-#[derive(Clone)]
-struct ResolverCancellation { local: Arc<AtomicBool>, parent: Option<Arc<AtomicBool>> }
-impl ResolverCancellation {
-    fn is_cancelled(&self) -> bool { self.local.load(Ordering::Acquire) || self.parent.as_ref().is_some_and(|parent| parent.load(Ordering::Acquire)) }
-}
-
-#[cfg(test)]
-struct ResolverFixture {
-    provider: Arc<dyn Fn(usize, &[u8]) -> Option<Vec<u8>> + Send + Sync>,
-    reference: Arc<dyn Fn(Ipv4Addr, &[u8]) -> Result<Vec<u8>, String> + Send + Sync>,
-    liveness: Arc<dyn Fn(IpAddr) -> bool + Send + Sync>,
-    learning: Option<Arc<dyn Fn() + Send + Sync>>,
-}
-
-struct ResolverWorkState { closed: bool, entries: Vec<ResolverEntry> }
-struct ResolverEntry { kind: ResolverChildKind, thread: Option<thread::ThreadId>, state: ResolverEntryState }
-enum ResolverEntryState {
-    Reserved,
-    Running(Option<thread::JoinHandle<ResolverChildResult>>),
-    Finished(Option<thread::Result<ResolverChildResult>>),
-    StartFailed(Option<std::io::Error>),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResolverChildKind {
-    Liveness(IpAddr), Provider(usize), Reference(Ipv4Addr), ControlProvider(usize), ControlReference(Ipv4Addr),
-}
-
-/// Packets/errors stay in private receiving state; no Debug transcript is exposed.
-pub(crate) enum ResolverObservation {
-    Reply(Vec<u8>), NoAnswer, Error(String), Reachable(bool), Cancelled,
-}
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResolverDelivery { Sent, NoMessage, ReceiverGone, Cancelled }
-pub(crate) struct ResolverChildResult {
-    pub(crate) observation: ResolverObservation,
-    pub(crate) delivery: ResolverDelivery,
-    pub(crate) cancelled: bool,
-}
-pub(crate) enum ResolverTermination {
-    StartFailed(std::io::Error),
-    Finished(thread::Result<ResolverChildResult>),
-}
-pub(crate) struct ResolverTerminal {
-    pub(crate) kind: ResolverChildKind,
-    pub(crate) thread: Option<thread::ThreadId>,
-    /// Owner cancellation sampled at transfer; not physical-completion proof.
-    pub(crate) cancelled: bool,
-    pub(crate) result: ResolverTermination,
-}
-
-struct ResolverWake(thread::Thread);
-impl Drop for ResolverWake { fn drop(&mut self) { self.0.unpark(); } }
-
-impl ResolverWork {
-    pub(crate) fn new(receiver: thread::Thread) -> Self {
-        Self::new_inner(receiver, None)
-    }
-    pub(crate) fn with_cancellation(receiver: thread::Thread, parent: Arc<AtomicBool>) -> Self {
-        Self::new_inner(receiver, Some(parent))
-    }
-    fn new_inner(receiver: thread::Thread, parent: Option<Arc<AtomicBool>>) -> Self {
-        Self { state: Mutex::new(ResolverWorkState { closed: false, entries: Vec::new() }),
-            cancelled: ResolverCancellation { local: Arc::new(AtomicBool::new(false)), parent }, receiver,
-            #[cfg(test)] fixture: None, #[cfg(test)] force_expired_after_attempt: false,
-            #[cfg(test)] legacy_settings: None, #[cfg(test)] legacy_input_observer: None }
-    }
-    pub(crate) fn cancel(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.closed = true;
-        self.cancelled.local.store(true, Ordering::Release);
-        drop(state);
-        self.receiver.unpark();
-    }
-    pub(crate) fn is_cancelled(&self) -> bool { self.cancelled.is_cancelled() }
-    /// Admit a short in-memory publication while serialized with `cancel`.
-    /// The closure must not perform I/O or re-enter this `ResolverWork`. When it
-    /// takes a routes-state lock, the order is work state then routes state.
-    /// A separate parent cancellation flag is sampled at entry; only `cancel`
-    /// itself is serialized with this guard.
-    pub(crate) fn with_open<T>(&self, operation: impl FnOnce() -> T) -> Result<T, String> {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.closed || self.is_cancelled() {
-            return Err("resolver work admission is closed; launched children remain owned".into());
-        }
-        let result = operation();
-        drop(state);
-        Ok(result)
-    }
-    fn check_open(&self) -> Result<(), String> {
-        if self.is_cancelled() { Err("resolver work cancelled; launched children remain owned".into()) } else { Ok(()) }
-    }
-    fn spawn(&self, kind: ResolverChildKind, operation: impl FnOnce(&ResolverCancellation) -> ResolverChildResult + Send + 'static) -> Result<(), String> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.closed || self.is_cancelled() { return Err("resolver work admission is closed; launched children remain owned".into()); }
-        state.entries.try_reserve(1).map_err(|error| error.to_string())?;
-        let index = state.entries.len();
-        state.entries.push(ResolverEntry { kind, thread: None, state: ResolverEntryState::Reserved });
-        let cancelled = self.cancelled.clone();
-        let receiver = self.receiver.clone();
-        let started = thread::Builder::new().spawn(move || {
-            let _wake = ResolverWake(receiver);
-            if cancelled.is_cancelled() {
-                return ResolverChildResult { observation: ResolverObservation::Cancelled,
-                    delivery: ResolverDelivery::Cancelled, cancelled: true };
-            }
-            let mut result = operation(&cancelled);
-            result.cancelled = cancelled.is_cancelled();
-            result
-        });
-        match started {
-            Ok(handle) => {
-                let id = handle.thread().id();
-                state.entries[index].state = ResolverEntryState::Running(Some(handle));
-                state.entries[index].thread = Some(id);
-                Ok(())
-            }
-            Err(error) => {
-                state.entries[index].state = ResolverEntryState::StartFailed(Some(error));
-                Err("resolver child did not start; actual launch error retained".into())
-            }
-        }
-    }
-    /// Join only actual finished handles. Joined terminals remain owed here.
-    pub(crate) fn poll_finished(&self) -> Result<(), String> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        for entry in &mut state.entries {
-            if let ResolverEntryState::Running(handle) = &mut entry.state {
-                if handle.as_ref().is_some_and(|handle| handle.is_finished()) {
-                    let result = handle.take().expect("finished resolver handle").join();
-                    entry.state = ResolverEntryState::Finished(Some(result));
-                }
-            }
-        }
-        Ok(())
-    }
-    /// Transfer terminals to the real parent's retained buffer before its
-    /// fallible interpretation. Transfer alone is not semantic receiving.
-    pub(crate) fn receive_finished(&self) -> Result<Vec<ResolverTerminal>, String> {
-        let mut result = Vec::new();
-        self.receive_into(&mut result)?;
-        Ok(result)
-    }
-    /// Append directly into an already retained parent buffer. Capacity is
-    /// reserved before any owned terminal leaves this work.
-    pub(crate) fn receive_into(&self, result: &mut Vec<ResolverTerminal>) -> Result<(), String> {
-        self.poll_finished()?;
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        result.try_reserve(state.entries.len()).map_err(|error| error.to_string())?;
-        for entry in &mut state.entries {
-            let terminal = match &mut entry.state {
-                ResolverEntryState::Finished(value) => value.take().map(ResolverTermination::Finished),
-                ResolverEntryState::StartFailed(value) => value.take().map(ResolverTermination::StartFailed),
-                _ => None,
-            };
-            if let Some(terminal) = terminal {
-                result.push(ResolverTerminal { kind: entry.kind, thread: entry.thread, cancelled: self.is_cancelled(), result: terminal });
-            }
-        }
-        state.entries.retain(|entry| !matches!(entry.state, ResolverEntryState::Finished(None) | ResolverEntryState::StartFailed(None)));
-        Ok(())
-    }
-    pub(crate) fn has_unreceived(&self) -> bool {
-        !self.state.lock().unwrap_or_else(|error| error.into_inner()).entries.is_empty()
-    }
-}
-
-fn check_resolver_work(work: Option<&ResolverWork>) -> Result<(), String> { work.map_or(Ok(()), ResolverWork::check_open) }
-
-/// The legacy adapter intentionally keeps its old detached-thread behavior.
-/// Explicit configured callers always supply an externally retained work.
-fn launch_resolver(work: Option<&ResolverWork>, kind: ResolverChildKind,
-    operation: impl FnOnce(&ResolverCancellation) -> ResolverChildResult + Send + 'static) -> Result<(), String> {
-    if let Some(work) = work { return work.spawn(kind, operation); }
-    thread::spawn(move || operation(&ResolverCancellation { local: Arc::new(AtomicBool::new(false)), parent: None }));
-    Ok(())
-}
-
-fn deliver_resolver<T>(sender: &mpsc::Sender<T>, value: T, cancelled: &ResolverCancellation) -> ResolverDelivery {
-    if cancelled.is_cancelled() { return ResolverDelivery::Cancelled; }
-    match sender.send(value) { Ok(()) => ResolverDelivery::Sent, Err(_) => ResolverDelivery::ReceiverGone }
-}
-
-/// Receive the actual private terminal batch into its parent's current result.
-/// Normal losing replies/no-answer/closed receivers are observations, not a
-/// reason to revoke the already selected winner or authorize another route.
-pub(crate) fn receive_terminals(terminals: &mut Vec<ResolverTerminal>, facts: &mut Vec<String>,
-    panics: &mut Vec<Box<dyn std::any::Any + Send>>) -> Result<(), String> {
-    let received = terminals.iter().map(|terminal| {
-        let kind = match terminal.kind {
-            ResolverChildKind::Liveness(_) => "liveness", ResolverChildKind::Provider(_) => "provider",
-            ResolverChildKind::Reference(_) => "reference", ResolverChildKind::ControlProvider(_) => "control-provider",
-            ResolverChildKind::ControlReference(_) => "control-reference",
-        };
-        let result = match &terminal.result {
-            ResolverTermination::StartFailed(error) => format!("start={:?}/{:?}", error.kind(), error.raw_os_error()),
-            ResolverTermination::Finished(Err(_)) => "unwound; original payload retained".into(),
-            ResolverTermination::Finished(Ok(result)) => {
-                let observation = match &result.observation {
-                    ResolverObservation::Reply(reply) => format!("reply_bytes={}", reply.len()),
-                    ResolverObservation::NoAnswer => "no answer".into(),
-                    ResolverObservation::Error(error) => format!("error={error}"),
-                    ResolverObservation::Reachable(value) => format!("reachable={value}"),
-                    ResolverObservation::Cancelled => "cancelled before operation".into(),
-                };
-                let delivery = match result.delivery {
-                    ResolverDelivery::Sent => "sent", ResolverDelivery::NoMessage => "no-message",
-                    ResolverDelivery::ReceiverGone => "receiver-gone", ResolverDelivery::Cancelled => "cancelled",
-                };
-                format!("{observation}; delivery={delivery}; child_cancelled={}", result.cancelled)
-            }
-        };
-        format!("resolver {kind}; thread={:?}; owner_cancelled={}; {result}", terminal.thread, terminal.cancelled)
-    }).collect::<Vec<_>>();
-    panics.try_reserve(terminals.len()).map_err(|error| error.to_string())?;
-    *facts = received;
-    for terminal in terminals.drain(..) {
-        if let ResolverTermination::Finished(Err(payload)) = terminal.result { panics.push(payload); }
-    }
-    Ok(())
-}
 
 // Choosing an unblock resolver at query time instead of trusting one forever.
 //
@@ -280,43 +42,276 @@ pub enum Transport {
     Udp,
     /// DNS-over-HTTPS. Reachable only through the relay, never by Windows.
     Doh(&'static crate::doh::Endpoint),
-    /// The user's own DNS server(s), captured from `settings.custom_dns` with
-    /// the selected providers. Like a DoH provider it carries empty `v4`/`v6`:
+    /// The user's own DNS server(s), read from `settings.custom_dns` at query
+    /// time (`custom_dns_servers`). Like a DoH provider it carries empty `v4`/`v6`:
     /// the addresses are not ours to put into an NRPT rule, only the relay asks.
     Custom,
 }
 
-/// The user's own DNS servers: IPv4 literals split on whitespace, commas and
-/// semicolons. Loopback, unspecified and multicast addresses are dropped - the
-/// relay itself listens on 127.0.0.53, and pointing it at itself would loop.
-pub fn parse_custom_dns(text: &str) -> Vec<Ipv4Addr> {
-    parse_custom_dns_input(text).0
+/// The slot the user fills in by hand. The name is what every switch, the
+/// deny-list and the saved order are keyed by, so it never changes.
+pub const CUSTOM_NAME: &str = "свой DNS";
+
+/// One server the user typed into the «свой DNS» slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomServer {
+    /// A plain resolver on UDP:53 - `77.88.8.8`.
+    Udp(Ipv4Addr),
+    /// DNS-over-HTTPS - `https://dns.example.com/dns-query`. Always port 443.
+    Doh { host: String, path: String },
+    /// DNS-over-TLS - `tls://dns.example.com` (port 853) or `tls://host:port`.
+    Dot { host: String, port: u16 },
 }
 
-/// A nonblank setting must supply at least one server and every token must be valid.
-/// Repeated addresses are kept once, in first occurrence order.
-pub(crate) fn parse_custom_dns_setting(text: &str) -> Option<Vec<Ipv4Addr>> {
-    let (servers, all_valid) = parse_custom_dns_input(text);
-    (all_valid && !servers.is_empty()).then_some(servers)
-}
-
-fn parse_custom_dns_input(text: &str) -> (Vec<Ipv4Addr>, bool) {
-    let mut servers = Vec::new();
-    let mut all_valid = true;
-    for part in text
-        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-        .filter(|part| !part.is_empty())
-    {
-        match part.parse::<Ipv4Addr>() {
-            Ok(ip) if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast() => {
-                if !servers.contains(&ip) {
-                    servers.push(ip);
+impl CustomServer {
+    /// The one way a server is written back to the settings file and the field.
+    pub fn text(&self) -> String {
+        match self {
+            CustomServer::Udp(ip) => ip.to_string(),
+            CustomServer::Doh { host, path } => format!("https://{}{}", host, path),
+            CustomServer::Dot { host, port } => {
+                if *port == 853 {
+                    format!("tls://{}", host)
+                } else {
+                    format!("tls://{}:{}", host, port)
                 }
             }
-            _ => all_valid = false,
         }
     }
-    (servers, all_valid)
+}
+
+/// A hostname or an IPv4 literal; nothing that could smuggle a path, a port, a
+/// credential or an IPv6 bracket into a place that expects a bare name.
+fn valid_host(host: &str) -> Result<(), String> {
+    if host.is_empty() || host.len() > 253 {
+        return Err("пустой адрес сервера".into());
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        || host.starts_with('.')
+        || host.starts_with('-')
+        || host.ends_with('-')
+    {
+        return Err(format!("«{}» — не адрес сервера", host));
+    }
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+            return Err(format!("{} не подходит: это не внешний сервер", host));
+        }
+    } else if !host.contains('.') {
+        return Err(format!("«{}» — не адрес сервера", host));
+    }
+    Ok(())
+}
+
+/// One word of the field. The reason is Russian and complete: it is shown to the
+/// user as it is.
+pub fn parse_custom_server(token: &str) -> Result<CustomServer, String> {
+    let token = token.trim();
+    let lower = token.to_ascii_lowercase();
+    if let Some(rest) = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("doh://"))
+    {
+        // Keep the path's own case: only the scheme and host are case-blind.
+        let rest_orig = &token[token.len() - rest.len()..];
+        let (hostport, path) = match rest_orig.find('/') {
+            Some(i) => (&rest_orig[..i], &rest_orig[i..]),
+            None => (rest_orig, "/dns-query"),
+        };
+        let host = match hostport.rsplit_once(':') {
+            Some((h, "443")) => h,
+            Some(_) => return Err(format!("{}: для DoH поддерживается только порт 443", token)),
+            None => hostport,
+        };
+        let host = host.to_ascii_lowercase();
+        valid_host(&host)?;
+        if path.len() > 200
+            || path
+                .chars()
+                .any(|c| c.is_whitespace() || c == '?' || c == '#')
+        {
+            return Err(format!("{}: путь DoH указан неверно", token));
+        }
+        return Ok(CustomServer::Doh {
+            host,
+            path: path.to_string(),
+        });
+    }
+    if let Some(rest) = lower
+        .strip_prefix("tls://")
+        .or_else(|| lower.strip_prefix("dot://"))
+    {
+        let rest = rest.trim_end_matches('/');
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((h, p)) => (
+                h,
+                p.parse::<u16>()
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or_else(|| format!("{}: неверный порт", token))?,
+            ),
+            None => (rest, 853),
+        };
+        valid_host(host)?;
+        return Ok(CustomServer::Dot {
+            host: host.to_string(),
+            port,
+        });
+    }
+    if lower.starts_with("http://") {
+        return Err(format!("{}: для DoH нужен https://", token));
+    }
+    if lower.contains("://") {
+        return Err(format!(
+            "{}: поддерживаются IPv4-адрес, https:// (DoH) и tls:// (DoT)",
+            token
+        ));
+    }
+    match token.parse::<Ipv4Addr>() {
+        Ok(ip) => {
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+                // The relay itself listens on 127.0.0.53: pointing it at itself loops.
+                Err(format!("{} не подходит: это не внешний сервер", token))
+            } else {
+                Ok(CustomServer::Udp(ip))
+            }
+        }
+        Err(_) => Err(format!(
+            "{}: нужен IPv4-адрес, https://… (DoH) или tls://… (DoT)",
+            token
+        )),
+    }
+}
+
+fn custom_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+}
+
+/// The user's own servers, strictly: any word that is not a server is an error
+/// naming it, and nothing is kept. Duplicates collapse. At most 8 - a field is
+/// not a list manager, and every one costs a handshake when it is the one asked.
+pub fn parse_custom_dns(text: &str) -> Result<Vec<CustomServer>, String> {
+    let mut out: Vec<CustomServer> = Vec::new();
+    for word in custom_words(text) {
+        let server = parse_custom_server(word)?;
+        if !out.contains(&server) {
+            out.push(server);
+        }
+    }
+    if out.len() > 8 {
+        return Err("Слишком много серверов — не больше 8.".into());
+    }
+    Ok(out)
+}
+
+/// What is stored, read leniently: a word that no longer parses is skipped
+/// rather than taking the rest down with it.
+pub fn custom_dns_servers() -> Vec<CustomServer> {
+    let text = crate::settings::custom_dns_cached();
+    let mut out: Vec<CustomServer> = Vec::new();
+    for word in custom_words(&text) {
+        if let Ok(s) = parse_custom_server(word) {
+            if !out.contains(&s) && out.len() < 8 {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// Addresses of a DoH/DoT host, remembered for ten minutes. An IPv4 literal is
+/// its own answer. Resolved by the system, which is fine here: the three gate
+/// hosts are the only names the relay ever has to keep away from it (D25), and
+/// the certificate still has to prove the name, so a poisoned answer fails
+/// the handshake rather than becoming anything.
+fn host_addrs(host: &str) -> Vec<IpAddr> {
+    use std::net::ToSocketAddrs;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return vec![ip];
+    }
+    static MEMO: Mutex<Option<HashMap<String, (Vec<IpAddr>, Instant)>>> = Mutex::new(None);
+    const KEEP: Duration = Duration::from_secs(600);
+    if let Ok(g) = MEMO.lock() {
+        if let Some((ips, at)) = g.as_ref().and_then(|m| m.get(host)) {
+            if at.elapsed() < KEEP && !ips.is_empty() {
+                return ips.clone();
+            }
+        }
+    }
+    let mut ips: Vec<IpAddr> = (host, 443u16)
+        .to_socket_addrs()
+        .map(|it| it.map(|a| a.ip()).collect())
+        .unwrap_or_default();
+    // IPv4 first: a line without IPv6 must not spend its slice on one.
+    ips.sort_by_key(|ip| ip.is_ipv6());
+    ips.dedup();
+    if let Ok(mut g) = MEMO.lock() {
+        let m = g.get_or_insert_with(HashMap::new);
+        if ips.is_empty() {
+            // Keep serving the last good answer rather than none.
+            if let Some((old, _)) = m.get(host) {
+                return old.clone();
+            }
+        } else {
+            m.insert(host.to_string(), (ips.clone(), Instant::now()));
+        }
+    }
+    ips
+}
+
+/// A DoH endpoint for a name typed by the user. `doh::Endpoint` borrows its
+/// strings for `'static` (the built-in ones are literals), so each distinct
+/// (host, path) is leaked once and handed out again - a handful of bytes for
+/// the life of the process, bounded by what the field can hold.
+fn custom_doh_endpoint(host: &str, path: &str) -> &'static crate::doh::Endpoint {
+    static MADE: Mutex<Vec<&'static crate::doh::Endpoint>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ep) = made.iter().find(|e| e.host == host && e.path == path) {
+        return ep;
+    }
+    let ep: &'static crate::doh::Endpoint = Box::leak(Box::new(crate::doh::Endpoint {
+        host: Box::leak(host.to_string().into_boxed_str()),
+        path: Box::leak(path.to_string().into_boxed_str()),
+        addrs: &[],
+    }));
+    made.push(ep);
+    ep
+}
+
+fn ask_custom(
+    server: &CustomServer,
+    query: &[u8],
+    if_index: u32,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let mut reply = match server {
+        CustomServer::Udp(ip) => dns_client::query_raw_via(query, *ip, if_index, timeout).ok()?,
+        CustomServer::Doh { host, path } => {
+            let ips = host_addrs(host);
+            crate::doh::query_at(custom_doh_endpoint(host, path), &ips, query, timeout).ok()?
+        }
+        CustomServer::Dot { host, port } => {
+            let ips = host_addrs(host);
+            crate::dot::query(host, *port, &ips, query, timeout).ok()?
+        }
+    };
+    // Re-stamp the transaction id: a DoH/DoT server may answer with another one,
+    // and the reply is handed to Windows over UDP:53, where a mismatch is a drop.
+    if reply.len() >= 2 && query.len() >= 2 {
+        reply[0] = query[0];
+        reply[1] = query[1];
+    }
+    Some(reply)
+}
+
+/// Whether the «свой DNS» slot is empty. Without anything in it the slot is not
+/// a provider at all: nothing to ask.
+fn custom_is_empty() -> bool {
+    custom_dns_servers().is_empty()
 }
 
 /// One unblock service. Addresses are tried in order; the first that answers
@@ -339,10 +334,6 @@ pub struct Provider {
 /// the name they already see in the log line.
 pub fn provider_names() -> Vec<&'static str> {
     PROVIDERS.iter().map(|p| p.name).collect()
-}
-
-fn provider_index(name: &str) -> Option<usize> {
-    PROVIDERS.iter().position(|provider| provider.name.eq_ignore_ascii_case(name))
 }
 
 pub const PROVIDERS: &[Provider] = &[
@@ -372,21 +363,11 @@ pub const PROVIDERS: &[Provider] = &[
         v6: &[],
         transport: Transport::Doh(&DNS_AI),
     },
+    // Last on purpose: the user's own server(s). Not a provider at all until
+    // they type one in: `provider_disabled` keeps it out of the race, the
+    // rotation and the head-of-list choice while the field is empty.
     Provider {
-        name: "comss.one",
-        v4: &["83.220.169.155", "212.109.195.93", "195.133.25.16"],
-        v6: &[],
-        transport: Transport::Udp,
-    },
-    Provider {
-        name: "geohide.ru",
-        v4: &["45.155.204.190", "37.230.192.51"],
-        v6: &["2a0c:9300:0:54::1"],
-        transport: Transport::Udp,
-    },
-    // Last on purpose: the user's own server, empty until they type one in.
-    Provider {
-        name: "свой DNS",
+        name: CUSTOM_NAME,
         v4: &[],
         v6: &[],
         transport: Transport::Custom,
@@ -606,365 +587,7 @@ const PROXY_SET_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Proxy addresses learned per provider, with the moment the entry was last
 /// refreshed.
-static PROXY_SET: Mutex<Option<HashMap<usize, ProxySet>>> = Mutex::new(None);
-
-#[derive(Default)]
-struct ProxySet {
-    legacy: Option<(Vec<IpAddr>, Instant)>,
-    witnessed: Vec<(IpAddr, DnsCandidateOrigin)>,
-}
-
-/// Effective inputs captured before a provider query. Never logged or serialized.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct DnsSourceWitness {
-    selected: Vec<usize>,
-    custom: Vec<Ipv4Addr>,
-    missing_defaults: bool,
-    rotate: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DnsSourceError { Missing, Broken, Unavailable, StateUnavailable, Cancelled, Deadline, SourceTimeout, NoReference, NoAnswer, InvalidInput, InputChanged }
-
-#[derive(Clone, Copy)]
-pub(crate) enum DnsMissingPolicy { RequireSettings, LegacyDefaults }
-
-#[derive(Clone)]
-struct DnsCandidateOrigin {
-    provider: usize,
-    inputs: DnsSourceWitness,
-    observed: Instant,
-    expires: Instant,
-    target: Option<String>,
-}
-
-#[derive(Clone)]
-pub(crate) struct DnsCandidate {
-    pub(crate) ip: Ipv4Addr,
-    origins: Vec<DnsCandidateOrigin>,
-}
-
-#[cfg(test)]
-pub(crate) fn test_source_witness() -> DnsSourceWitness {
-    witness_from_read(crate::settings::Read::Parsed(crate::settings::Settings::default()), DnsMissingPolicy::RequireSettings)
-        .expect("default synthetic settings")
-}
-
-#[cfg(test)]
-pub(crate) fn test_source_witness_with_providers(names: &[&str], rotate: bool) -> DnsSourceWitness {
-    assert!(!names.is_empty());
-    assert!(names.iter().all(|name| PROVIDERS.iter().any(|provider| provider.name.eq_ignore_ascii_case(name))));
-    let mut settings = crate::settings::Settings::default();
-    settings.provider_order = names.iter().map(|name| (*name).to_owned()).collect();
-    settings.disabled_providers = PROVIDERS.iter().filter(|provider|
-        !names.iter().any(|name| provider.name.eq_ignore_ascii_case(name))).map(|provider| provider.name.to_owned()).collect();
-    settings.rotate_providers = rotate;
-    settings.custom_dns = "192.0.2.53".into();
-    witness_from_read(crate::settings::Read::Parsed(settings), DnsMissingPolicy::RequireSettings).expect("synthetic settings")
-}
-
-#[cfg(test)]
-pub(crate) fn test_source_candidate(ip: Ipv4Addr, witness: &DnsSourceWitness) -> DnsCandidate {
-    let provider = *witness.selected.first().expect("synthetic witness needs an enabled provider");
-    test_candidate_for_index(ip, witness, provider)
-}
-
-#[cfg(test)]
-pub(crate) fn test_source_candidate_for_provider(ip: Ipv4Addr, witness: &DnsSourceWitness, provider: &str) -> DnsCandidate {
-    let idx = provider_index(provider).expect("unknown synthetic provider");
-    assert!(witness.selected.contains(&idx), "synthetic provider must be selected");
-    test_candidate_for_index(ip, witness, idx)
-}
-
-#[cfg(test)]
-fn test_candidate_for_index(ip: Ipv4Addr, witness: &DnsSourceWitness, provider: usize) -> DnsCandidate {
-    let observed = Instant::now();
-    DnsCandidate { ip, origins: vec![DnsCandidateOrigin { provider, inputs: witness.clone(), observed,
-        expires: observed + PROXY_SET_TTL, target: None }] }
-}
-
-/// Missing defaults apply only to an already selected legacy/default provider.
-pub(crate) fn current_witness(policy: DnsMissingPolicy) -> Result<DnsSourceWitness, DnsSourceError> {
-    witness_from_read(crate::settings::read(), policy)
-}
-
-fn witness_from_read(read: crate::settings::Read, policy: DnsMissingPolicy) -> Result<DnsSourceWitness, DnsSourceError> {
-    let (settings, missing_defaults) = match read {
-        crate::settings::Read::Parsed(s) => (s, false),
-        crate::settings::Read::Missing if matches!(policy, DnsMissingPolicy::LegacyDefaults) => (crate::settings::Settings::default(), true),
-        crate::settings::Read::Missing => return Err(DnsSourceError::Missing),
-        crate::settings::Read::Broken => return Err(DnsSourceError::Broken),
-        crate::settings::Read::Unavailable => return Err(DnsSourceError::Unavailable),
-    };
-    Ok(witness_from_settings(&settings, missing_defaults))
-}
-
-fn witness_from_settings(settings: &crate::settings::Settings, missing_defaults: bool) -> DnsSourceWitness {
-    let custom = parse_custom_dns(&settings.custom_dns);
-    let mut selected: Vec<usize> = usable_providers(settings, !custom.is_empty())
-        .filter_map(|p| provider_index(p.name))
-        .collect();
-    if !settings.rotate_providers { selected.truncate(1); }
-    let custom = if selected.iter().any(|idx| matches!(&PROVIDERS[*idx].transport, Transport::Custom)) {
-        custom
-    } else { Vec::new() };
-    DnsSourceWitness { selected, custom, missing_defaults, rotate: settings.rotate_providers }
-}
-
-fn legacy_inputs_for_work(work: Option<&ResolverWork>) -> DnsSourceWitness {
-    #[cfg(test)]
-    if let Some(settings) = work.and_then(|work| work.legacy_settings.as_ref()) {
-        return witness_from_settings(settings, false);
-    }
-    let _ = work;
-    witness_from_settings(&crate::settings::routing_snapshot(), false)
-}
-
-impl DnsCandidate {
-    /// Preserve each origin and its own observation time when combining sources.
-    pub(crate) fn merge(&mut self, other: Self) -> bool {
-        if self.ip != other.ip { return false; }
-        if self.origins.iter().filter_map(|origin| origin.target.as_ref()).any(|host|
-            other.origins.iter().filter_map(|origin| origin.target.as_ref()).any(|other_host| other_host != host)) { return false; }
-        let now = Instant::now();
-        self.origins.retain(|origin| origin.expires > now);
-        for origin in other.origins.into_iter().filter(|origin| origin.expires > now) {
-            if let Some(existing) = self.origins.iter_mut().find(|existing|
-                existing.provider == origin.provider && existing.inputs == origin.inputs && existing.target == origin.target) {
-                if origin.expires > existing.expires { *existing = origin; }
-            } else {
-                self.origins.push(origin);
-            }
-        }
-        true
-    }
-}
-
-fn origin_is_current(origin: &DnsCandidateOrigin, witness: &DnsSourceWitness) -> bool {
-    witness.selected.contains(&origin.provider)
-        && origin.inputs == *witness
-        && Instant::now() < origin.expires
-}
-
-pub(crate) fn source_is_current(candidate: &DnsCandidate, witness: &DnsSourceWitness) -> Result<bool, DnsSourceError> {
-    Ok(candidate.origins.iter().any(|origin| origin_is_current(origin, witness)))
-}
-
-pub(crate) fn current_candidates(witness: &DnsSourceWitness) -> Result<Vec<DnsCandidate>, DnsSourceError> {
-    let guard = PROXY_SET.lock().map_err(|_| DnsSourceError::StateUnavailable)?;
-    Ok(candidates_from_sets(guard.as_ref(), witness))
-}
-
-/// The Mac relay's maintenance owner is the only producer of these witnessed
-/// discovery inputs. A changed egress needs fresh discovery and qualification.
-#[cfg(target_os = "macos")]
-pub(crate) fn invalidate_witnessed_candidates() {
-    if let Ok(mut guard) = PROXY_SET.lock() {
-        if let Some(sets) = guard.as_mut() {
-            for set in sets.values_mut() { set.witnessed.clear(); }
-        }
-    }
-}
-
-fn candidates_from_sets(map: Option<&HashMap<usize, ProxySet>>, witness: &DnsSourceWitness) -> Vec<DnsCandidate> {
-    let mut out: Vec<DnsCandidate> = Vec::new();
-    if let Some(map) = map {
-        for idx in &witness.selected {
-            if let Some(set) = map.get(idx) {
-                for (address, origin) in &set.witnessed {
-                    let IpAddr::V4(ip) = address else { continue; };
-                    if !is_public_v4(*ip) || !origin_is_current(origin, witness) { continue; }
-                    if let Some(candidate) = out.iter_mut().find(|candidate| candidate.ip == *ip) {
-                        candidate.merge(DnsCandidate { ip: *ip, origins: vec![origin.clone()] });
-                    } else {
-                        out.push(DnsCandidate { ip: *ip, origins: vec![origin.clone()] });
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-#[derive(Default)]
-pub(crate) struct DnsDiscoveryCursor {
-    inputs: Option<DnsSourceWitness>,
-    host: String,
-    pin: Option<u32>,
-    control: Option<&'static str>,
-    phase: DiscoveryPhase,
-    position: usize,
-    reference: Vec<IpAddr>,
-    reference_until: Option<Instant>,
-    resume_provider: usize,
-    zero_ttl: bool,
-}
-
-#[derive(Clone, Copy, Default)]
-enum DiscoveryPhase { #[default] Initial, ControlReference, ControlProviders, TargetReference, TargetProviders, Done }
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DiscoveryState { Pending, Exhausted }
-
-pub(crate) struct DiscoveryStep {
-    pub(crate) candidates: Vec<DnsCandidate>,
-    pub(crate) state: DiscoveryState,
-}
-
-fn discovery_check(deadline: Instant, work: Option<&ResolverWork>) -> Result<Duration, DnsSourceError> {
-    if work.is_some_and(ResolverWork::is_cancelled) { return Err(DnsSourceError::Cancelled); }
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() { return Err(DnsSourceError::Deadline); }
-    Ok(left)
-}
-
-fn discovery_after_attempt(deadline: Instant, work: Option<&ResolverWork>) -> Result<(), DnsSourceError> {
-    if work.is_some_and(ResolverWork::is_cancelled) { return Err(DnsSourceError::Cancelled); }
-    #[cfg(test)]
-    if work.is_some_and(|work| work.force_expired_after_attempt) { return Err(DnsSourceError::SourceTimeout); }
-    if Instant::now() >= deadline { return Err(DnsSourceError::SourceTimeout); }
-    Ok(())
-}
-
-fn valid_discovery_host(host: &str) -> bool {
-    !host.is_empty() && host.len() <= 253 && host.is_ascii()
-        && host.split('.').all(|label| !label.is_empty() && label.len() <= 63
-            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            && !label.starts_with('-') && !label.ends_with('-'))
-}
-
-fn target_candidates(idx: usize, addrs: Vec<IpAddr>, reference: &[IpAddr], controls: &[DnsCandidate],
-    host: &str, witness: &DnsSourceWitness, observed: Instant, ttl: Duration) -> Vec<DnsCandidate> {
-    let proxy: Vec<IpAddr> = controls.iter().filter(|candidate|
-        candidate.origins.iter().any(|origin| origin.provider == idx && origin.target.is_none() && origin_is_current(origin, witness)))
-        .map(|candidate| IpAddr::V4(candidate.ip)).collect();
-    addrs.into_iter().filter_map(|address| {
-        let IpAddr::V4(ip) = address else { return None; };
-        if !is_public_v4(ip) || proxy.is_empty() || classify(&[address], reference, &proxy) != Verdict::Substituted { return None; }
-        let proof_expiry = controls.iter().filter(|candidate| block(&IpAddr::V4(candidate.ip)) == block(&address))
-            .flat_map(|candidate| candidate.origins.iter())
-            .filter(|origin| origin.provider == idx && origin.target.is_none() && origin_is_current(origin, witness))
-            .map(|origin| origin.expires).max()?;
-        let expires = observed.checked_add(ttl.min(PROXY_SET_TTL))?.min(proof_expiry);
-        Some(DnsCandidate { ip, origins: vec![DnsCandidateOrigin { provider: idx, inputs: witness.clone(), observed, expires, target: Some(host.to_owned()) }] })
-    }).collect()
-}
-
-/// One serial I/O step. The cursor owns no worker, socket, or persistent DNS cache.
-pub(crate) fn discover_next(witness: &DnsSourceWitness, host: &str, cursor: &mut DnsDiscoveryCursor,
-    pin: u32, budget: Duration, work: Option<&ResolverWork>) -> Result<DiscoveryStep, DnsSourceError> {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if !valid_discovery_host(&host) { return Err(DnsSourceError::InvalidInput); }
-    let deadline = Instant::now().checked_add(budget).ok_or(DnsSourceError::InvalidInput)?;
-    if let Some(existing) = cursor.inputs.as_ref() {
-        if existing != witness || cursor.host != host || cursor.pin != Some(pin) { return Err(DnsSourceError::InputChanged); }
-    } else {
-        cursor.inputs = Some(witness.clone());
-        cursor.host = host;
-        cursor.pin = Some(pin);
-        cursor.control = Some(CONTROL_NAMES[ROTATION.fetch_add(1, Ordering::Relaxed) % CONTROL_NAMES.len()]);
-    }
-    discovery_check(deadline, work)?;
-    discover_step(witness, cursor, pin, deadline, work, false)
-}
-
-fn discover_step(witness: &DnsSourceWitness, cursor: &mut DnsDiscoveryCursor, pin: u32,
-    deadline: Instant, work: Option<&ResolverWork>, paired: bool) -> Result<DiscoveryStep, DnsSourceError> {
-    let pending = |candidates| DiscoveryStep { candidates, state: DiscoveryState::Pending };
-    match cursor.phase {
-        DiscoveryPhase::Initial => {
-            cursor.phase = DiscoveryPhase::ControlReference;
-            Ok(pending(current_candidates(witness)?))
-        }
-        DiscoveryPhase::ControlReference | DiscoveryPhase::TargetReference => {
-            let control = matches!(cursor.phase, DiscoveryPhase::ControlReference);
-            if cursor.position >= REFERENCE_V4.len() { return Err(DnsSourceError::NoReference); }
-            let server = REFERENCE_V4[cursor.position].parse::<Ipv4Addr>().map_err(|_| DnsSourceError::InvalidInput)?;
-            let name = if control { cursor.control.ok_or(DnsSourceError::InvalidInput)? } else { &cursor.host };
-            let query = dns_client::build_query(name, ROTATION.fetch_add(1, Ordering::Relaxed) as u16);
-            let timeout = discovery_check(deadline, work)?.min(QUERY_TIMEOUT);
-            #[cfg(test)]
-            let reply = work.and_then(|work| work.fixture.as_ref()).map(|fixture| (fixture.reference)(server, &query))
-                .unwrap_or_else(|| dns_client::query_raw_via(&query, server, pin, timeout));
-            #[cfg(not(test))]
-            let reply = dns_client::query_raw_via(&query, server, pin, timeout);
-            cursor.position += 1;
-            discovery_after_attempt(deadline, work)?;
-            let usable = reply.ok().and_then(|reply| {
-                let ttl = dns_client::answer_ttl(&reply)?;
-                Some((dns_client::answer_addrs(&reply), Duration::from_secs(ttl.into()).min(ANSWER_TTL)))
-            });
-            if let Some((usable, ttl)) = usable.filter(|(addresses, _)| addresses.iter().any(|address| matches!(address, IpAddr::V4(ip) if !REFERENCE_STUBS.contains(ip)))) {
-                cursor.reference = usable;
-                cursor.reference_until = if ttl.is_zero() { Some(deadline) } else { Instant::now().checked_add(ttl) };
-                cursor.zero_ttl = ttl.is_zero();
-                cursor.position = cursor.resume_provider;
-                cursor.resume_provider = 0;
-                cursor.phase = if control { DiscoveryPhase::ControlProviders } else { DiscoveryPhase::TargetProviders };
-                discover_step(witness, cursor, pin, deadline, work, true)
-            } else if cursor.position == REFERENCE_V4.len() {
-                Err(DnsSourceError::NoReference)
-            } else { Ok(pending(Vec::new())) }
-        }
-        DiscoveryPhase::ControlProviders | DiscoveryPhase::TargetProviders => {
-            let control = matches!(cursor.phase, DiscoveryPhase::ControlProviders);
-            let reference_until = cursor.reference_until.ok_or(DnsSourceError::NoReference)?;
-            if !paired && Instant::now() >= reference_until {
-                cursor.resume_provider = cursor.position;
-                cursor.position = 0;
-                cursor.reference.clear();
-                cursor.reference_until = None;
-                cursor.phase = if control { DiscoveryPhase::ControlReference } else { DiscoveryPhase::TargetReference };
-                return Ok(pending(Vec::new()));
-            }
-            if cursor.position >= witness.selected.len() {
-                cursor.position = 0;
-                cursor.reference.clear();
-                cursor.reference_until = None;
-                cursor.phase = if control { DiscoveryPhase::TargetReference } else { DiscoveryPhase::Done };
-                return Ok(DiscoveryStep { candidates: Vec::new(), state: if control { DiscoveryState::Pending } else { DiscoveryState::Exhausted } });
-            }
-            let idx = witness.selected[cursor.position];
-            let name = if control { cursor.control.ok_or(DnsSourceError::InvalidInput)? } else { &cursor.host };
-            let query = dns_client::build_query(name, ROTATION.fetch_add(1, Ordering::Relaxed) as u16);
-            let io_deadline = deadline;
-            let timeout = discovery_check(io_deadline, work)?.min(QUERY_TIMEOUT);
-            let mut started = false;
-            #[cfg(test)]
-            let reply = work.and_then(|work| work.fixture.as_ref()).map(|fixture| { started = true; (fixture.provider)(idx, &query) })
-                .unwrap_or_else(|| ask_provider_with_inputs(&PROVIDERS[idx], &query, pin, timeout, work.map(|work| &work.cancelled), Some(witness), Some(io_deadline), Some(&mut started)));
-            #[cfg(not(test))]
-            let reply = ask_provider_with_inputs(&PROVIDERS[idx], &query, pin, timeout, work.map(|work| &work.cancelled), Some(witness), Some(io_deadline), Some(&mut started));
-            if !started { discovery_check(deadline, work)?; }
-            cursor.position += 1;
-            if cursor.zero_ttl {
-                cursor.resume_provider = cursor.position;
-                cursor.position = 0;
-                cursor.reference_until = None;
-                cursor.phase = if control { DiscoveryPhase::ControlReference } else { DiscoveryPhase::TargetReference };
-                cursor.zero_ttl = false;
-            }
-            discovery_after_attempt(deadline, work)?;
-            let reply = reply.ok_or(DnsSourceError::NoAnswer)?;
-            let observed = Instant::now();
-            let addrs = dns_client::answer_addrs(&reply);
-            if control {
-                if classify(&addrs, &cursor.reference, &[]) == Verdict::Substituted {
-                    learn_witnessed_proxy_addrs(idx, &addrs, witness)?;
-                    let candidates = current_candidates(witness)?.into_iter().filter(|candidate|
-                        addrs.contains(&IpAddr::V4(candidate.ip)) && candidate.origins.iter().any(|origin| origin.provider == idx)).collect();
-                    return Ok(pending(candidates));
-                }
-                return Ok(pending(Vec::new()));
-            }
-            let controls = current_candidates(witness)?;
-            let ttl = dns_client::answer_ttl(&reply).ok_or(DnsSourceError::NoAnswer)?;
-            let candidates = target_candidates(idx, addrs, &cursor.reference, &controls, &cursor.host, witness, observed, Duration::from_secs(ttl.into()));
-            Ok(pending(candidates))
-        }
-        DiscoveryPhase::Done => Ok(DiscoveryStep { candidates: Vec::new(), state: DiscoveryState::Exhausted }),
-    }
-}
+static PROXY_SET: Mutex<Option<HashMap<usize, (Vec<IpAddr>, Instant)>>> = Mutex::new(None);
 
 /// A substituted address is only useful if the client can actually open a TLS
 /// connection to it, and that does not follow from answering DNS: geohide hands
@@ -1281,11 +904,6 @@ fn reachable(addr: IpAddr, budget: Duration, sni: Option<&str>) -> bool {
 /// is affordable on a timer and not while Windows is counting to one. It is what
 /// keeps the cached verdict from outliving the thing it describes.
 fn dead_addrs(addrs: &[IpAddr], fresh: bool, sni: Option<&str>) -> Vec<IpAddr> {
-    dead_addrs_with_work(addrs, fresh, sni, None).expect("legacy liveness launch behavior")
-}
-
-fn dead_addrs_with_work(addrs: &[IpAddr], fresh: bool, sni: Option<&str>, work: Option<&ResolverWork>) -> Result<Vec<IpAddr>, String> {
-    check_resolver_work(work)?;
     let mut dead = Vec::new();
     let mut unknown = Vec::new();
     for a in addrs {
@@ -1296,7 +914,7 @@ fn dead_addrs_with_work(addrs: &[IpAddr], fresh: bool, sni: Option<&str>, work: 
         }
     }
     if unknown.is_empty() {
-        return Ok(dead);
+        return dead;
     }
 
     // Generous when the warm loop is asking, tight when a client is waiting.
@@ -1311,30 +929,22 @@ fn dead_addrs_with_work(addrs: &[IpAddr], fresh: bool, sni: Option<&str>, work: 
         let tx = tx.clone();
         let addr = *a;
         let sni = sni.map(|s| s.to_string());
-        #[cfg(test)]
-        let fixture = work.and_then(|work| work.fixture.clone());
-        launch_resolver(work, ResolverChildKind::Liveness(addr), move |cancelled| {
-            #[cfg(test)]
-            let ok = fixture.as_ref().map(|fixture| (fixture.liveness)(addr)).unwrap_or_else(|| reachable(addr, budget, sni.as_deref()));
-            #[cfg(not(test))]
+        thread::spawn(move || {
             let ok = reachable(addr, budget, sni.as_deref());
-            let delivery = deliver_resolver(&tx, (addr, ok), cancelled);
-            ResolverChildResult { observation: ResolverObservation::Reachable(ok), delivery, cancelled: false }
-        })?;
+            tx.send((addr, ok)).ok();
+        });
     }
     drop(tx);
 
     let deadline = Instant::now() + budget;
     let mut answered: Vec<IpAddr> = Vec::new();
     while answered.len() < unknown.len() {
-        check_resolver_work(work)?;
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
         }
         match rx.recv_timeout(left) {
             Ok((addr, alive)) => {
-                check_resolver_work(work)?;
                 answered.push(addr);
                 remember_liveness(addr, alive);
                 if !alive {
@@ -1352,14 +962,12 @@ fn dead_addrs_with_work(addrs: &[IpAddr], fresh: bool, sni: Option<&str>, work: 
     // sitting there would mask a probe that never came back - which is the bug
     // this whole parameter exists to fix.
     for a in unknown {
-        check_resolver_work(work)?;
         if !answered.contains(&a) {
             remember_liveness(a, false);
             dead.push(a);
         }
     }
-    check_resolver_work(work)?;
-    Ok(dead)
+    dead
 }
 
 /// Cuts unreachable addresses out of a substituted answer.
@@ -1368,22 +976,17 @@ fn dead_addrs_with_work(addrs: &[IpAddr], fresh: bool, sni: Option<&str>, work: 
 /// and needs no vetting, and probing it would put a TCP connection on every
 /// name the relay ever sees for nothing.
 fn drop_dead_addrs(reply: Vec<u8>, fresh: bool, sni: Option<&str>) -> Vec<u8> {
-    drop_dead_addrs_with_work(reply, fresh, sni, None).expect("legacy liveness launch behavior")
-}
-
-fn drop_dead_addrs_with_work(reply: Vec<u8>, fresh: bool, sni: Option<&str>, work: Option<&ResolverWork>) -> Result<Vec<u8>, String> {
-    check_resolver_work(work)?;
     let addrs = dns_client::answer_addrs(&reply);
     if addrs.len() < 2 {
         // With a single address there is nothing to fall through to, so
         // removing it would turn a slow answer into no answer.
-        return Ok(reply);
+        return reply;
     }
-    let dead = dead_addrs_with_work(&addrs, fresh, sni, work)?;
+    let dead = dead_addrs(&addrs, fresh, sni);
     if dead.is_empty() {
-        return Ok(reply);
+        return reply;
     }
-    Ok(dns_client::without_addrs(&reply, &dead).unwrap_or(reply))
+    dns_client::without_addrs(&reply, &dead).unwrap_or(reply)
 }
 
 /// What is currently known about a provider's proxy addresses.
@@ -1393,7 +996,7 @@ fn known_proxy_addrs(idx: usize) -> Vec<IpAddr> {
     };
     guard
         .as_ref()
-        .and_then(|m| m.get(&idx)).and_then(|set| set.legacy.as_ref())
+        .and_then(|m| m.get(&idx))
         .filter(|(_, at)| at.elapsed() < PROXY_SET_TTL)
         .map(|(addrs, _)| addrs.clone())
         .unwrap_or_default()
@@ -1406,7 +1009,7 @@ fn proxy_addrs_are_stale(idx: usize) -> bool {
     };
     guard
         .as_ref()
-        .and_then(|m| m.get(&idx)).and_then(|set| set.legacy.as_ref())
+        .and_then(|m| m.get(&idx))
         .map_or(true, |(_, at)| at.elapsed() >= PROXY_SET_TTL)
 }
 
@@ -1422,8 +1025,9 @@ fn learn_proxy_addrs(idx: usize, addrs: Vec<IpAddr>) {
     }
     if let Ok(mut guard) = PROXY_SET.lock() {
         let map = guard.get_or_insert_with(HashMap::new);
-        let entry = map.entry(idx).or_default().legacy
-            .get_or_insert_with(|| (Vec::new(), Instant::now()));
+        let entry = map
+            .entry(idx)
+            .or_insert_with(|| (Vec::new(), Instant::now()));
         for a in addrs {
             if !entry.0.contains(&a) {
                 entry.0.push(a);
@@ -1433,26 +1037,24 @@ fn learn_proxy_addrs(idx: usize, addrs: Vec<IpAddr>) {
     }
 }
 
-fn learn_witnessed_proxy_addrs(idx: usize, addrs: &[IpAddr], witness: &DnsSourceWitness) -> Result<(), DnsSourceError> {
-    if !witness.selected.contains(&idx) || addrs.is_empty() { return Ok(()); }
-    {
-        let mut guard = PROXY_SET.lock().map_err(|_| DnsSourceError::StateUnavailable)?;
-        let set = guard.get_or_insert_with(HashMap::new).entry(idx).or_default();
-        let now = Instant::now();
-        set.witnessed.retain(|(_, origin)| origin.expires > now);
-        for &address in addrs {
-            if let Some((_, origin)) = set.witnessed.iter_mut().find(|(old, origin)| *old == address && origin.inputs == *witness) {
-                origin.observed = now;
-                origin.expires = now + PROXY_SET_TTL;
-            } else {
-                set.witnessed.push((address, DnsCandidateOrigin { provider: idx, inputs: witness.clone(), observed: now, expires: now + PROXY_SET_TTL, target: None }));
-            }
+/// Forgets every remembered choice and answer once the pool's settings have
+/// changed since they were made, so a switch in the window acts on the very next
+/// query instead of after the cache expires (up to `CHOICE_TTL`).
+fn sync_with_settings() {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let now = crate::settings::pool_epoch();
+    if SEEN.swap(now, Ordering::Relaxed) != now {
+        if let Ok(mut g) = CHOICE.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = ANSWERS.lock() {
+            *g = None;
         }
     }
-    Ok(())
 }
 
 fn cached_choice(key: &(String, u16)) -> Option<(usize, Verdict)> {
+    sync_with_settings();
     let guard = CHOICE.lock().ok()?;
     let map = guard.as_ref()?;
     let (idx, verdict, at) = map.get(key)?;
@@ -1495,6 +1097,7 @@ fn cached_answer(
     stale: bool,
     from_client: bool,
 ) -> Option<(Vec<u8>, &'static str, Verdict)> {
+    sync_with_settings();
     let key = answer_key(query)?;
     let mut guard = ANSWERS.lock().ok()?;
     let hit = guard.as_mut()?.get_mut(&key)?;
@@ -1599,40 +1202,41 @@ fn warm_queries(names: &[&str]) -> Vec<Vec<u8>> {
 /// does arrive is answered out of memory instead of racing three providers and
 /// probing addresses while Windows counts to one.
 pub fn warm(names: &[&str], if_index: u32) {
-    warm_with_work(names, if_index, None).expect("legacy resolver launch behavior")
-}
-
-pub(crate) fn warm_owned(names: &[&str], if_index: u32, work: &ResolverWork) -> Result<(), String> {
-    warm_with_work(names, if_index, Some(work))
-}
-
-fn warm_with_work(names: &[&str], if_index: u32, work: Option<&ResolverWork>) -> Result<(), String> {
-    check_resolver_work(work)?;
-    let inputs = legacy_inputs_for_work(work);
-    ensure_proxy_sets_learned_with_inputs(if_index, work, &inputs)?;
     for mut query in warm_queries(names) {
-        check_resolver_work(work)?;
         let id = ROTATION.fetch_add(1, Ordering::Relaxed) as u16;
         query[0..2].copy_from_slice(&id.to_be_bytes());
-        let hit = resolve_upstream_with_inputs(&query, if_index, false, work, &inputs)?;
-        check_resolver_work(work)?;
-        note_served_a(&query, &hit);
+        refresh(&query, if_index);
     }
-    check_resolver_work(work)
 }
 
-fn usable_providers(settings: &crate::settings::Settings, custom_usable: bool) -> impl Iterator<Item = &'static Provider> + '_ {
-    in_order(&settings.provider_order).into_iter().filter(move |p| {
-        settings.provider_enabled(p.name) && (custom_usable || !matches!(&p.transport, Transport::Custom))
-    })
-}
-
-/// The provider that would answer with rotation disabled. An empty Custom slot
-/// keeps its saved position and switch but has no address to ask.
-pub(crate) fn first_usable_provider(settings: &crate::settings::Settings) -> Option<&'static str> {
-    usable_providers(settings, !parse_custom_dns(&settings.custom_dns).is_empty())
-        .next()
+/// Sends `query` to every address of one provider in turn, stopping at the
+/// first that answers.
+/// Whether the user switched this provider off in the window.
+///
+/// Checked here, at the single point every racing path goes through, rather than
+/// by rebuilding the candidate list in each of them — the loops index `PROVIDERS`
+/// directly in half a dozen places and one of them would have been missed. A
+/// provider that is off simply never answers, which is a state the race already
+/// handles: it is what a dead front-end looks like.
+///
+/// The deny-list only ever *subtracts*, which is what keeps this safe: I22 says a
+/// rule's fallbacks list only providers measured to substitute that name, and a
+/// subset of a measured set is still measured. Adding one would not be.
+///
+/// Takes the settings cache's own lock and calls back into nothing, so it cannot
+/// take part in the reentrancy that I50 forbids.
+/// With rotation off, only this provider may answer: the first one in pool order
+/// the user has not switched off.
+///
+/// Pool order, not "whichever answered last" — the list is ordered by measured
+/// substitution, so its head is the one most likely to still be substituting.
+fn only_provider() -> Option<&'static str> {
+    let disabled = crate::settings::disabled_providers_cached();
+    in_user_order()
+        .into_iter()
         .map(|p| p.name)
+        .filter(|n| *n != CUSTOM_NAME || !custom_is_empty())
+        .find(|n| !disabled.iter().any(|d| d.eq_ignore_ascii_case(n)))
 }
 
 /// The pool laid out the way the user arranged it.
@@ -1654,10 +1258,6 @@ const LEAD_PROVIDER: &str = "dns-ai.ru";
 
 fn in_user_order() -> Vec<&'static Provider> {
     let wanted = crate::settings::provider_order_cached();
-    in_order(&wanted)
-}
-
-fn in_order(wanted: &[String]) -> Vec<&'static Provider> {
     let mut out: Vec<&'static Provider> = Vec::new();
     // Lead with the owner's service unless the user placed it themselves.
     let user_placed_lead = wanted.iter().any(|n| n.eq_ignore_ascii_case(LEAD_PROVIDER));
@@ -1666,7 +1266,7 @@ fn in_order(wanted: &[String]) -> Vec<&'static Provider> {
             out.push(p);
         }
     }
-    for name in wanted {
+    for name in &wanted {
         if let Some(p) = PROVIDERS.iter().find(|p| p.name.eq_ignore_ascii_case(name)) {
             if !out.iter().any(|q| q.name == p.name) {
                 out.push(p);
@@ -1698,8 +1298,8 @@ pub fn udp_provider_names() -> Vec<&'static str> {
 }
 
 /// The provider names in the user's order — what the window's list draws.
-pub fn ordered_provider_names(order: &[String]) -> Vec<&'static str> {
-    in_order(order).into_iter().map(|p| p.name).collect()
+pub fn ordered_provider_names() -> Vec<&'static str> {
+    in_user_order().into_iter().map(|p| p.name).collect()
 }
 
 /// Switched off by name in the window.
@@ -1709,55 +1309,39 @@ fn denied(name: &str) -> bool {
         .any(|d| d.eq_ignore_ascii_case(name))
 }
 
+fn provider_disabled(name: &str) -> bool {
+    if denied(name) {
+        return true;
+    }
+    // The user's slot with nothing in it: there is no server to ask, and with
+    // rotation off it must not be taken for the head of the list either.
+    if name == CUSTOM_NAME && custom_is_empty() {
+        return true;
+    }
+    // Rotation off: everything below the head of the list is treated exactly the
+    // way a switched-off provider is, so the race, the fallback list and the
+    // NRPT nameservers all narrow together instead of disagreeing.
+    if !crate::settings::rotation_enabled() {
+        return only_provider() != Some(name);
+    }
+    false
+}
+
 fn ask_provider(
     provider: &Provider,
     query: &[u8],
     if_index: u32,
     timeout: Duration,
 ) -> Option<Vec<u8>> {
-    ask_provider_cancellable(provider, query, if_index, timeout, None)
-}
-
-fn ask_provider_cancellable(provider: &Provider, query: &[u8], if_index: u32, timeout: Duration, cancelled: Option<&ResolverCancellation>) -> Option<Vec<u8>> {
-    ask_provider_with_inputs(provider, query, if_index, timeout, cancelled, None, None, None)
-}
-
-fn query_custom_with_inputs<F>(servers: &[Ipv4Addr], timeout: Duration, cancelled: Option<&ResolverCancellation>, deadline: Option<Instant>, mut query: F) -> Option<Vec<u8>>
-where F: FnMut(Ipv4Addr, Duration) -> Option<Vec<u8>> {
-    for &ip in servers {
-        if cancelled.is_some_and(ResolverCancellation::is_cancelled) { return None; }
-        let left = deadline.map_or(timeout, |until| timeout.min(until.saturating_duration_since(Instant::now())));
-        if left.is_zero() { return None; }
-        if let Some(reply) = query(ip, left) { return Some(reply); }
-    }
-    None
-}
-
-fn ask_provider_with_inputs(provider: &Provider, query: &[u8], if_index: u32, timeout: Duration, cancelled: Option<&ResolverCancellation>, witness: Option<&DnsSourceWitness>, deadline: Option<Instant>, mut started: Option<&mut bool>) -> Option<Vec<u8>> {
-    let stopped = || cancelled.is_some_and(ResolverCancellation::is_cancelled);
-    let remaining = || deadline.map_or(timeout, |until| timeout.min(until.saturating_duration_since(Instant::now())));
-    if stopped() { return None; }
-    let legacy_inputs;
-    let inputs = match witness {
-        Some(inputs) => inputs,
-        None => {
-            legacy_inputs = legacy_inputs_for_work(None);
-            &legacy_inputs
-        }
-    };
-    if !provider_index(provider.name).is_some_and(|idx| inputs.selected.contains(&idx)) {
+    if provider_disabled(provider.name) {
         return None;
     }
     match provider.transport {
         Transport::Udp => {
             for server in provider.v4 {
-                if stopped() { return None; }
-                let timeout = remaining();
-                if timeout.is_zero() { return None; }
                 let Ok(ip) = server.parse::<Ipv4Addr>() else {
                     continue;
                 };
-                if let Some(started) = started.as_deref_mut() { *started = true; }
                 if let Ok(reply) = dns_client::query_raw_via(query, ip, if_index, timeout) {
                     return Some(reply);
                 }
@@ -1765,24 +1349,15 @@ fn ask_provider_with_inputs(provider: &Provider, query: &[u8], if_index: u32, ti
             None
         }
         Transport::Custom => {
-            query_custom_with_inputs(&inputs.custom, timeout, cancelled, deadline, |ip, left| {
-                if let Some(started) = started.as_deref_mut() { *started = true; }
-                dns_client::query_raw_via(query, ip, if_index, left).ok()
-            })
+            for server in custom_dns_servers() {
+                if let Some(reply) = ask_custom(&server, query, if_index, timeout) {
+                    return Some(reply);
+                }
+            }
+            None
         }
         Transport::Doh(endpoint) => {
-            let timeout = remaining();
-            if timeout.is_zero() { return None; }
-            if let Some(started) = started.as_deref_mut() { *started = true; }
-            #[cfg(target_os = "macos")]
-            let answer = if deadline.is_some() {
-                crate::doh::query_on_interface(endpoint, query, timeout, if_index)
-            } else {
-                crate::doh::query(endpoint, query, timeout)
-            };
-            #[cfg(not(target_os = "macos"))]
-            let answer = crate::doh::query(endpoint, query, timeout);
-            let mut reply = answer.ok()?;
+            let mut reply = crate::doh::query(endpoint, query, timeout).ok()?;
             // Re-stamp the transaction id. RFC 8484 tells a DoH client to send 0
             // and a server is free to answer with 0 whatever we asked with, but
             // the reply is handed to Windows over UDP:53, where an id that does
@@ -1963,10 +1538,8 @@ pub fn forget_names(names: &[&str]) {
 fn resolve_through_tunnel(
     query: &[u8],
     from_client: bool,
-    work: Option<&ResolverWork>,
-) -> Result<Option<(Vec<u8>, &'static str, Verdict)>, String> {
+) -> Option<(Vec<u8>, &'static str, Verdict)> {
     for server in REFERENCE_V4 {
-        check_resolver_work(work)?;
         let Ok(ip) = server.parse::<Ipv4Addr>() else {
             continue;
         };
@@ -1975,15 +1548,13 @@ fn resolve_through_tunnel(
         } else {
             QUERY_TIMEOUT
         };
-        let reply = dns_client::query_raw_via(query, ip, 0, budget);
-        check_resolver_work(work)?;
-        if let Ok(reply) = reply {
+        if let Ok(reply) = dns_client::query_raw_via(query, ip, 0, budget) {
             let reply = dns_client::cap_ttl(&reply, PASSTHROUGH_TTL).unwrap_or(reply);
             remember_answer(query, &reply, "VPN", Verdict::Passthrough, from_client);
-            return Ok(Some((reply, "VPN", Verdict::Passthrough)));
+            return Some((reply, "VPN", Verdict::Passthrough));
         }
     }
-    Ok(None)
+    None
 }
 
 /// The provider to prefer for `name`, and how long a racer may be held for it.
@@ -2012,7 +1583,18 @@ fn preferred_provider(name: &str) -> Option<usize> {
 fn one_shot_floor(provider: &Provider, budget: Duration) -> Duration {
     match provider.transport {
         Transport::Doh(_) => budget.max(DOH_FAST_TIMEOUT),
-        Transport::Udp | Transport::Custom => budget,
+        Transport::Udp => budget,
+        // A DoH/DoT server needs a handshake before it can answer at all.
+        Transport::Custom => {
+            if custom_dns_servers()
+                .iter()
+                .any(|c| !matches!(c, CustomServer::Udp(_)))
+            {
+                budget.max(DOH_FAST_TIMEOUT)
+            } else {
+                budget
+            }
+        }
     }
 }
 
@@ -2024,21 +1606,9 @@ fn one_shot_floor(provider: &Provider, budget: Duration) -> Duration {
 /// the round trip untouched. A cached reply is the same bytes with the client's
 /// transaction id and its TTLs counted down.
 pub fn resolve_best(query: &[u8], if_index: u32) -> Option<(Vec<u8>, &'static str, Verdict)> {
-    resolve_best_with_work(query, if_index, None).expect("legacy resolver launch behavior")
-}
-
-pub(crate) fn resolve_best_owned(query: &[u8], if_index: u32, work: &ResolverWork) -> Result<Option<(Vec<u8>, &'static str, Verdict)>, String> {
-    resolve_best_with_work(query, if_index, Some(work))
-}
-
-fn resolve_best_with_work(query: &[u8], if_index: u32, work: Option<&ResolverWork>) -> Result<Option<(Vec<u8>, &'static str, Verdict)>, String> {
-    check_resolver_work(work)?;
-    let hit = match cached_answer(query, false, true) {
-        Some(hit) => Some(hit), None => resolve_upstream_with_work(query, if_index, true, work)?,
-    };
-    check_resolver_work(work)?;
+    let hit = cached_answer(query, false, true).or_else(|| resolve_upstream(query, if_index, true));
     note_served_a(query, &hit);
-    Ok(hit)
+    hit
 }
 
 /// Records the verdict of an **A** answer for its name. Only A: Windows asks
@@ -2060,38 +1630,18 @@ fn note_served_a(query: &[u8], hit: &Option<(Vec<u8>, &'static str, Verdict)>) {
 /// This is what the warm loop calls: going through `resolve_best` would just
 /// hand back the entry it exists to replace.
 pub fn refresh(query: &[u8], if_index: u32) -> Option<(Vec<u8>, &'static str, Verdict)> {
-    refresh_with_work(query, if_index, None).expect("legacy resolver launch behavior")
-}
-
-pub(crate) fn refresh_owned(query: &[u8], if_index: u32, work: &ResolverWork) -> Result<Option<(Vec<u8>, &'static str, Verdict)>, String> {
-    refresh_with_work(query, if_index, Some(work))
-}
-
-fn refresh_with_work(query: &[u8], if_index: u32, work: Option<&ResolverWork>) -> Result<Option<(Vec<u8>, &'static str, Verdict)>, String> {
-    check_resolver_work(work)?;
-    let hit = resolve_upstream_with_work(query, if_index, false, work)?;
-    check_resolver_work(work)?;
+    let hit = resolve_upstream(query, if_index, false);
     note_served_a(query, &hit);
-    Ok(hit)
+    hit
 }
 
 /// Asks every provider and every reference resolver at once and returns the
 /// answer of the provider that actually substituted the name.
-fn resolve_upstream_with_work(
+fn resolve_upstream(
     query: &[u8],
     if_index: u32,
     from_client: bool,
-    work: Option<&ResolverWork>,
-) -> Result<Option<(Vec<u8>, &'static str, Verdict)>, String> {
-    let inputs = legacy_inputs_for_work(work);
-    resolve_upstream_with_inputs(query, if_index, from_client, work, &inputs)
-}
-
-fn resolve_upstream_with_inputs(
-    query: &[u8], if_index: u32, from_client: bool, work: Option<&ResolverWork>,
-    legacy_inputs: &DnsSourceWitness,
-) -> Result<Option<(Vec<u8>, &'static str, Verdict)>, String> {
-    check_resolver_work(work)?;
+) -> Option<(Vec<u8>, &'static str, Verdict)> {
     let qtype = dns_client::question_type(query).unwrap_or(0);
     let name = dns_client::question_name(query).unwrap_or_default();
     let key = (name, qtype);
@@ -2100,11 +1650,9 @@ fn resolve_upstream_with_inputs(
     // as well as before the race, or a provider chosen minutes earlier would go
     // on answering for the whole `CHOICE_TTL` after the user connected.
     if vpn_is_active() {
-        if let Some(hit) = resolve_through_tunnel(query, from_client, work)? {
-            check_resolver_work(work)?;
-            return Ok(Some(hit));
+        if let Some(hit) = resolve_through_tunnel(query, from_client) {
+            return Some(hit);
         }
-        check_resolver_work(work)?;
         // The tunnel's resolver is not answering either; fall through rather
         // than hand the client nothing.
     }
@@ -2113,8 +1661,6 @@ fn resolve_upstream_with_inputs(
     // to whichever provider is already known good for this name - or the first
     // one that answers.
     let classifiable = qtype == QTYPE_A || qtype == QTYPE_AAAA;
-    // All provider and control queries in this ordinary race use the same
-    // cached settings snapshot. This is legacy DNS input, not source authority.
 
     // Nothing here may outlast what Windows will wait for while a client is
     // blocked on it: past that it asks the fallback nameserver, whose answer no
@@ -2127,13 +1673,11 @@ fn resolve_upstream_with_inputs(
 
     if let Some((idx, verdict)) = cached_choice(&key) {
         let budget = one_shot_floor(&PROVIDERS[idx], one_shot);
-        if let Some(reply) = ask_provider_with_inputs(&PROVIDERS[idx], query, if_index, budget, work.map(|work| &work.cancelled), Some(legacy_inputs), None, None) {
-            check_resolver_work(work)?;
-            let reply = vet_with_work(reply, verdict, !from_client, Some(key.0.as_str()), work)?;
+        if let Some(reply) = ask_provider(&PROVIDERS[idx], query, if_index, budget) {
+            let reply = vet(reply, verdict, !from_client, Some(key.0.as_str()));
             remember_answer(query, &reply, PROVIDERS[idx].name, verdict, from_client);
-            return Ok(prefer_substituted(query, from_client, (reply, PROVIDERS[idx].name, verdict)));
+            return prefer_substituted(query, from_client, (reply, PROVIDERS[idx].name, verdict));
         }
-        check_resolver_work(work)?;
         // The chosen provider went away; re-race rather than keep asking it.
         forget_choice(&key);
     }
@@ -2141,40 +1685,26 @@ fn resolve_upstream_with_inputs(
     if !classifiable {
         let start = ROTATION.fetch_add(1, Ordering::Relaxed);
         for step in 0..PROVIDERS.len() {
-            check_resolver_work(work)?;
             let idx = (start + step) % PROVIDERS.len();
-            if let Some(reply) = ask_provider_with_inputs(&PROVIDERS[idx], query, if_index, one_shot, work.map(|work| &work.cancelled), Some(legacy_inputs), None, None) {
-                check_resolver_work(work)?;
-                return Ok(Some((reply, PROVIDERS[idx].name, Verdict::Unknown)));
+            if let Some(reply) = ask_provider(&PROVIDERS[idx], query, if_index, one_shot) {
+                return Some((reply, PROVIDERS[idx].name, Verdict::Unknown));
             }
         }
-        check_resolver_work(work)?;
-        return Ok(None);
+        return None;
     }
 
     let (tx, rx) = mpsc::channel::<Heat>();
     for idx in 0..PROVIDERS.len() {
         let tx = tx.clone();
         let q = query.to_vec();
-        let inputs = (*legacy_inputs).clone();
-        #[cfg(test)]
-        let fixture = work.and_then(|work| work.fixture.clone());
-        #[cfg(test)]
-        let observer = work.and_then(|work| work.legacy_input_observer.clone());
-        launch_resolver(work, ResolverChildKind::Provider(idx), move |cancelled| {
+        thread::spawn(move || {
             // The generous timeout is right here: nothing blocks on one racer,
             // the race as a whole is bounded by RACE_BUDGET, and a straggler
             // simply sends into a channel nobody is reading any more.
-            #[cfg(test)]
-            if let Some(observer) = observer { observer(idx, &q, &inputs); }
-            #[cfg(test)]
-            let reply = fixture.as_ref().map(|fixture| (fixture.provider)(idx, &q)).unwrap_or_else(|| ask_provider_with_inputs(&PROVIDERS[idx], &q, if_index, QUERY_TIMEOUT, Some(cancelled), Some(&inputs), None, None));
-            #[cfg(not(test))]
-            let reply = ask_provider_with_inputs(&PROVIDERS[idx], &q, if_index, QUERY_TIMEOUT, Some(cancelled), Some(&inputs), None, None);
-            let delivery = reply.as_ref().map_or(ResolverDelivery::NoMessage, |reply|
-                deliver_resolver(&tx, Heat::Provider(idx, reply.clone()), cancelled));
-            ResolverChildResult { observation: reply.map_or(ResolverObservation::NoAnswer, ResolverObservation::Reply), delivery, cancelled: false }
-        })?;
+            if let Some(reply) = ask_provider(&PROVIDERS[idx], &q, if_index, QUERY_TIMEOUT) {
+                tx.send(Heat::Provider(idx, reply)).ok();
+            }
+        });
     }
     for server in REFERENCE_V4 {
         let Ok(ip) = server.parse::<Ipv4Addr>() else {
@@ -2182,17 +1712,12 @@ fn resolve_upstream_with_inputs(
         };
         let tx = tx.clone();
         let q = query.to_vec();
-        #[cfg(test)]
-        let fixture = work.and_then(|work| work.fixture.clone());
-        launch_resolver(work, ResolverChildKind::Reference(ip), move |cancelled| {
-            #[cfg(test)]
-            let reply = fixture.as_ref().map(|fixture| (fixture.reference)(ip, &q)).unwrap_or_else(|| dns_client::query_raw_via(&q, ip, if_index, QUERY_TIMEOUT));
-            #[cfg(not(test))]
-            let reply = dns_client::query_raw_via(&q, ip, if_index, QUERY_TIMEOUT);
-            let delivery = reply.as_ref().map_or(ResolverDelivery::NoMessage, |reply|
-                deliver_resolver(&tx, Heat::Reference(dns_client::answer_addrs(reply)), cancelled));
-            ResolverChildResult { observation: match reply { Ok(reply) => ResolverObservation::Reply(reply), Err(error) => ResolverObservation::Error(error) }, delivery, cancelled: false }
-        })?;
+        thread::spawn(move || {
+            if let Ok(reply) = dns_client::query_raw_via(&q, ip, if_index, QUERY_TIMEOUT) {
+                tx.send(Heat::Reference(dns_client::answer_addrs(&reply)))
+                    .ok();
+            }
+        });
     }
 
     // The control probes ride along in the same batch rather than on a timer:
@@ -2208,36 +1733,22 @@ fn resolve_upstream_with_inputs(
         for idx in 0..PROVIDERS.len() {
             let tx = tx.clone();
             let q = control.clone();
-            let inputs = (*legacy_inputs).clone();
-            #[cfg(test)]
-            let fixture = work.and_then(|work| work.fixture.clone());
-            #[cfg(test)]
-            let observer = work.and_then(|work| work.legacy_input_observer.clone());
-            launch_resolver(work, ResolverChildKind::ControlProvider(idx), move |cancelled| {
-                #[cfg(test)]
-                if let Some(observer) = observer { observer(idx, &q, &inputs); }
-                #[cfg(test)]
-                let reply = fixture.as_ref().map(|fixture| (fixture.provider)(idx, &q)).unwrap_or_else(|| ask_provider_with_inputs(&PROVIDERS[idx], &q, if_index, QUERY_TIMEOUT, Some(cancelled), Some(&inputs), None, None));
-                #[cfg(not(test))]
-                let reply = ask_provider_with_inputs(&PROVIDERS[idx], &q, if_index, QUERY_TIMEOUT, Some(cancelled), Some(&inputs), None, None);
-                let delivery = reply.as_ref().map_or(ResolverDelivery::NoMessage, |reply|
-                    deliver_resolver(&tx, Heat::Control(idx, dns_client::answer_addrs(reply)), cancelled));
-                ResolverChildResult { observation: reply.map_or(ResolverObservation::NoAnswer, ResolverObservation::Reply), delivery, cancelled: false }
-            })?;
+            thread::spawn(move || {
+                if let Some(reply) = ask_provider(&PROVIDERS[idx], &q, if_index, QUERY_TIMEOUT) {
+                    tx.send(Heat::Control(idx, dns_client::answer_addrs(&reply)))
+                        .ok();
+                }
+            });
         }
         if let Ok(ip) = REFERENCE_V4[0].parse::<Ipv4Addr>() {
             let tx = tx.clone();
-            #[cfg(test)]
-            let fixture = work.and_then(|work| work.fixture.clone());
-            launch_resolver(work, ResolverChildKind::ControlReference(ip), move |cancelled| {
-                #[cfg(test)]
-                let reply = fixture.as_ref().map(|fixture| (fixture.reference)(ip, &control)).unwrap_or_else(|| dns_client::query_raw_via(&control, ip, if_index, QUERY_TIMEOUT));
-                #[cfg(not(test))]
-                let reply = dns_client::query_raw_via(&control, ip, if_index, QUERY_TIMEOUT);
-                let delivery = reply.as_ref().map_or(ResolverDelivery::NoMessage, |reply|
-                    deliver_resolver(&tx, Heat::ControlReference(dns_client::answer_addrs(reply)), cancelled));
-                ResolverChildResult { observation: match reply { Ok(reply) => ResolverObservation::Reply(reply), Err(error) => ResolverObservation::Error(error) }, delivery, cancelled: false }
-            })?;
+            thread::spawn(move || {
+                if let Ok(reply) = dns_client::query_raw_via(&control, ip, if_index, QUERY_TIMEOUT)
+                {
+                    tx.send(Heat::ControlReference(dns_client::answer_addrs(&reply)))
+                        .ok();
+                }
+            });
         }
     }
     // Every sender lives in a thread; the local one would otherwise keep the
@@ -2255,7 +1766,6 @@ fn resolve_upstream_with_inputs(
     let mut got_control_reference = false;
 
     loop {
-        check_resolver_work(work)?;
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
@@ -2313,7 +1823,7 @@ fn resolve_upstream_with_inputs(
                 let name = key.0.clone();
                 remember_choice(key, replies[hit].0, Verdict::Substituted);
                 let (idx, reply) = replies.swap_remove(hit);
-                let reply = vet_with_work(reply, Verdict::Substituted, !from_client, Some(&name), work)?;
+                let reply = vet(reply, Verdict::Substituted, !from_client, Some(&name));
                 remember_answer(
                     query,
                     &reply,
@@ -2321,8 +1831,7 @@ fn resolve_upstream_with_inputs(
                     Verdict::Substituted,
                     from_client,
                 );
-                check_resolver_work(work)?;
-                return Ok(Some((reply, PROVIDERS[idx].name, Verdict::Substituted)));
+                return Some((reply, PROVIDERS[idx].name, Verdict::Substituted));
             }
         }
         if replies.len() == PROVIDERS.len() && got_reference && !still_learning {
@@ -2330,13 +1839,11 @@ fn resolve_upstream_with_inputs(
         }
     }
 
-    check_resolver_work(work)?;
     if replies.is_empty() {
         // Every provider went quiet. A substituted answer from minutes ago is
         // still the best thing in the building: the alternative is not a fresh
         // answer but Windows falling through to an unvetted fallback.
-        check_resolver_work(work)?;
-        return Ok(cached_answer(query, true, from_client));
+        return cached_answer(query, true, from_client);
     }
     // Nothing substituted. Hand back the best of what arrived anyway - an
     // unsubstituted answer still resolves the name, and refusing to answer
@@ -2366,10 +1873,9 @@ fn resolve_upstream_with_inputs(
     // the client's path and is precisely the work this module exists to do.
     forget_choice(&key);
     let (idx, reply) = replies.swap_remove(best);
-    let reply = vet_with_work(reply, verdict, !from_client, Some(key.0.as_str()), work)?;
+    let reply = vet(reply, verdict, !from_client, Some(key.0.as_str()));
     remember_answer(query, &reply, PROVIDERS[idx].name, verdict, from_client);
-    check_resolver_work(work)?;
-    Ok(prefer_substituted(query, from_client, (reply, PROVIDERS[idx].name, verdict)))
+    prefer_substituted(query, from_client, (reply, PROVIDERS[idx].name, verdict))
 }
 
 /// Filters a reply before it goes back to the client.
@@ -2378,15 +1884,10 @@ fn resolve_upstream_with_inputs(
 /// party rather than to Google, so they are the only ones worth probing. Every
 /// other verdict gets its TTL clamped instead: see `PASSTHROUGH_TTL`.
 fn vet(reply: Vec<u8>, verdict: Verdict, fresh: bool, sni: Option<&str>) -> Vec<u8> {
-    vet_with_work(reply, verdict, fresh, sni, None).expect("legacy liveness launch behavior")
-}
-
-fn vet_with_work(reply: Vec<u8>, verdict: Verdict, fresh: bool, sni: Option<&str>, work: Option<&ResolverWork>) -> Result<Vec<u8>, String> {
-    check_resolver_work(work)?;
     if verdict == Verdict::Substituted {
-        drop_dead_addrs_with_work(reply, fresh, sni, work)
+        drop_dead_addrs(reply, fresh, sni)
     } else {
-        Ok(dns_client::cap_ttl(&reply, PASSTHROUGH_TTL).unwrap_or(reply))
+        dns_client::cap_ttl(&reply, PASSTHROUGH_TTL).unwrap_or(reply)
     }
 }
 
@@ -2419,23 +1920,8 @@ fn prefer_substituted(
 /// sets first makes `classify` take the proxy-match path, so a genuine
 /// different-/16 answer is `Sibling`, not `Substituted`.
 fn ensure_proxy_sets_learned(if_index: u32) {
-    ensure_proxy_sets_learned_with_work(if_index, None).expect("legacy resolver behavior")
-}
-
-fn ensure_proxy_sets_learned_with_work(if_index: u32, work: Option<&ResolverWork>) -> Result<(), String> {
-    let inputs = legacy_inputs_for_work(work);
-    ensure_proxy_sets_learned_with_inputs(if_index, work, &inputs)
-}
-
-fn ensure_proxy_sets_learned_with_inputs(if_index: u32, work: Option<&ResolverWork>, legacy_inputs: &DnsSourceWitness) -> Result<(), String> {
-    check_resolver_work(work)?;
-    #[cfg(test)]
-    if let Some(learning) = work.and_then(|work| work.fixture.as_ref()).and_then(|fixture| fixture.learning.as_ref()) {
-        learning();
-        return check_resolver_work(work);
-    }
     if !(0..PROVIDERS.len()).any(proxy_addrs_are_stale) {
-        return Ok(());
+        return;
     }
     // Union across two usable control names, not one: geohide rotates its proxy
     // across three addresses in three /16s (see PROXY_SET_TTL), so a single probe
@@ -2446,18 +1932,15 @@ fn ensure_proxy_sets_learned_with_inputs(if_index: u32, work: Option<&ResolverWo
     const ROUNDS: usize = 2;
     let mut done = 0;
     for &picked in CONTROL_NAMES {
-        check_resolver_work(work)?;
         if done >= ROUNDS {
             break;
         }
         let control = dns_client::build_query(picked, 0x0C71);
         let mut cref: Vec<IpAddr> = Vec::new();
         for server in REFERENCE_V4 {
-            check_resolver_work(work)?;
             if let Ok(ip) = server.parse::<Ipv4Addr>() {
                 if let Ok(reply) = dns_client::query_raw_via(&control, ip, if_index, QUERY_TIMEOUT)
                 {
-                    check_resolver_work(work)?;
                     cref.extend(dns_client::answer_addrs(&reply));
                 }
             }
@@ -2472,9 +1955,7 @@ fn ensure_proxy_sets_learned_with_inputs(if_index: u32, work: Option<&ResolverWo
             continue;
         }
         for idx in 0..PROVIDERS.len() {
-            check_resolver_work(work)?;
-            if let Some(reply) = ask_provider_with_inputs(&PROVIDERS[idx], &control, if_index, QUERY_TIMEOUT, work.map(|work| &work.cancelled), Some(legacy_inputs), None, None) {
-                check_resolver_work(work)?;
+            if let Some(reply) = ask_provider(&PROVIDERS[idx], &control, if_index, QUERY_TIMEOUT) {
                 let addrs = dns_client::answer_addrs(&reply);
                 if classify(&addrs, &cref, &[]) == Verdict::Substituted {
                     learn_proxy_addrs(idx, addrs);
@@ -2483,12 +1964,10 @@ fn ensure_proxy_sets_learned_with_inputs(if_index: u32, work: Option<&ResolverWo
         }
         done += 1;
     }
-    check_resolver_work(work)
 }
 
 pub fn substituting_addrs(name: &str, if_index: u32) -> Vec<&'static str> {
-    let inputs = legacy_inputs_for_work(None);
-    ensure_proxy_sets_learned_with_inputs(if_index, None, &inputs).expect("legacy resolver behavior");
+    ensure_proxy_sets_learned(if_index);
     let query = dns_client::build_query(name, 0x6767);
 
     let mut reference: Vec<IpAddr> = Vec::new();
@@ -2502,7 +1981,7 @@ pub fn substituting_addrs(name: &str, if_index: u32) -> Vec<&'static str> {
 
     let mut out = Vec::new();
     for (idx, provider) in PROVIDERS.iter().enumerate() {
-        let Some(reply) = ask_provider_with_inputs(provider, &query, if_index, QUERY_TIMEOUT, None, Some(&inputs), None, None) else {
+        let Some(reply) = ask_provider(provider, &query, if_index, QUERY_TIMEOUT) else {
             continue;
         };
         let addrs = dns_client::answer_addrs(&reply);
@@ -2528,14 +2007,9 @@ pub fn substituting_addrs(name: &str, if_index: u32) -> Vec<&'static str> {
 /// that was never substituted: freezing a genuine Google address into `hosts`
 /// buys nothing and goes stale the moment Google rotates its edge.
 pub fn resolve_a_best(name: &str, if_index: u32) -> Option<(Vec<Ipv4Addr>, &'static str, Verdict)> {
-    resolve_a_best_with_work(name, if_index, None).expect("legacy resolver launch behavior")
-}
-
-fn resolve_a_best_with_work(name: &str, if_index: u32, work: Option<&ResolverWork>) -> Result<Option<(Vec<Ipv4Addr>, &'static str, Verdict)>, String> {
-    check_resolver_work(work)?;
     // The id only has to be echoed back; `query_raw_via` matches on it.
     let query = dns_client::build_query(name, 0x5A5A);
-    let Some((reply, provider, verdict)) = resolve_best_with_work(&query, if_index, work)? else { return Ok(None); };
+    let (reply, provider, verdict) = resolve_best(&query, if_index)?;
     let addrs: Vec<Ipv4Addr> = dns_client::answer_addrs(&reply)
         .into_iter()
         .filter_map(|a| match a {
@@ -2544,49 +2018,33 @@ fn resolve_a_best_with_work(name: &str, if_index: u32, work: Option<&ResolverWor
         })
         .collect();
     if addrs.is_empty() {
-        return Ok(None);
+        return None;
     }
-    check_resolver_work(work)?;
-    Ok(Some((addrs, provider, verdict)))
+    Some((addrs, provider, verdict))
 }
 
-/// What the `Direct` route walks: the race winner's answer, then every proxy
-/// address any provider is known to hand out, the ones that accept a connection
-/// first.
-///
-/// `resolve_a_best` alone is one provider's word. A single-address answer is
-/// never vetted (`drop_dead_addrs` keeps the last address so a slow answer does
-/// not become no answer), so a winner whose lone proxy had died put the direct
-/// route on a black hole every time while another provider's proxy served the
-/// same name (measured: dns-ai.ru's address timed out, geohide's completed TLS).
-pub fn direct_addrs(name: &str, if_index: u32) -> Option<(Vec<Ipv4Addr>, &'static str, Verdict)> {
-    direct_addrs_with_work(name, if_index, None).expect("legacy resolver launch behavior")
-}
-
-pub(crate) fn direct_addrs_owned(name: &str, if_index: u32, work: &ResolverWork) -> Result<Option<(Vec<Ipv4Addr>, &'static str, Verdict)>, String> {
-    direct_addrs_with_work(name, if_index, Some(work))
-}
-
-fn direct_addrs_with_work(name: &str, if_index: u32, work: Option<&ResolverWork>) -> Result<Option<(Vec<Ipv4Addr>, &'static str, Verdict)>, String> {
-    check_resolver_work(work)?;
-    let Some((mut addrs, provider, verdict)) = resolve_a_best_with_work(name, if_index, work)? else { return Ok(None); };
-    if verdict != Verdict::Substituted {
-        return Ok(Some((addrs, provider, verdict)));
-    }
-    for idx in 0..PROVIDERS.len() {
-        for a in known_proxy_addrs(idx) {
-            if let IpAddr::V4(v4) = a {
-                if !addrs.contains(&v4) {
-                    addrs.push(v4);
+/// Candidates, not a DNS verdict: even when today's race returns genuine
+/// Google (or nothing), another provider's known proxy may carry this SNI.
+/// Every address MUST pass the host-specific TLS/HTTP probe before use.
+pub fn dns_proxy_candidates(name: &str, if_index: u32) -> Vec<Ipv4Addr> {
+    ensure_proxy_sets_learned(if_index);
+    let mut out = match resolve_a_best(name, if_index) {
+        Some((ips, provider, Verdict::Substituted)) if !provider_disabled(provider) => ips,
+        _ => Vec::new(),
+    };
+    for (idx, provider) in PROVIDERS.iter().enumerate() {
+        if provider_disabled(provider.name) {
+            continue;
+        }
+        for addr in known_proxy_addrs(idx) {
+            if let IpAddr::V4(ip) = addr {
+                if !out.contains(&ip) {
+                    out.push(ip);
                 }
             }
         }
     }
-    // Only previously measured dead addresses move behind other candidates.
-    // A request must not wait for fresh liveness of unrelated pool members.
-    addrs.sort_by_key(|a| cached_liveness(&IpAddr::V4(*a)) == Some(false));
-    check_resolver_work(work)?;
-    Ok(Some((addrs, provider, verdict)))
+    out
 }
 
 /// Genuine Google for `name`, as the routing table's own path resolves it: the
@@ -2642,7 +2100,7 @@ pub fn genuine_a(name: &str) -> Vec<Ipv4Addr> {
 /// ranges a tunnel's "fake IP" DNS hands out (198.18.0.0/15) or anything
 /// private: connecting there hands the name back to whatever answered it, and
 /// that can resolve it through us again.
-pub(crate) fn is_public_v4(v4: Ipv4Addr) -> bool {
+fn is_public_v4(v4: Ipv4Addr) -> bool {
     let o = v4.octets();
     !(REFERENCE_STUBS.contains(&v4)
         || v4.is_private()
@@ -2719,644 +2177,6 @@ fn best_of(replies: &[(usize, Vec<u8>)], reference: &[IpAddr]) -> usize {
 mod tests {
     use super::*;
 
-    #[test]
-    fn cancelled_held_probe_cannot_enter_publication() {
-        let work = Arc::new(ResolverWork::new(thread::current()));
-        let admitted = Arc::new(AtomicBool::new(false));
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let worker_work = work.clone();
-        let worker_admitted = admitted.clone();
-        let worker = thread::spawn(move || {
-            let _ = entered_tx.send(());
-            if release_rx.recv_timeout(Duration::from_secs(5)).is_err() { return false; }
-            worker_work.with_open(|| worker_admitted.store(true, Ordering::SeqCst)).is_err()
-        });
-        let entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
-        work.cancel();
-        let _ = release_tx.send(());
-        let rejected = worker.join().unwrap();
-        assert!(entered && rejected && !admitted.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn completed_cancel_prevents_later_publication_admission() {
-        let work = Arc::new(ResolverWork::new(thread::current()));
-        let (inside_tx, inside_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let publisher_work = work.clone();
-        let publisher = thread::spawn(move || publisher_work.with_open(|| {
-            let _ = inside_tx.send(());
-            release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
-        }));
-        let entered = inside_rx.recv_timeout(Duration::from_secs(5)).is_ok();
-        let canceller_work = work.clone();
-        let canceller = thread::spawn(move || canceller_work.cancel());
-        let _ = release_tx.send(());
-        let publication = publisher.join().unwrap();
-        canceller.join().unwrap();
-        let later = AtomicBool::new(false);
-        let rejected = work.with_open(|| later.store(true, Ordering::SeqCst)).is_err();
-        assert!(entered && publication.unwrap() && rejected && !later.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn external_parent_cancel_is_checked_at_guard_entry() {
-        let parent = Arc::new(AtomicBool::new(true));
-        let work = ResolverWork::with_cancellation(thread::current(), parent);
-        let entered = AtomicBool::new(false);
-        assert!(work.with_open(|| entered.store(true, Ordering::SeqCst)).is_err());
-        assert!(!entered.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn witness_missing_and_invalid_settings_are_distinct() {
-        assert!(matches!(witness_from_read(crate::settings::Read::Missing, DnsMissingPolicy::RequireSettings), Err(DnsSourceError::Missing)));
-        assert!(witness_from_read(crate::settings::Read::Missing, DnsMissingPolicy::LegacyDefaults).unwrap().missing_defaults);
-        assert!(matches!(witness_from_read(crate::settings::Read::Broken, DnsMissingPolicy::LegacyDefaults), Err(DnsSourceError::Broken)));
-        assert!(matches!(witness_from_read(crate::settings::Read::Unavailable, DnsMissingPolicy::LegacyDefaults), Err(DnsSourceError::Unavailable)));
-    }
-
-    #[test]
-    fn witness_respects_order_rotation_and_custom_input() {
-        let mut settings = crate::settings::Settings::default();
-        let custom = PROVIDERS.iter().position(|provider| matches!(&provider.transport, Transport::Custom)).unwrap();
-        settings.provider_order = vec![PROVIDERS[custom].name.to_string(), LEAD_PROVIDER.to_string()];
-        settings.rotate_providers = false;
-        settings.custom_dns = "192.0.2.53 junk 192.0.2.53 127.0.0.53; 198.51.100.53".to_string();
-        let inputs = witness_from_read(crate::settings::Read::Parsed(settings.clone()), DnsMissingPolicy::RequireSettings).unwrap();
-        assert_eq!(inputs.selected, vec![custom]);
-        assert_eq!(inputs.custom, vec![Ipv4Addr::new(192, 0, 2, 53), Ipv4Addr::new(198, 51, 100, 53)]);
-
-        settings.set_provider_enabled(PROVIDERS[custom].name, false);
-        let inputs = witness_from_read(crate::settings::Read::Parsed(settings), DnsMissingPolicy::RequireSettings).unwrap();
-        assert_eq!(inputs.selected, vec![provider_index(LEAD_PROVIDER).unwrap()]);
-        assert!(inputs.custom.is_empty());
-    }
-
-    #[test]
-    fn unusable_custom_does_not_displace_the_next_provider() {
-        let custom = PROVIDERS.iter().position(|provider| matches!(&provider.transport, Transport::Custom)).unwrap();
-        let lead = provider_index(LEAD_PROVIDER).unwrap();
-        let mut settings = crate::settings::Settings::default();
-        settings.provider_order = vec![PROVIDERS[custom].name.to_string(), LEAD_PROVIDER.to_string()];
-        settings.rotate_providers = false;
-        for text in [" \t ", "junk 127.0.0.53 0.0.0.0 224.0.0.1"] {
-            settings.custom_dns = text.into();
-            let strict = witness_from_read(crate::settings::Read::Parsed(settings.clone()), DnsMissingPolicy::RequireSettings).unwrap();
-            let mut work = ResolverWork::new(thread::current());
-            work.legacy_settings = Some(settings.clone());
-            let legacy = legacy_inputs_for_work(Some(&work));
-            assert_eq!(strict.selected, [lead]);
-            assert!(strict.custom.is_empty());
-            assert!(legacy == strict);
-            assert!(settings.provider_enabled(PROVIDERS[custom].name));
-        }
-
-        settings.rotate_providers = true;
-        let rotated = witness_from_settings(&settings, false);
-        assert_eq!(rotated.selected.first(), Some(&lead));
-        assert!(!rotated.selected.contains(&custom));
-    }
-
-    #[test]
-    fn provider_identity_is_stable_across_constant_slice_reads() {
-        for (idx, provider) in PROVIDERS.iter().enumerate() {
-            let inputs = test_source_witness_with_providers(&[provider.name], false);
-            assert_eq!(inputs.selected, vec![idx]);
-            assert_eq!(provider_index(PROVIDERS[idx].name), Some(idx));
-        }
-    }
-
-    #[test]
-    fn legacy_winner_does_not_wait_for_unwitnessed_control_reference() {
-        const NAME: &str = "legacy-witness-independent.invalid";
-        struct Restore(Option<HashMap<usize, ProxySet>>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                *PROXY_SET.lock().unwrap_or_else(|e| e.into_inner()) = self.0.take();
-                forget_names(&[NAME]);
-            }
-        }
-        let old = PROXY_SET.lock().unwrap().take();
-        let _restore = Restore(old);
-        let address = Ipv4Addr::new(8, 8, 1, 1);
-        for idx in 0..PROVIDERS.len() { learn_proxy_addrs(idx, vec![IpAddr::V4(address)]); }
-        forget_names(&[NAME]);
-        let (held_tx, held_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let release_rx = Mutex::new(release_rx);
-        let fixture = ResolverFixture {
-            provider: Arc::new(move |_, query| dns_client::synth_reply(query, Some(address), 60)),
-            reference: Arc::new(move |_, query| {
-                let name = dns_client::question_name(query).unwrap_or_default();
-                if CONTROL_NAMES.contains(&name.as_str()) {
-                    let _ = held_tx.send(());
-                    let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(3));
-                }
-                dns_client::synth_reply(query, Some(Ipv4Addr::new(1, 1, 1, 1)), 60).ok_or("fixture reply".into())
-            }),
-            liveness: Arc::new(|_| true), learning: None,
-        };
-        let mut work = ResolverWork::new(thread::current());
-        work.fixture = Some(Arc::new(fixture));
-        let query = dns_client::build_query(NAME, 0x1234);
-        let result = resolve_upstream_with_work(&query, 0, true, Some(&work));
-        let control_started = held_rx.try_recv().is_ok();
-        let _ = release_tx.send(());
-        let mut terminals = Vec::new();
-        while work.has_unreceived() {
-            work.receive_into(&mut terminals).unwrap();
-            if work.has_unreceived() { thread::park_timeout(Duration::from_millis(1)); }
-        }
-        assert!(!control_started, "strict witness readiness must not schedule legacy control learning");
-        assert!(result.unwrap().is_some_and(|(_, _, verdict)| verdict == Verdict::Substituted));
-    }
-
-    #[test]
-    fn legacy_target_and_control_share_captured_cached_inputs() {
-        const NAME: &str = "legacy-cached-inputs.invalid";
-        struct Restore(Option<HashMap<usize, ProxySet>>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                *PROXY_SET.lock().unwrap_or_else(|e| e.into_inner()) = self.0.take();
-                forget_names(&[NAME]);
-            }
-        }
-        let old = PROXY_SET.lock().unwrap().take();
-        let _restore = Restore(old);
-        forget_names(&[NAME]);
-        let custom = PROVIDERS.iter().position(|p| matches!(&p.transport, Transport::Custom)).unwrap();
-        let mut cached_a = crate::settings::Settings::default();
-        cached_a.custom_dns = "10.2.3.4".into();
-        let mut disk_b = cached_a.clone();
-        disk_b.custom_dns = "10.2.3.5".into();
-        let strict_b = witness_from_read(crate::settings::Read::Parsed(disk_b), DnsMissingPolicy::RequireSettings).unwrap();
-        let observations = Arc::new(Mutex::new(Vec::new()));
-        let record = observations.clone();
-        let fixture = ResolverFixture {
-            provider: Arc::new(|_, query| dns_client::synth_reply(query, Some(Ipv4Addr::new(8, 8, 1, 1)), 60)),
-            reference: Arc::new(|_, query| dns_client::synth_reply(query, Some(Ipv4Addr::new(1, 1, 1, 1)), 60).ok_or("fixture reply".into())),
-            liveness: Arc::new(|_| true), learning: None,
-        };
-        let mut work = ResolverWork::new(thread::current());
-        work.fixture = Some(Arc::new(fixture));
-        work.legacy_settings = Some(cached_a);
-        work.legacy_input_observer = Some(Arc::new(move |idx, query, inputs| {
-            if idx == custom { record.lock().unwrap().push((dns_client::question_name(query).unwrap_or_default(), inputs.custom.clone())); }
-        }));
-        let query = dns_client::build_query(NAME, 0x2345);
-        let result = resolve_upstream_with_work(&query, 0, true, Some(&work));
-        let mut terminals = Vec::new();
-        while work.has_unreceived() {
-            work.receive_into(&mut terminals).unwrap();
-            if work.has_unreceived() { thread::park_timeout(Duration::from_millis(1)); }
-        }
-        let observed = observations.lock().unwrap();
-        assert!(observed.iter().any(|(name, _)| name == NAME));
-        assert!(observed.iter().any(|(name, _)| CONTROL_NAMES.contains(&name.as_str())));
-        assert!(observed.iter().all(|(_, custom)| *custom == vec![Ipv4Addr::new(10, 2, 3, 4)]));
-        assert_eq!(strict_b.custom, vec![Ipv4Addr::new(10, 2, 3, 5)]);
-        assert!(result.unwrap().is_some());
-        assert!(current_candidates(&strict_b).unwrap().is_empty());
-    }
-
-    #[test]
-    fn source_requires_selected_fresh_matching_custom_input() {
-        let mut inputs = DnsSourceWitness { selected: vec![0], custom: vec![Ipv4Addr::new(10, 0, 0, 1)], missing_defaults: false, rotate: true };
-        let now = Instant::now();
-        let origin = DnsCandidateOrigin { provider: 0, inputs: inputs.clone(), observed: now, expires: now + PROXY_SET_TTL, target: None };
-        let candidate = DnsCandidate { ip: Ipv4Addr::new(1, 1, 1, 1), origins: vec![origin] };
-        assert!(source_is_current(&candidate, &inputs).unwrap());
-        inputs.custom = vec![Ipv4Addr::new(10, 0, 0, 2)];
-        assert!(!source_is_current(&candidate, &inputs).unwrap());
-        inputs.custom = vec![Ipv4Addr::new(10, 0, 0, 1)];
-        inputs.selected.clear();
-        assert!(!source_is_current(&candidate, &inputs).unwrap());
-    }
-
-    #[test]
-    fn legacy_entries_do_not_authorize_and_shared_candidate_keeps_sources() {
-        let address = Ipv4Addr::new(1, 1, 1, 1);
-        let now = Instant::now();
-        let inputs = DnsSourceWitness { selected: vec![0, 1], custom: Vec::new(), missing_defaults: false, rotate: true };
-        let mut sets = HashMap::new();
-        sets.insert(0, ProxySet { legacy: Some((vec![address.into()], now)), witnessed: Vec::new() });
-        assert!(candidates_from_sets(Some(&sets), &inputs).is_empty());
-        for idx in 0..2 {
-            sets.entry(idx).or_default().witnessed.push((address.into(), DnsCandidateOrigin { provider: idx, inputs: inputs.clone(), observed: now, expires: now + PROXY_SET_TTL, target: None }));
-        }
-        let candidates = candidates_from_sets(Some(&sets), &inputs);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].origins.len(), 2);
-        let mut merged = DnsCandidate { ip: address, origins: vec![candidates[0].origins[0].clone()] };
-        assert!(merged.merge(DnsCandidate { ip: address, origins: vec![candidates[0].origins[1].clone()] }));
-        let one_enabled = DnsSourceWitness { selected: vec![1], ..inputs.clone() };
-        assert!(!source_is_current(&merged, &one_enabled).unwrap());
-        assert!(merged.merge(DnsCandidate { ip: address, origins: vec![DnsCandidateOrigin { provider: 1, inputs: one_enabled.clone(), observed: now, expires: now + PROXY_SET_TTL, target: None }] }));
-        assert!(source_is_current(&merged, &one_enabled).unwrap());
-        let none_enabled = DnsSourceWitness { selected: Vec::new(), ..inputs };
-        assert!(!source_is_current(&candidates[0], &none_enabled).unwrap());
-    }
-
-    #[test]
-    fn held_custom_query_uses_captured_inputs_after_settings_change() {
-        let mut settings = crate::settings::Settings::default();
-        settings.custom_dns = "10.2.3.4".into();
-        let captured = witness_from_read(crate::settings::Read::Parsed(settings.clone()), DnsMissingPolicy::RequireSettings).unwrap();
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
-        let worker = thread::spawn(move || query_custom_with_inputs(&captured.custom, Duration::from_secs(5), None, None, |ip, _| {
-            entered_tx.send(ip).unwrap();
-            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            Some(vec![1])
-        }));
-        let observed = entered_rx.recv_timeout(Duration::from_secs(5));
-        settings.custom_dns = "10.2.3.5".into();
-        let changed = witness_from_read(crate::settings::Read::Parsed(settings), DnsMissingPolicy::RequireSettings).unwrap();
-        let _ = resume_tx.send(());
-        let result = worker.join();
-        assert_eq!(observed.unwrap(), Ipv4Addr::new(10, 2, 3, 4));
-        assert_eq!(changed.custom, vec![Ipv4Addr::new(10, 2, 3, 5)]);
-        assert_eq!(result.unwrap(), Some(vec![1]));
-    }
-
-    #[test]
-    fn target_evidence_requires_live_control_and_honest_reference() {
-        let inputs = DnsSourceWitness { selected: vec![0], custom: Vec::new(), missing_defaults: false, rotate: true };
-        let control_ip = Ipv4Addr::new(8, 8, 1, 1);
-        let target_ip = Ipv4Addr::new(8, 8, 2, 2);
-        let reference = vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
-        let now = Instant::now();
-        let control = DnsCandidate { ip: control_ip, origins: vec![DnsCandidateOrigin { provider: 0, inputs: inputs.clone(), observed: now, expires: now + PROXY_SET_TTL, target: None }] };
-        let answer = vec![IpAddr::V4(target_ip)];
-        let ttl = Duration::from_secs(60);
-        assert!(target_candidates(0, answer.clone(), &reference, &[], "example.test", &inputs, now, ttl).is_empty());
-        assert!(target_candidates(0, answer.clone(), &[], &[control.clone()], "example.test", &inputs, now, ttl).is_empty());
-        assert!(target_candidates(0, vec![reference[0]], &reference, &[control.clone()], "example.test", &inputs, now, ttl).is_empty());
-        assert!(target_candidates(0, vec![IpAddr::V4(Ipv4Addr::new(9, 9, 1, 1))], &reference, &[control.clone()], "example.test", &inputs, now, ttl).is_empty());
-        assert_eq!(target_candidates(0, answer.clone(), &reference, &[control], "example.test", &inputs, now, ttl).len(), 1);
-        assert_eq!(classify(&answer, &reference, &[IpAddr::V4(control_ip)]), Verdict::Substituted);
-    }
-
-    #[test]
-    fn target_origin_expires_with_its_control_proof() {
-        let now = Instant::now();
-        let old = now.checked_sub(Duration::from_secs(1)).unwrap();
-        let inputs = DnsSourceWitness { selected: vec![0], custom: Vec::new(), missing_defaults: false, rotate: true };
-        let candidate = DnsCandidate { ip: Ipv4Addr::new(8, 8, 8, 8), origins: vec![DnsCandidateOrigin {
-            provider: 0, inputs: inputs.clone(), observed: now, expires: old, target: Some("example.test".into()),
-        }] };
-        assert!(!source_is_current(&candidate, &inputs).unwrap());
-    }
-
-    #[test]
-    fn target_answer_ttl_and_zero_ttl_bound_reuse() {
-        let inputs = test_source_witness();
-        let control = test_source_candidate(Ipv4Addr::new(8, 8, 1, 1), &inputs);
-        let idx = inputs.selected[0];
-        let now = Instant::now();
-        let answers = vec![IpAddr::V4(Ipv4Addr::new(8, 8, 2, 2))];
-        let reference = [IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
-        let candidates = target_candidates(idx, answers.clone(), &reference, &[control.clone()], "example.test", &inputs, now, Duration::from_secs(1));
-        assert_eq!(candidates[0].origins[0].expires, now + Duration::from_secs(1));
-        let zero = target_candidates(idx, answers, &reference, &[control], "example.test", &inputs, now, Duration::ZERO);
-        assert!(!source_is_current(&zero[0], &inputs).unwrap());
-    }
-
-    #[test]
-    fn candidate_merge_deduplicates_without_refresh_and_requires_full_witness() {
-        let a = test_source_witness();
-        let mut candidate = test_source_candidate(Ipv4Addr::new(8, 8, 8, 8), &a);
-        let before = candidate.origins[0].observed;
-        let original = candidate.clone();
-        for _ in 0..1000 { assert!(candidate.merge(original.clone())); }
-        assert_eq!(candidate.origins.len(), 1);
-        assert_eq!(candidate.origins[0].observed, before);
-        let mut b = a.clone();
-        b.rotate = !b.rotate;
-        assert!(!source_is_current(&candidate, &b).unwrap());
-        assert!(source_is_current(&candidate, &a).unwrap());
-        let mut sets = HashMap::new();
-        sets.insert(a.selected[0], ProxySet { legacy: None, witnessed: vec![(IpAddr::V4(candidate.ip), candidate.origins[0].clone())] });
-        assert!(candidates_from_sets(Some(&sets), &b).is_empty());
-        assert_eq!(candidates_from_sets(Some(&sets), &a).len(), 1);
-    }
-
-    #[test]
-    fn zero_and_short_reference_ttl_pair_with_provider_in_same_step() {
-        for ttl in [0, 1] {
-            let inputs = test_source_witness();
-            let calls = Arc::new(AtomicUsize::new(0));
-            let provider_calls = calls.clone();
-            let fixture = ResolverFixture {
-                provider: Arc::new(move |_, query| {
-                    provider_calls.fetch_add(1, Ordering::Relaxed);
-                    dns_client::synth_reply(query, Some(Ipv4Addr::new(1, 1, 1, 1)), 60)
-                }),
-                reference: Arc::new(move |_, query| dns_client::synth_reply(query, Some(Ipv4Addr::new(1, 1, 1, 1)), ttl).ok_or("invalid fixture".into())),
-                liveness: Arc::new(|_| true), learning: None,
-            };
-            let mut work = ResolverWork::new(thread::current());
-            work.fixture = Some(Arc::new(fixture));
-            let mut cursor = DnsDiscoveryCursor { inputs: Some(inputs.clone()), host: "example.test".into(), pin: Some(0),
-                control: Some(CONTROL_NAMES[0]), phase: DiscoveryPhase::ControlReference, ..Default::default() };
-            let step = discover_next(&inputs, "example.test", &mut cursor, 0, Duration::from_secs(2), Some(&work)).unwrap();
-            assert!(step.candidates.is_empty());
-            assert_eq!(calls.load(Ordering::Relaxed), 1);
-            if ttl == 0 { assert!(matches!(cursor.phase, DiscoveryPhase::ControlReference)); }
-        }
-    }
-
-    #[test]
-    fn discovery_reports_cancellation_deadline_and_input_changes() {
-        let inputs = DnsSourceWitness { selected: Vec::new(), custom: Vec::new(), missing_defaults: false, rotate: true };
-        let mut cancelled = DnsDiscoveryCursor::default();
-        let work = ResolverWork::new(thread::current());
-        work.cancel();
-        assert!(matches!(discover_next(&inputs, "example.test", &mut cancelled, 0, Duration::from_secs(1), Some(&work)), Err(DnsSourceError::Cancelled)));
-        let mut expired = DnsDiscoveryCursor::default();
-        assert!(matches!(discover_next(&inputs, "example.test", &mut expired, 0, Duration::ZERO, None), Err(DnsSourceError::Deadline)));
-        assert_eq!(expired.position, 0);
-        let mut bound = DnsDiscoveryCursor::default();
-        assert!(discover_next(&inputs, "example.test", &mut bound, 0, Duration::from_secs(1), None).is_ok());
-        assert!(matches!(discover_next(&inputs, "other.test", &mut bound, 0, Duration::from_secs(1), None), Err(DnsSourceError::InputChanged)));
-        assert!(matches!(discover_next(&inputs, "example.test", &mut bound, 1, Duration::from_secs(1), None), Err(DnsSourceError::InputChanged)));
-    }
-
-    #[test]
-    fn discovery_reloads_expired_reference_before_more_providers() {
-        let inputs = DnsSourceWitness { selected: vec![0], custom: Vec::new(), missing_defaults: false, rotate: true };
-        let mut cursor = DnsDiscoveryCursor { inputs: Some(inputs.clone()), host: "example.test".into(), pin: Some(0),
-            control: Some(CONTROL_NAMES[0]), phase: DiscoveryPhase::TargetProviders, position: 0,
-            reference: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))], reference_until: Some(Instant::now()), ..Default::default() };
-        let step = discover_next(&inputs, "example.test", &mut cursor, 0, Duration::from_secs(1), None).unwrap();
-        assert!(step.candidates.is_empty());
-        assert!(matches!(cursor.phase, DiscoveryPhase::TargetReference));
-    }
-
-    #[test]
-    fn discovery_advances_after_settled_timeout_to_later_live_provider() {
-        let names = [PROVIDERS[0].name, PROVIDERS[1].name];
-        let inputs = test_source_witness_with_providers(&names, true);
-        let first = inputs.selected[0];
-        let second = inputs.selected[1];
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let recorded = calls.clone();
-        let fixture = ResolverFixture {
-            provider: Arc::new(move |idx, query| {
-                recorded.lock().unwrap().push(idx);
-                dns_client::synth_reply(query, Some(Ipv4Addr::new(1, 1, 1, 1)), 60)
-            }),
-            reference: Arc::new(|_, query| dns_client::synth_reply(query, Some(Ipv4Addr::new(1, 1, 1, 1)), 60).ok_or("invalid fixture".into())),
-            liveness: Arc::new(|_| true), learning: None,
-        };
-        let mut work = ResolverWork::new(thread::current());
-        work.fixture = Some(Arc::new(fixture));
-        work.force_expired_after_attempt = true;
-        let mut cursor = DnsDiscoveryCursor { inputs: Some(inputs.clone()), host: "example.test".into(), pin: Some(0),
-            control: Some(CONTROL_NAMES[0]), phase: DiscoveryPhase::TargetProviders, position: 0,
-            reference: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
-            reference_until: Some(Instant::now() + Duration::from_secs(30)), ..Default::default() };
-        assert!(matches!(discover_next(&inputs, "example.test", &mut cursor, 0, Duration::from_secs(1), Some(&work)), Err(DnsSourceError::SourceTimeout)));
-        assert_eq!(cursor.position, 1);
-        work.force_expired_after_attempt = false;
-        let step = discover_next(&inputs, "example.test", &mut cursor, 0, Duration::from_secs(1), Some(&work)).unwrap();
-        assert!(step.candidates.is_empty());
-        assert_eq!(*calls.lock().unwrap(), vec![first, second]);
-    }
-
-    #[test]
-    fn discovery_advances_reference_after_settled_timeout() {
-        let inputs = test_source_witness();
-        let fixture = ResolverFixture {
-            provider: Arc::new(|_, query| dns_client::synth_reply(query, Some(Ipv4Addr::new(1, 1, 1, 1)), 60)),
-            reference: Arc::new(|_, query| dns_client::synth_reply(query, Some(Ipv4Addr::new(1, 1, 1, 1)), 60).ok_or("invalid fixture".into())),
-            liveness: Arc::new(|_| true), learning: None,
-        };
-        let mut work = ResolverWork::new(thread::current());
-        work.fixture = Some(Arc::new(fixture));
-        work.force_expired_after_attempt = true;
-        let mut cursor = DnsDiscoveryCursor { inputs: Some(inputs.clone()), host: "example.test".into(), pin: Some(0),
-            control: Some(CONTROL_NAMES[0]), phase: DiscoveryPhase::ControlReference, ..Default::default() };
-        assert!(matches!(discover_next(&inputs, "example.test", &mut cursor, 0, Duration::from_secs(1), Some(&work)), Err(DnsSourceError::SourceTimeout)));
-        assert_eq!(cursor.position, 1);
-        assert!(cursor.reference.is_empty());
-        work.force_expired_after_attempt = false;
-        let step = discover_next(&inputs, "example.test", &mut cursor, 0, Duration::from_secs(1), Some(&work)).unwrap();
-        assert!(step.candidates.is_empty());
-    }
-
-    #[test]
-    fn substituted_connection_completes_before_post_winner_learning() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        const NAME: &str = "post-winner-learning.invalid";
-        const LATER: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
-        struct RestoreSets(Option<HashMap<usize, ProxySet>>);
-        impl Drop for RestoreSets {
-            fn drop(&mut self) {
-                *PROXY_SET.lock().unwrap_or_else(|error| error.into_inner()) = self.0.take();
-                forget_names(&[NAME]);
-            }
-        }
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let target = listener.local_addr().unwrap();
-        let _restore_sets = RestoreSets(PROXY_SET.lock().unwrap().take());
-        learn_proxy_addrs(0, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
-        forget_names(&[NAME]);
-        let (held_tx, held_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let release_rx = Mutex::new(release_rx);
-        let fixture = ResolverFixture {
-            provider: Arc::new(|index, query| {
-                (index == 0 && dns_client::question_name(query).as_deref() == Some(NAME))
-                    .then(|| dns_client::synth_reply(query, Some(Ipv4Addr::LOCALHOST), 60).unwrap())
-            }),
-            reference: Arc::new(|_, query| dns_client::synth_reply(query, Some(Ipv4Addr::new(142, 250, 74, 10)), 60).ok_or("synthetic reply malformed".into())),
-            liveness: Arc::new(|_| true),
-            learning: Some(Arc::new(move || {
-                let _ = held_tx.send(());
-                if release_rx.lock().unwrap().recv_timeout(Duration::from_secs(15)).is_ok() {
-                    learn_proxy_addrs(1, vec![IpAddr::V4(LATER)]);
-                }
-            })),
-        };
-        let fixture = Arc::new(fixture);
-        let mut query_owner = ResolverWork::new(thread::current());
-        query_owner.fixture = Some(fixture.clone());
-        let query_work = Arc::new(query_owner);
-        let mut warm_owner = ResolverWork::new(thread::current());
-        warm_owner.fixture = Some(fixture.clone());
-        let warm_work = Arc::new(warm_owner);
-        let maintenance_work = warm_work.clone();
-        let maintenance = thread::spawn(move || warm_owned(&[], 0, &maintenance_work));
-        let learning_entered = held_rx.recv_timeout(Duration::from_secs(2)).is_ok();
-        let worker_work = query_work.clone();
-        let outer = learning_entered.then(|| thread::spawn(move || -> Result<Verdict, String> {
-            let (addresses, _, verdict) = direct_addrs_owned(NAME, 0, &worker_work)?
-                .ok_or_else(|| "fixture did not resolve".to_string())?;
-            if verdict != Verdict::Substituted || !addresses.contains(&Ipv4Addr::LOCALHOST) {
-                return Err("fixture winner was not the classified loopback answer".into());
-            }
-            let candidates = addresses.into_iter().map(|ip| SocketAddr::from((ip, target.port()))).collect();
-            let mut stream = crate::proxy::connect_fixture_addrs(candidates, Duration::from_secs(2))?;
-            stream.write_all(b"ok").map_err(|e| e.to_string())?;
-            Ok(verdict)
-        }));
-        let deadline = Instant::now() + QUERY_TIMEOUT + RACE_BUDGET;
-        let mut received = false;
-        while learning_entered && Instant::now() < deadline {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                let mut bytes = [0; 2];
-                received = stream.read_exact(&mut bytes).is_ok() && &bytes == b"ok";
-                break;
-            }
-            thread::park_timeout(Duration::from_millis(10));
-        }
-        let finish_until = Instant::now() + Duration::from_secs(1);
-        while received && outer.as_ref().is_some_and(|worker| !worker.is_finished()) && Instant::now() < finish_until {
-            thread::park_timeout(Duration::from_millis(10));
-        }
-        let request_finished_before_cancel = outer.as_ref().is_some_and(|worker| worker.is_finished());
-        query_work.cancel();
-        let learning_was_held = !maintenance.is_finished() && !warm_work.is_cancelled();
-        let absent_while_held = !known_proxy_addrs(1).contains(&IpAddr::V4(LATER));
-        let release = release_tx.send(());
-        let result = outer.map(|outer| outer.join());
-        let maintenance_result = maintenance.join();
-        let mut terminals = Vec::new();
-        for work in [&query_work, &warm_work] {
-            while work.has_unreceived() {
-                work.receive_into(&mut terminals).unwrap();
-                if work.has_unreceived() { thread::park_timeout(Duration::from_millis(10)); }
-            }
-        }
-        let learned_after_warm = known_proxy_addrs(1).contains(&IpAddr::V4(LATER));
-        let mut later_owner = ResolverWork::new(thread::current());
-        later_owner.fixture = Some(fixture);
-        let later = direct_addrs_owned(NAME, 0, &later_owner);
-        while later_owner.has_unreceived() {
-            later_owner.receive_into(&mut terminals).unwrap();
-            if later_owner.has_unreceived() { thread::park_timeout(Duration::from_millis(10)); }
-        }
-        let mut facts = Vec::new();
-        let mut panics = Vec::new();
-        let receiving = receive_terminals(&mut terminals, &mut facts, &mut panics);
-        assert!(learning_entered && request_finished_before_cancel && query_work.is_cancelled() && learning_was_held && release.is_ok());
-        assert!(maintenance_result.unwrap().is_ok());
-        assert!(result.unwrap().unwrap().is_ok());
-        assert!(receiving.is_ok() && panics.is_empty());
-        assert!(absent_while_held && learned_after_warm);
-        assert!(later.unwrap().is_some_and(|(addresses, _, verdict)| verdict == Verdict::Substituted && addresses.contains(&LATER)));
-        assert!(received, "connection did not complete while post-winner learning was held (entered={learning_was_held})");
-    }
-
-    #[test]
-    fn owned_race_delivers_winner_before_held_loser_and_receives_original_panic() {
-        const NAME: &str = "owned-resolver-custody.invalid";
-        assert!(PROVIDERS.len() >= 2);
-        forget_names(&[NAME]);
-        let (held_tx, held_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let release_rx = Arc::new(Mutex::new(release_rx));
-        let (panic_tx, panic_rx) = mpsc::channel();
-        let liveness_calls = Arc::new(AtomicUsize::new(0));
-        let calls = liveness_calls.clone();
-        let fixture = ResolverFixture {
-            provider: Arc::new(move |index, query| {
-                if dns_client::question_name(query).as_deref() != Some(NAME) { return None; }
-                if index == 1 {
-                    held_tx.send(()).expect("retained held-start receiver");
-                    release_rx.lock().unwrap().recv().expect("creator releases held racer");
-                    let payload = std::panic::catch_unwind(|| std::panic::panic_any(947u64)).unwrap_err();
-                    panic_tx.send(payload.as_ref() as *const _ as *const () as usize).expect("retained panic identity receiver");
-                    std::panic::resume_unwind(payload);
-                }
-                (index == 0).then(|| dns_client::synth_reply(query, Some(Ipv4Addr::new(192, 0, 2, 47)), 60).unwrap())
-            }),
-            reference: Arc::new(|_, query| dns_client::synth_reply(query, Some(Ipv4Addr::new(142, 250, 74, 10)), 60).ok_or("synthetic reply malformed".into())),
-            liveness: Arc::new(move |_| { calls.fetch_add(1, Ordering::SeqCst); true }),
-            learning: None,
-        };
-        let mut owner = ResolverWork::new(thread::current());
-        owner.fixture = Some(Arc::new(fixture));
-        let work = Arc::new(owner);
-        // This is the same registration helper as the race's four child kinds.
-        let live = dead_addrs_with_work(&[IpAddr::V4(Ipv4Addr::new(203, 0, 113, 247))], true, None, Some(&work));
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let query_work = work.clone();
-        let started = thread::Builder::new().spawn(move || {
-            let query = dns_client::build_query(NAME, 0x4747);
-            let result = resolve_best_owned(&query, 0, &query_work);
-            let delivery = reply_tx.send(result.as_ref().ok().and_then(|reply| reply.as_ref().map(|reply| reply.0.clone())));
-            (result, delivery)
-        });
-        let outer = match started {
-            Ok(outer) => outer,
-            Err(error) => {
-                work.cancel();
-                let mut retained = Vec::new();
-                while work.has_unreceived() {
-                    let _ = work.receive_into(&mut retained);
-                    if work.has_unreceived() { thread::park_timeout(Duration::from_millis(50)); }
-                }
-                panic!("outer fixture worker did not start after nested settlement: {error}");
-            }
-        };
-        let held_started = held_rx.recv_timeout(QUERY_TIMEOUT);
-        let early_reply = reply_rx.recv_timeout(QUERY_TIMEOUT + RACE_BUDGET);
-        let until = Instant::now() + QUERY_TIMEOUT;
-        while !outer.is_finished() && Instant::now() < until { thread::park_timeout(Duration::from_millis(50)); }
-        let outer_done_early = outer.is_finished();
-        let mut terminals = Vec::new();
-        let mut receiving_error = work.poll_finished().err();
-        let joined_still_owed = work.has_unreceived() && work.state.lock().unwrap().entries.iter()
-            .any(|entry| matches!(entry.state, ResolverEntryState::Finished(Some(_))));
-        if let Err(error) = work.receive_into(&mut terminals) { receiving_error.get_or_insert(error); }
-        let pending_after_outer = work.has_unreceived();
-        work.cancel();
-        let pending_after_cancel = work.has_unreceived();
-        let admission_closed = work.spawn(ResolverChildKind::Provider(0), |_| ResolverChildResult {
-            observation: ResolverObservation::NoAnswer, delivery: ResolverDelivery::NoMessage, cancelled: false,
-        }).is_err();
-        // Always release/receive resources before any observation assertion.
-        let release = release_tx.send(());
-        while !outer.is_finished() { thread::park_timeout(Duration::from_millis(50)); }
-        let outer = outer.join();
-        while work.has_unreceived() {
-            if let Err(error) = work.receive_into(&mut terminals) { receiving_error.get_or_insert(error); }
-            if work.has_unreceived() { thread::park_timeout(Duration::from_millis(50)); }
-        }
-        let original_address = panic_rx.recv_timeout(QUERY_TIMEOUT);
-        forget_names(&[NAME]);
-        assert!(live.unwrap().is_empty());
-        assert_eq!(liveness_calls.load(Ordering::SeqCst), 1);
-        held_started.unwrap();
-        release.unwrap();
-        assert!(receiving_error.is_none());
-        let packet = early_reply.unwrap().expect("actual resolver winner delivered");
-        assert!(dns_client::answer_addrs(&packet).contains(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 47))));
-        assert!(outer_done_early && joined_still_owed && pending_after_outer && pending_after_cancel && admission_closed);
-        let (semantic, delivery) = outer.unwrap();
-        assert!(semantic.unwrap().is_some());
-        assert!(delivery.is_ok());
-        assert!(terminals.iter().any(|terminal| matches!(terminal.kind, ResolverChildKind::Liveness(_))));
-        assert!(terminals.iter().any(|terminal| matches!(&terminal.result, ResolverTermination::Finished(Ok(result)) if matches!(result.observation, ResolverObservation::Reply(_)))));
-        let expected = original_address.unwrap();
-        let mut facts = Vec::new();
-        let mut panics = Vec::new();
-        receive_terminals(&mut terminals, &mut facts, &mut panics).unwrap();
-        assert!(terminals.is_empty() && !work.has_unreceived());
-        assert_eq!(panics.len(), 1);
-        assert_eq!(panics[0].as_ref() as *const _ as *const () as usize, expected);
-        assert_eq!(panics[0].downcast_ref::<u64>(), Some(&947));
-        assert!(facts.iter().any(|fact| fact.contains("reply_bytes=")));
-    }
-
     fn v4(s: &str) -> IpAddr {
         IpAddr::V4(s.parse().unwrap())
     }
@@ -3427,13 +2247,85 @@ mod tests {
     }
 
     #[test]
-    fn custom_dns_takes_plain_ipv4_and_refuses_loops_and_junk() {
-        let got = parse_custom_dns("77.88.8.8, 77.88.8.8;1.1.1.1  127.0.0.53 0.0.0.0 junk 224.0.0.1");
+    fn custom_dns_takes_ipv4_doh_and_dot_and_refuses_junk() {
+        let got = parse_custom_dns(
+            "77.88.8.8, 77.88.8.8;1.1.1.1 https://dns.example.com/dns-query tls://Dns.Example.com tls://x.example.org:8853 https://dns.example.com",
+        )
+        .unwrap();
         assert_eq!(
             got,
-            vec!["77.88.8.8".parse::<Ipv4Addr>().unwrap(), "1.1.1.1".parse().unwrap()]
+            vec![
+                CustomServer::Udp("77.88.8.8".parse().unwrap()),
+                CustomServer::Udp("1.1.1.1".parse().unwrap()),
+                CustomServer::Doh {
+                    host: "dns.example.com".into(),
+                    path: "/dns-query".into()
+                },
+                CustomServer::Dot {
+                    host: "dns.example.com".into(),
+                    port: 853
+                },
+                CustomServer::Dot {
+                    host: "x.example.org".into(),
+                    port: 8853
+                },
+            ]
         );
-        assert!(parse_custom_dns("").is_empty());
+        assert!(parse_custom_dns("").unwrap().is_empty());
+        for bad in [
+            "127.0.0.53",
+            "0.0.0.0",
+            "224.0.0.1",
+            "junk",
+            "dns.example.com",
+            "http://dns.example.com/dns-query",
+            "quic://dns.example.com",
+            "https://dns.example.com:8443/dns-query",
+            "https://localhost/dns-query",
+            "tls://dns.example.com:0",
+            "https://127.0.0.1/dns-query",
+        ] {
+            assert!(parse_custom_dns(bad).is_err(), "{} must be refused", bad);
+        }
+        // One bad word spoils the whole line: nothing half-saved.
+        assert!(parse_custom_dns("77.88.8.8 junk").is_err());
+    }
+
+    /// Live: each kind of custom server answers a real question.
+    #[test]
+    #[ignore = "needs a live network"]
+    fn live_custom_servers_answer_over_udp_doh_and_dot() {
+        let query = dns_client::build_query("example.com", 0x2222);
+        for text in [
+            "8.8.8.8",
+            "https://dns.google/dns-query",
+            "tls://dns.google",
+            "tls://1.1.1.1",
+        ] {
+            let server = parse_custom_server(text).unwrap();
+            let reply = ask_custom(&server, &query, 0, Duration::from_secs(5))
+                .unwrap_or_else(|| panic!("{} gave no answer", text));
+            assert!(!dns_client::answer_addrs(&reply).is_empty(), "{}", text);
+            assert_eq!(&reply[0..2], &query[0..2], "{}", text);
+        }
+    }
+
+    #[test]
+    fn a_custom_server_is_written_back_the_way_it_was_read() {
+        for text in [
+            "77.88.8.8",
+            "https://dns.example.com/dns-query",
+            "tls://dns.example.com",
+            "tls://a.example.org:8853",
+        ] {
+            assert_eq!(parse_custom_server(text).unwrap().text(), text);
+        }
+        assert_eq!(
+            parse_custom_server("https://dns.example.com")
+                .unwrap()
+                .text(),
+            "https://dns.example.com/dns-query"
+        );
     }
 
     /// The slot carries no address of its own (like a DoH provider): it must never
@@ -3446,6 +2338,16 @@ mod tests {
             .expect("a custom slot");
         assert!(p.v4.is_empty() && p.v6.is_empty());
         assert!(!fallback_v4().iter().any(|a| a.is_empty()));
+    }
+
+    #[test]
+    fn dns_ai_is_the_only_builtin_and_no_doh_address_leaks_to_nrpt() {
+        let builtin: Vec<_> = PROVIDERS.iter().filter(|p| !matches!(p.transport, Transport::Custom)).collect();
+        assert_eq!(builtin.len(), 1);
+        assert_eq!(builtin[0].name, "dns-ai.ru");
+        assert!(matches!(builtin[0].transport, Transport::Doh(_)));
+        assert!(fallback_v4().is_empty());
+        assert!(all_v6().is_empty());
     }
 
     #[test]
@@ -3567,12 +2469,14 @@ mod tests {
             .iter()
             .find(|p| matches!(p.transport, Transport::Doh(_)))
             .expect("a DoH provider");
-        let udp = PROVIDERS
-            .iter()
-            .find(|p| matches!(p.transport, Transport::Udp))
-            .expect("a UDP provider");
+        let udp = Provider {
+            name: "fixture",
+            v4: &["192.0.2.53"],
+            v6: &[],
+            transport: Transport::Udp,
+        };
         assert_eq!(one_shot_floor(doh, FAST_PATH_TIMEOUT), DOH_FAST_TIMEOUT);
-        assert_eq!(one_shot_floor(udp, FAST_PATH_TIMEOUT), FAST_PATH_TIMEOUT);
+        assert_eq!(one_shot_floor(&udp, FAST_PATH_TIMEOUT), FAST_PATH_TIMEOUT);
         // A caller that already budgeted more keeps it.
         assert_eq!(one_shot_floor(doh, QUERY_TIMEOUT), QUERY_TIMEOUT);
         // And the whole thing still fits inside the second Windows waits (I23).
@@ -4091,8 +2995,8 @@ mod tests {
     /// ten-minute verdict meant the relay advertised a corpse for nine of them.
     #[test]
     fn the_warm_path_re_probes_instead_of_trusting_what_it_knows() {
-        let addr = v4("203.0.113.9");
-        // A blackhole address in TEST-NET-3: nothing there, so a probe says dead.
+        let addr = v4("127.0.0.254");
+        // A blackhole address: nothing there, so a probe says dead.
         remember_liveness(addr, true);
         assert_eq!(cached_liveness(&addr), Some(true));
 
