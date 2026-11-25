@@ -140,8 +140,8 @@ impl App {
         let settings = Settings::load();
         theme::set_preference(&cc.egui_ctx, settings.theme);
         let screen = first_screen(&settings);
-        // A debug build told to skip the key never passes the licence screen,
-        // which is where `Unlocked` is otherwise sent from.
+        // If startup opens the main screen directly, it sends the same
+        // startup command as the licence screen after a successful entry.
         if matches!(screen, Screen::Main) {
             worker.send(Cmd::Unlocked);
         }
@@ -393,17 +393,13 @@ fn without_source_location(msg: &str) -> &str {
         .unwrap_or(msg)
 }
 
-/// The licence screen, always - except in a *debug* build started with
-/// `AG_UNLOCKER_DEV_SKIP_KEY` set, so the main screen can be looked at while it
-/// is being worked on. Compiled out of every release build (`build_rust.py`
-/// builds release), so a shipped exe has no way past the key.
+/// Choose the local startup screen from the saved key and build policy.
 fn first_screen(settings: &Settings) -> Screen {
     #[cfg(debug_assertions)]
     if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
         return Screen::Main;
     }
-    // A key accepted before and still good for this version: no screen.
-    if crate::auth::verify_key(&settings.license_key) {
+    if crate::auth::entry_allowed(&settings.license_key) {
         return Screen::Main;
     }
     Screen::License

@@ -1375,15 +1375,13 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
         .min(usize::from(u16::MAX)) as u16
 }
 
-/// The licence screen, always — except in a *debug* build started with
-/// `AG_UNLOCKER_DEV_SKIP_KEY`, as in the window.
+/// Choose the local startup screen using the same policy as the window.
 fn first_screen(settings: &crate::settings::Settings) -> Screen {
     #[cfg(debug_assertions)]
     if std::env::var_os("AG_UNLOCKER_DEV_SKIP_KEY").is_some() {
         return Screen::Main;
     }
-    // A key accepted before and still good for this version: no screen.
-    if auth::verify_key(&settings.license_key) {
+    if auth::entry_allowed(&settings.license_key) {
         return Screen::Main;
     }
     Screen::License

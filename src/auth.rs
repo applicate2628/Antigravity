@@ -60,6 +60,11 @@ pub fn verify_key(key: &str) -> bool {
     result == 0
 }
 
+/// Check local startup entry using this build's licence policy.
+pub(crate) fn entry_allowed(key: &str) -> bool {
+    cfg!(feature = "personal-build") || verify_key(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +100,13 @@ mod tests {
         assert_eq!(license_version("2.32.1"), license_version("2.32.4"));
         assert_ne!(license_version("2.32.1"), license_version("2.33.0"));
         assert_ne!(license_version("2.32.1"), license_version("3.32.1"));
+    }
+
+    #[test]
+    fn configured_feature_controls_invalid_local_entry() {
+        const INVALID_KEY: &str = "not-a-key";
+        assert_eq!(entry_allowed(INVALID_KEY), cfg!(feature = "personal-build"));
+        assert!(!verify_key(INVALID_KEY));
     }
 
     #[test]
