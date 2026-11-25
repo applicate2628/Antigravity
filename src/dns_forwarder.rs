@@ -2543,23 +2543,13 @@ pub fn run_proxy_service(root: std::sync::Arc<crate::command_lifetime::CommandLi
 fn spawn_proxy_env_maintainer(root: std::sync::Arc<crate::command_lifetime::CommandLifetime>) {
     thread::spawn(move || {
         let var = crate::endpoint::PROXY_ENV_VAR;
-        // Before the wait, and unconditionally: retiring the user-wide pair an
-        // older build wrote has nothing to do with whether *our* listener came
-        // up. Behind the wait it would be skipped on exactly the machines that
-        // need it most - the ones where 53129 is taken or reserved, where the old
-        // value names a port that no longer answers and takes the whole machine's
-        // proxy-aware traffic with it (G20, G31).
         #[cfg(windows)]
         let mut pending: Option<crate::command_lifetime::PendingCommand> = None;
         #[cfg(windows)]
-        let legacy = match root.call_with_outcome("legacy proxy environment", |owner| crate::endpoint::remove_legacy_proxy_env(owner, &proxy::proxy_url())) {
-            Ok((value, receipt)) => { if receipt.pending() { pending = Some(receipt); } value },
-            Err(error) => Err(error),
-        };
+        let mut environment_result: Result<(), String> = Ok(());
         #[cfg(not(windows))]
         let legacy = crate::endpoint::remove_legacy_proxy_env(&proxy::proxy_url());
-        #[cfg(windows)]
-        let mut environment_result = legacy.as_ref().map(|_| ()).map_err(Clone::clone);
+        #[cfg(not(windows))]
         match legacy {
             Ok(true) => log_proxy("снята прежняя общесистемная HTTPS_PROXY"),
             Ok(false) => {}

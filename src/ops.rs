@@ -1352,7 +1352,7 @@ fn receive_shutdown_request(ctx: &mut Ctx, command: &Option<Cmd>) {
 #[cfg(windows)]
 fn observe_system(owner: &mut crate::utils::CommandOutcome, cancel: &AtomicBool, image: Result<Arc<crate::windows_coordinator::process_identity::CurrentImage>, String>) -> Result<WindowsSystemObservation, String> {
     if cancel.load(Ordering::SeqCst) { return Err("Наблюдение отменено до начала".into()); }
-    let rules = dns::checked_nrpt_state(owner).map(|state| (state.core_applied, state.owned_rules_present));
+    let rules = dns::checked_nrpt_state(owner).map(|state| (state.core_applied, state.needs_retirement()));
     let (background, transport, transport_error) = match crate::settings::checked_transport_intent() {
         crate::settings::TransportIntent::Explicit { requirements, .. } => {
             match background::observe_background_for_transport(cancel, None, requirements.active_config) {
@@ -2889,21 +2889,9 @@ fn dispatch_owned_command(ctx: &mut Ctx, command: Cmd) -> Result<NativeCompletio
             let effects = settings.checked_transport_effects()?;
             if specified_wish(&effects.carrier) == Some(true) || specified_wish(&effects.watchdog) == Some(true) {
                 ctx.busy(Some("Чиню службу обхода"));
-                let (handled, receiving) = background::repair_current_generation_with_receiving(
+                let (_, receiving) = background::repair_current_generation_with_receiving(
                     &ctx.native_cancel, ctx.lifetime.retained_image());
                 ctx.retain_background_receiving(receiving)?;
-                if handled {
-                    push_status(ctx, Scan::System);
-                    return Ok(NativeCompletion::Retired);
-                }
-                let (handled, receiving) = background::repair_prior_transition_with_receiving(
-                    background::BackgroundChanges { relay: specified_wish(&effects.carrier), watchdog: specified_wish(&effects.watchdog) },
-                    &ctx.native_cancel, ctx.lifetime.retained_image());
-                ctx.retain_background_receiving(receiving)?;
-                if handled {
-                    push_status(ctx, Scan::System);
-                    return Ok(NativeCompletion::Retired);
-                }
             }
         }
     }
@@ -4364,7 +4352,7 @@ fn select_profile(ctx: &mut Ctx, selection: ProfileSelection) -> Result<crate::s
 fn reconcile_explicit_carrier(ctx: &mut Ctx, expected: crate::settings::ActiveTransportConfig, watchdog: Option<bool>) -> Result<(), String> {
     let requirements = ctx.settings.transport_requirements()?;
     if requirements.active_config != expected { return Err("Сохранённый режим подключения изменился до получения службы.".into()); }
-    if expected.profile == crate::settings::TransportProfile::SystemTcp && expected.client_proxy && ctx.with_command(dns::checked_nrpt_state)?.owned_rules_present {
+    if expected.profile == crate::settings::TransportProfile::SystemTcp && expected.client_proxy && ctx.with_command(dns::checked_nrpt_state)?.needs_retirement() {
         return Err("Собственные правила DNS всё ещё присутствуют; системное подключение не подтверждено.".into());
     }
     let cancellation = ctx.native_cancel.clone();
@@ -5301,7 +5289,7 @@ fn inspect_native_apply(owner: &mut crate::utils::CommandOutcome, wanted: &Setti
         Some(NativeRelayFacts { running: matches!(&observation.relay, background::RoleObservation::Running) })
     } else { None };
     NativeApplyPlan::receive_with_effects(&NativeApplyFacts {
-        core_rules: rules.core_applied, owned_rules: rules.owned_rules_present,
+        core_rules: rules.core_applied, owned_rules: rules.needs_retirement(),
         relay_task: !matches!(&observation.relay, background::RoleObservation::Absent), relay,
         watchdog: observation.watchdog,
         program_outdated: observation.selected_delivery_required,
@@ -5655,7 +5643,7 @@ fn repair(ctx: &mut Ctx) -> Result<(), String> {
             crate::settings::TransportIntent::Explicit { requirements, .. } if requirements.active_config == expected => {}
             _ => return Err("Сохранённый режим подключения не подтверждён; восстановление не начиналось.".into()),
         }
-        let rules_present = ctx.with_command(dns::checked_nrpt_state)?.owned_rules_present;
+        let rules_present = ctx.with_command(dns::checked_nrpt_state)?.needs_retirement();
         let observed = background::observe_background_for_transport(&ctx.native_cancel,
             Some(ctx.lifetime.retained_image()?), expected)?;
         let watchdog = watchdog_change(specified_wish(&ctx.settings.checked_transport_effects()?.watchdog), observed.background.watchdog);
@@ -5686,7 +5674,7 @@ fn repair(ctx: &mut Ctx) -> Result<(), String> {
     }
     match specified_wish(&effects.dns) {
         Some(true) => enable_dns_effect(ctx)?,
-        Some(false) if ctx.with_command(dns::checked_nrpt_state)?.owned_rules_present => remove_dns_rules_effect(ctx)?,
+        Some(false) if ctx.with_command(dns::checked_nrpt_state)?.needs_retirement() => remove_dns_rules_effect(ctx)?,
         _ => {}
     }
     if let Some(wish) = specified_wish(&effects.local_proxy) {
@@ -6026,7 +6014,7 @@ fn disable_client_patch_received(ctx: &mut Ctx, #[cfg(windows)] plan: Option<&Al
     #[cfg(windows)]
     {
         if plan.is_none() && specified_wish(&ctx.settings.checked_transport_effects()?.dns) == Some(false)
-            && ctx.with_command(dns::checked_nrpt_state)?.owned_rules_present {
+            && ctx.with_command(dns::checked_nrpt_state)?.needs_retirement() {
             remove_dns_rules_effect(ctx)?;
         }
         let cancellation = ctx.native_cancel.clone();
@@ -6365,8 +6353,8 @@ fn disable_dns_effect(ctx: &mut Ctx) -> Result<(), String> {
 fn remove_dns_rules_effect(ctx: &mut Ctx) -> Result<(), String> {
     ctx.with_command(dns::remove_dns_nrpt_checked)?;
     dns::invalidate_cache();
-    if ctx.with_command(dns::checked_nrpt_state)?.owned_rules_present {
-        return Err("Собственные правила DNS всё ещё присутствуют; удаление не подтверждено.".into());
+    if ctx.with_command(dns::checked_nrpt_state)?.needs_retirement() {
+        return Err("Остались собственные изменения DNS; удаление не подтверждено.".into());
     }
     ctx.log(Level::Ok, "Правила DNS сняты.");
     Ok(())
@@ -6548,6 +6536,17 @@ fn reapply_dns_rules(ctx: &mut Ctx) -> bool {
 
 fn reapply_dns_rules_checked(ctx: &mut Ctx) -> Result<bool, String> {
     if ctx.native_cancel.load(Ordering::SeqCst) { return Err("Изменение правил DNS отменено.".into()); }
+    #[cfg(windows)]
+    {
+        let state = ctx.with_command(dns::checked_nrpt_state)?;
+        let Some(apply) = dns_reapply_action(dns::saved_dns_wish()?, &state) else { return Ok(false); };
+        if !apply {
+            if !is_admin() { return Err("Нужны права администратора для завершения отключения DNS.".into()); }
+            remove_dns_rules_effect(ctx)?;
+            return Ok(true);
+        }
+    }
+    #[cfg(not(windows))]
     if !ctx.with_command(dns::is_nrpt_applied)? {
         return Ok(false);
     }
@@ -6571,19 +6570,23 @@ fn reapply_dns_rules_checked(ctx: &mut Ctx) -> Result<bool, String> {
     Ok(true)
 }
 
+#[cfg(windows)]
+fn dns_reapply_action(saved: Option<bool>, state: &dns::NrptState) -> Option<bool> {
+    match saved {
+        Some(true) if state.core_applied || state.recovery_pending => Some(true),
+        Some(false) if state.needs_retirement() => Some(false),
+        _ => None,
+    }
+}
+
 // --- local proxy -----------------------------------------------------------
 
 fn enable_local_proxy_effect(ctx: &mut Ctx) -> Result<(), String> {
     ctx.log(Level::Step, "Локальный прокси");
     let url = proxy::proxy_url();
 
-    // 1. Windows and Linux clean up legacy user-wide values before enabling our
-    //    private variable (D19). macOS leaves the standard variables alone.
-    #[cfg(windows)]
-    let legacy = ctx.with_command(|owner| endpoint::remove_legacy_proxy_env(owner, &url));
     #[cfg(not(windows))]
-    let legacy = endpoint::remove_legacy_proxy_env(&url);
-    match legacy {
+    match endpoint::remove_legacy_proxy_env(&url) {
         Ok(true) => ctx.log(Level::Ok, "Прежняя общесистемная HTTPS_PROXY снята."),
         Ok(false) => {}
         Err(e) => {
@@ -7889,6 +7892,20 @@ mod tests {
             relay: None, watchdog: background::RoleObservation::Running, program_outdated: Some(false) };
         let plan = NativeApplyPlan::receive(&wanted, &facts).unwrap();
         assert!(!plan.enable_dns && !plan.disable_dns && !plan.ensure_relay && !plan.stop_relay);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dns_reapply_uses_saved_wish_to_choose_pending_recovery_direction() {
+        let mut state = dns::NrptState { core_applied: false, owned_rules_present: false,
+            recovery_pending: true, auxiliary_cleanup: false };
+        assert_eq!(dns_reapply_action(Some(false), &state), Some(false));
+        assert_eq!(dns_reapply_action(Some(true), &state), Some(true));
+        assert_eq!(dns_reapply_action(None, &state), None);
+        state.recovery_pending = false;
+        state.auxiliary_cleanup = true;
+        assert_eq!(dns_reapply_action(Some(false), &state), Some(false));
+        assert_eq!(dns_reapply_action(Some(true), &state), None);
     }
 
     #[cfg(windows)]

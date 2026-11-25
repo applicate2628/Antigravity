@@ -123,9 +123,15 @@ pub struct CommandOutcome {
     stop_result: Option<std::io::Result<()>>, deadline: Option<Instant>, limit: Option<Duration>,
     deadline_expired: bool, deadline_unrepresentable: bool,
     capture_eof: bool, capture_unavailable: bool,
+    #[cfg(windows)]
+    mutation_lease: Option<std::sync::Arc<dyn Send + Sync>>,
 }
 
 impl CommandOutcome {
+    #[cfg(windows)]
+    pub(crate) fn retain_mutation_lease(&mut self, lease: std::sync::Arc<dyn Send + Sync>) {
+        if self.is_empty() { self.mutation_lease = Some(lease); }
+    }
     pub fn is_empty(&self) -> bool { self.job.is_none() && self.start_error.is_none() && self.qualification_error.is_none() }
     pub fn stdout(&self) -> &[u8] { &self.stdout }
     pub fn stderr(&self) -> &[u8] { &self.stderr }

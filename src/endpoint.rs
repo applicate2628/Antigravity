@@ -270,13 +270,8 @@ const NO_PROXY_VALUE: &str = "127.0.0.1,localhost,::1";
 /// upgrading passes through here and through no undo path.
 #[cfg(target_os = "windows")]
 pub fn apply_proxy(owner: &mut CommandOutcome, url: &str, ca_path: &str) -> Result<Outcome, String> {
-    let migrated = remove_legacy_proxy_env(owner, url)?;
     if current_env(owner, PROXY_ENV_VAR)?.as_deref() == Some(url) {
-        return Ok(if migrated {
-            Outcome::Applied
-        } else {
-            Outcome::AlreadySet
-        });
+        return Ok(Outcome::AlreadySet);
     }
     set_env(owner, PROXY_ENV_VAR, Some(url))?;
     // The relay route terminates no TLS and installs no CA, so it needs no
@@ -285,39 +280,6 @@ pub fn apply_proxy(owner: &mut CommandOutcome, url: &str, ca_path: &str) -> Resu
         set_env(owner, NODE_CA_ENV_VAR, Some(ca_path))?;
     }
     Ok(Outcome::Applied)
-}
-
-/// Takes the user-wide `HTTPS_PROXY`/`NO_PROXY` of builds up to `2.11.0_4` back
-/// off, and only when the values are the ones this tool wrote.
-///
-/// This is the migration that has to happen on *every* path a machine can take
-/// out of an old build: menu 1 (via `apply_proxy`), the relay's
-/// `ensure_proxy_env`, and both undo paths. Skipping it would leave the exact
-/// state the owner asked to be rid of - and, worse, one naming a port that the
-/// new scheme still binds, so it would keep silently working and nobody would
-/// notice the whole machine was still routed through loopback.
-///
-/// `Ok(true)` when something came off. A value that is not ours is never
-/// touched: `HTTPS_PROXY` is also where a user's own proxy lives (I45).
-#[cfg(target_os = "windows")]
-pub fn remove_legacy_proxy_env(owner: &mut CommandOutcome, url: &str) -> Result<bool, String> {
-    let proxy = current_env(owner, LEGACY_PROXY_ENV_VAR)?;
-    let no_proxy = current_env(owner, NO_PROXY_ENV_VAR)?;
-    let (drop_proxy, drop_no_proxy) = legacy_removals(
-        proxy.as_deref(),
-        no_proxy.as_deref(),
-        url,
-    );
-    let mut removed = false;
-    if drop_proxy {
-        set_env(owner, LEGACY_PROXY_ENV_VAR, None)?;
-        removed = true;
-    }
-    if drop_no_proxy {
-        set_env(owner, NO_PROXY_ENV_VAR, None)?;
-        removed = true;
-    }
-    Ok(removed)
 }
 
 /// Which of the two legacy variables this tool may take off, given what they
@@ -867,7 +829,7 @@ fn environment_d_path() -> Result<PathBuf, String> {
 /// Removes them, but only while they still hold what we wrote - a user may have
 /// a proxy of their own, and taking that away would be worse than any bug here.
 #[cfg(target_os = "windows")]
-pub fn remove_proxy(owner: &mut CommandOutcome, url: &str, ca_path: &str) -> Result<(), String> {
+pub fn remove_proxy(owner: &mut CommandOutcome, _url: &str, ca_path: &str) -> Result<(), String> {
     // Preserve the first uncertain effect and stop dependent mutations until
     // the containing owner has received the outcome.
 
@@ -878,9 +840,6 @@ pub fn remove_proxy(owner: &mut CommandOutcome, url: &str, ca_path: &str) -> Res
     if current_env(owner, PROXY_ENV_VAR)?.is_some() {
         set_env(owner, PROXY_ENV_VAR, None)?;
     }
-    // The user-wide variables of builds up to `2.11.0_4`, value-scoped because
-    // `HTTPS_PROXY` is also where a user's own proxy lives.
-    remove_legacy_proxy_env(owner, url)?;
     clear_node_ca(owner, ca_path)?;
 
     Ok(())
@@ -1144,7 +1103,7 @@ pub fn ensure_proxy_env(owner: &mut CommandOutcome, ours: &str) -> Result<Outcom
         return Ok(Outcome::AlreadySet);
     }
     if current_env(owner, PROXY_ENV_VAR)?.is_some_and(|value| is_our_proxy_value(&value, ours)) {
-        return Ok(if remove_legacy_proxy_env(owner, ours)? { Outcome::Applied } else { Outcome::AlreadySet });
+        return Ok(Outcome::AlreadySet);
     }
     apply_proxy(owner, ours, "")
 }
@@ -1165,7 +1124,7 @@ pub fn remove_proxy_if_ours(url: &str, ca_path: &str) -> Result<bool, String> {
 }
 #[cfg(target_os = "windows")]
 pub fn remove_proxy_if_ours(owner: &mut CommandOutcome, url: &str, ca_path: &str) -> Result<bool, String> {
-    if current_env(owner, PROXY_ENV_VAR)?.is_none() { return remove_legacy_proxy_env(owner, url); }
+    if current_env(owner, PROXY_ENV_VAR)?.is_none() { return Ok(false); }
     remove_proxy(owner, url, ca_path).map(|()| true)
 }
 #[cfg(target_os = "windows")]

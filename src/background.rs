@@ -1202,7 +1202,7 @@ mod windows_impl {
         if legacy_roles_already_running(received, BackgroundDesired { relay: true, watchdog: before.watchdog_enabled })? {
             return Ok(());
         }
-        let program = ensure_program(received, BackgroundChanges { relay: Some(true), watchdog: None }, ImageDemand::KeepCompatible)?;
+        let program = ensure_program(received, BackgroundChanges { relay: Some(true), watchdog: None }, ImageDemand::KeepCompatible, false)?;
         let receipt = scheduler("relay", true, &program, received)?;
         require_running(&receipt, "relay")
     }
@@ -1464,7 +1464,7 @@ mod windows_impl {
     }
     pub(crate) fn ensure_installed_with_receiving() -> BackgroundReceiving {
         uncancelled_receiving("ensureInstalled", |received| {
-            ensure_program(received, BackgroundChanges { relay: None, watchdog: None }, ImageDemand::KeepCompatible).map(|_| ())
+            ensure_program(received, BackgroundChanges { relay: None, watchdog: None }, ImageDemand::KeepCompatible, false).map(|_| ())
         })
     }
 
@@ -2297,7 +2297,8 @@ mod windows_impl {
     }
 
     fn ensure_managed_program(received: &mut BackgroundRun<'_>, installed: CheckedPath, scheduler: &task_scheduler::Scheduler,
-        changes: BackgroundChanges, demand: ImageDemand, explicit_prior_repair: bool) -> Result<Option<CheckedPath>, String> {
+        changes: BackgroundChanges, demand: ImageDemand, explicit_prior_repair: bool,
+        clean_only: bool) -> Result<Option<CheckedPath>, String> {
         let known = task_scheduler::Programs { managed: Some(&installed), legacy: None };
         let mut selected = scheduler.receive(&["relay", "watchdog"], &known, received)?;
         let (decision, source) = if explicit_prior_repair {
@@ -2328,6 +2329,7 @@ mod windows_impl {
             receive_current_image_decision(received, &installed, &selected, demand)?
         };
         if decision == CurrentImageDecision::ReuseCurrent { return Ok(Some(installed)); }
+        if clean_only { return Err(CLEAN_INSTALL_REQUIRED.into()); }
         let source_lease = match source { Some(lease) => lease, None => receive_copy_source(received)? };
         let same_bytes = installed.read_snapshot()?.as_slice() == source_lease.source_bytes()?;
         if demand == ImageDemand::DeliverSelectedImage {
@@ -2529,7 +2531,7 @@ mod windows_impl {
             if scheduler.references_program(locations.legacy_program())? { return Ok(()); }
             let installed = windows_installation::checked_background_path(received.lease()?, destination, PathKind::File)?;
             received.delivery_selected = true;
-            handled = ensure_managed_program(received, installed, &scheduler, changes, ImageDemand::DeliverSelectedImage, true)?.is_some();
+            handled = ensure_managed_program(received, installed, &scheduler, changes, ImageDemand::DeliverSelectedImage, true, false)?.is_some();
             Ok(())
         });
         (handled, actual)
@@ -2539,18 +2541,21 @@ mod windows_impl {
     /// any collision, and actual identity/bytes are independently read back
     /// before the scheduler may observe the executable. No source-byte mismatch
     /// can authorize stopping an existing task or overwriting its image.
-    fn ensure_program(received: &mut BackgroundRun<'_>, changes: BackgroundChanges, demand: ImageDemand) -> Result<CheckedPath, String> {
+    fn ensure_program(received: &mut BackgroundRun<'_>, changes: BackgroundChanges, demand: ImageDemand,
+        clean_only: bool) -> Result<CheckedPath, String> {
         received.ready()?;
         let destination = received.program_path();
         let locations = windows_installation::background_locations()?;
         let scheduler = task_scheduler::Scheduler::connect()?;
         if scheduler.references_program(locations.legacy_program())? {
+            if clean_only { return Err(CLEAN_INSTALL_REQUIRED.into()); }
             return migrate_legacy(received, changes, demand);
         }
         match fs::symlink_metadata(&destination) {
             Ok(_) => {
                 let installed = windows_installation::checked_background_path(received.lease()?, &destination, PathKind::File)?;
-                return ensure_managed_program(received, installed, &scheduler, changes, demand, false)?
+                let demand = if clean_only { ImageDemand::DeliverSelectedImage } else { demand };
+                return ensure_managed_program(received, installed, &scheduler, changes, demand, false, clean_only)?
                     .ok_or_else(|| "managed program receiving was not applicable".into());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2571,6 +2576,13 @@ mod windows_impl {
         source_lease.source_bytes()?;
         record_published_generation(received, &installed, &source_lease)?;
         Ok(installed)
+    }
+
+    const CLEAN_INSTALL_REQUIRED: &str =
+        "Существующая фоновая служба сохранена. Для запуска текущей версии нужна проверенная чистая установка.";
+
+    fn requests_background_image(changes: BackgroundChanges) -> bool {
+        changes.relay == Some(true) || changes.watchdog == Some(true)
     }
 
     fn require_running(receipt: &TaskReceipt, role: &str) -> Result<(), String> {
@@ -2601,7 +2613,7 @@ mod windows_impl {
             if legacy_roles_already_running(received, BackgroundDesired { relay: before.relay_enabled, watchdog: true })? {
                 return Ok(());
             }
-            let program = ensure_program(received, BackgroundChanges { relay: None, watchdog: Some(true) }, ImageDemand::KeepCompatible)?;
+            let program = ensure_program(received, BackgroundChanges { relay: None, watchdog: Some(true) }, ImageDemand::KeepCompatible, false)?;
             let receipt = scheduler("watchdog", true, &program, received)?;
             require_running(&receipt, "watchdog")
         })
@@ -2640,13 +2652,10 @@ mod windows_impl {
         image: Result<std::sync::Arc<windows_coordinator::process_identity::CurrentImage>, String>,
         expected: Option<crate::settings::ActiveTransportConfig>) -> BackgroundReceiving {
         receiving("reconcileBackgroundProfile", cancelled, Some(image), |received| {
-            received.delivery_selected = demand == ImageDemand::DeliverSelectedImage;
-            if let (Some(relay), Some(watchdog)) = (changes.relay, changes.watchdog) {
-                if expected.is_none() && demand == ImageDemand::KeepCompatible
-                    && legacy_roles_already_running(received, BackgroundDesired { relay, watchdog })? { return Ok(()); }
-            }
-            if changes.relay == Some(true) || changes.watchdog == Some(true) {
-                let program = ensure_program(received, changes, demand)?;
+            let need_image = requests_background_image(changes);
+            received.delivery_selected = need_image || demand == ImageDemand::DeliverSelectedImage;
+            if need_image {
+                let program = ensure_program(received, changes, ImageDemand::DeliverSelectedImage, true)?;
                 for (wanted, role) in [(changes.watchdog, "watchdog"), (changes.relay, "relay")] {
                     let Some(wanted) = wanted else { continue; };
                     for lease in &received.source_leases { lease.source_bytes()?; }
@@ -3231,6 +3240,13 @@ mod windows_impl {
             assert!(current_image_decision(&unknown, false, ImageDemand::DeliverSelectedImage).is_err());
             assert_eq!(current_image_decision(&unknown, true, ImageDemand::KeepCompatible).unwrap(), CurrentImageDecision::ReuseCurrent);
             assert!(require_owned_occupancy(OccupancyOwnership::Unproved).is_err());
+        }
+
+        #[test]
+        fn a_partial_watchdog_or_proxy_start_uses_the_shared_image() {
+            assert!(requests_background_image(BackgroundChanges { relay: None, watchdog: Some(true) }));
+            assert!(requests_background_image(BackgroundChanges { relay: Some(true), watchdog: None }));
+            assert!(!requests_background_image(BackgroundChanges { relay: Some(false), watchdog: None }));
         }
 
         #[test]
